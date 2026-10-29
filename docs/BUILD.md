@@ -45,9 +45,16 @@ On a real macOS machine with Xcode installed:
    #   -isysroot $(xcrun --sdk macosx --show-sdk-path) \
    #   -I$(SDK)/System/Library/Frameworks/Kernel.framework/Headers
    ```
-4. The product is `QCA6174Wifi.kext`. **Do not** code-sign/notarize or install it
-   from this repository workflow — see docs/INSTALL.md for the manual,
-   test-machine-only steps and risks.
+4. Build on macOS with the pinned MacKernelSDK:
+   ```sh
+   git clone https://github.com/acidanthera/MacKernelSDK.git
+   git -C MacKernelSDK checkout 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+   ./scripts/build_kext_macos.sh
+   ```
+   GitHub Actions runs this on `macos-15-intel`; download a successful artifact
+   with `gh run download <run-id> -n QCA6174Wifi-macos-unsigned`.
+5. The product is `build/macos/QCA6174Wifi.kext`. It is unsigned; do not
+   permanently install it before the one-session procedure in docs/INSTALL.md.
 
 ### Before building for real hardware
 The register constants are pinned in docs/ATTRIBUTION.md. Keep direct raw

@@ -14,3 +14,4 @@
 QCA6174Wifi.xcodeproj/
 .DS_Store
 MacKernelSDK/
+/artifacts/github-run-*/
