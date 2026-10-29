@@ -109,6 +109,9 @@ for cd in directories:
 assert any(x['algorithm']=='sha256' for x in verified)
 assert not any(data[sigoff+slength:sigoff+sigsize])
 info=plistlib.loads((bundle/'Contents/Info.plist').read_bytes());p=info['IOKitPersonalities']['Lunnen-QCA9377']
+q=info['IOKitPersonalities'].get('LiteOn-QCA6174')
+assert q and q['IOPCIMatch']=='0x003e168c' and q['IOPCISecondaryMatch']=='0x080711ad'
+assert q['Ath10kDiagnosticStage']==p['Ath10kDiagnosticStage']
 assert p['Ath10kDiagnosticStage'] in range(4) and not p['Ath10kProbeOnly']
 assert info['OSBundleLibraries']['com.apple.iokit.IO80211Family']
 getters={}

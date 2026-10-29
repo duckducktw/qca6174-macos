@@ -222,7 +222,7 @@ IOReturn Ath10kPCIDevice::getDRIVER_VERSION(IO80211SkywalkInterface *,apple80211
     return nativeVersion(data,"Ath10kMac Sequoia WCL experimental");
 }
 IOReturn Ath10kPCIDevice::getHARDWARE_VERSION(IO80211SkywalkInterface *,apple80211_version_data *data) {
-    return nativeVersion(data,"Qualcomm Atheros QCA9377 Lunnen 1a3b:2b51");
+    return nativeVersion(data,_deviceId==0x3e?"Qualcomm Atheros QCA6174 Lite-On 11ad:0807":"Qualcomm Atheros QCA9377 Lunnen 1a3b:2b51");
 }
 IOReturn Ath10kPCIDevice::getCARD_CAPABILITIES(IO80211SkywalkInterface *,apple80211_capability_data *data) {
     if(!data)return kIOReturnBadArgument;bzero(data,sizeof(*data));data->version=APPLE80211_VERSION;
@@ -487,7 +487,9 @@ bool Ath10kPCIDevice::prepareNativeInterface() {
     if(!_nativeServiceCall)return false;
     bcopy(_wmiInit.mac,_nativeMACCurrent,6);_nativeMACValid=true;
     // Strict profile/OS guard; unrelated adapters must not enter the WCL path.
-    if(_vendorId!=0x168c || _deviceId!=0x42 || _subsystemVendorId!=0x1a3b || _subsystemId!=0x2b51)return false;
+    const bool lunnen9377=_vendorId==0x168c && _deviceId==0x42 && _subsystemVendorId==0x1a3b && _subsystemId==0x2b51;
+    const bool liteon6174=_vendorId==0x168c && _deviceId==0x3e && _subsystemVendorId==0x11ad && _subsystemId==0x0807;
+    if(!lunnen9377 && !liteon6174)return false;
     _nativeGate=IOCommandGate::commandGate(this);
     if(!_nativeGate || getWorkLoop()->addEventSource(_nativeGate)!=kIOReturnSuccess)return false;
     // BSD preparation is a WCL operation and requires the IO80211 queue gate.
@@ -1054,7 +1056,7 @@ IOReturn Ath10kPCIDevice::nativePHYCapabilities(AthNativeOp op,void *data) {
     if(!ATH10K_HT_VHT || !(_wmi.htCapability&1))return kIOReturnUnsupported;
     // This native personality is pinned to the verified single-chain QCA9377.
     // Capabilities are local and available before joining any AP.
-    constexpr UInt8 streams=1;
+    const UInt8 streams=_wmiInit.requestedChainMask==1?1:2;
     UInt8 reply[32]{};Ath10k::htcWriteLE32(reply,1);UInt32 length=0;
     if(op==AthNativeOp::getHT_CAPABILITY){
         if(!Ath10k::writeLocalHTCapabilityIE(reply+4,28,Ath10k::localHTCapability(_wmi.htCapability),streams))return kIOReturnError;
@@ -1120,7 +1122,7 @@ IOReturn Ath10kPCIDevice::nativeRequestGated(AthNativeOp op,void *data) {
         if(!AirportWCL::copyHardwareAddress(_nativeMACCurrent,address))return kIOReturnNotReady;bcopy(&address,data,sizeof(address));return kIOReturnSuccess;}
     case N::getCHANNEL:case N::getRSSI:case N::getRATE:return nativeLinkMetrics(op,data);
     case N::getOP_MODE:{auto d=static_cast<apple80211_opmode_data *>(data);bzero(d,sizeof(*d));d->version=1;d->op_mode=APPLE80211_M_STA;return kIOReturnSuccess;}
-    case N::getNSS:{auto d=static_cast<apple80211_nss_data *>(data);bzero(d,sizeof(*d));d->version=1;d->nss=1;return kIOReturnSuccess;}
+    case N::getNSS:{auto d=static_cast<apple80211_nss_data *>(data);bzero(d,sizeof(*d));d->version=1;d->nss=_wmiInit.requestedChainMask==1?1:2;return kIOReturnSuccess;}
     case N::getTXPOWER:{auto d=static_cast<apple80211_txpower_data *>(data);bzero(d,sizeof(*d));d->version=1;d->txpower_unit=APPLE80211_UNIT_DBM;d->txpower=s.txPowerHalfDbm/2;return kIOReturnSuccess;}
     case N::getPOWERSAVE:{auto d=static_cast<apple80211_powersave_data *>(data);bzero(d,sizeof(*d));d->version=1;d->powersave_level=s.radio.appliedPS?1:0;return kIOReturnSuccess;}
     case N::setPOWERSAVE:{auto d=static_cast<apple80211_powersave_data *>(data);if(d->powersave_level>1)return kIOReturnUnsupported;s.radio.requestedPS=d->powersave_level;return kIOReturnSuccess;}
@@ -1204,7 +1206,7 @@ IOReturn Ath10kPCIDevice::nativeRequestGated(AthNativeOp op,void *data) {
         s.regulatory=_regulatory;s.hiddenSSID=true;s.securityAKM=selectedAKM;s.secure=personal;s.ssidLength=join.ssidLength;
         bcopy(join.ssid,s.ssid,join.ssidLength);bcopy(join.bssid,s.bssid,6);bcopy(_nativeMACCurrent,s.local,6);
         s.firmwareHT=_wmi.htCapability;s.firmwareVHT=_wmi.vhtCapability;
-        s.firmwareMFPSupport=payload().kSupportsMFP;s.pmfQoSTransported=_wmiRadio[Ath10k::kWMIPMFQoSIndex].completed;s.rfChains=1;
+        s.firmwareMFPSupport=payload().kSupportsMFP;s.pmfQoSTransported=_wmiRadio[Ath10k::kWMIPMFQoSIndex].completed;s.rfChains=static_cast<UInt8>(_wmiInit.requestedChainMask==1?1:2);
         _nativeSecurity->candidates.expire(Ath10k::uptimeNS()/1000000u);
         const char *error=Ath10k::selectOpenBSS(s,_nativeSecurity->candidates.bss);
         if(error){setProperty("Ath10kNativeJoinReason",error);AthSecurity::wipe(&join,sizeof(join));Ath10k::resetDisconnected(s);return kIOReturnUnsupported;}

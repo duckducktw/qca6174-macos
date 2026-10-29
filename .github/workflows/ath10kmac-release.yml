@@ -158,9 +158,13 @@ jobs:
           retention-days: 14
 
   native-sequoia:
-    name: Sequoia native stage 3
+    name: Sequoia native stage ${{ matrix.stage }}
     runs-on: macos-15-intel
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [3, 0]
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
@@ -169,23 +173,23 @@ jobs:
           persist-credentials: false
       - name: Portable native regressions
         run: python3 tests/run-development-tests.py
-      - name: Build and sign diagnostic controller
+      - name: Build and sign native candidate
         run: |
           set -euo pipefail
-          make NATIVE=1 DIAGNOSTIC_STAGE=3 -j2 kext
+          make NATIVE=1 DIAGNOSTIC_STAGE=${{ matrix.stage }} -j2 kext
           codesign --force --sign - build/native/out/Ath10kMac.kext
           codesign --verify --strict --verbose=2 build/native/out/Ath10kMac.kext
           python3 scripts/windows/validate.py build/native/out/Ath10kMac.kext
-      - name: Package stage-3 candidate
+      - name: Package native candidate
         run: |
           set -euo pipefail
           mkdir -p build/native/dist
-          ditto -c -k --norsrc build/native/out/Ath10kMac.kext build/native/dist/Ath10kMac-Sequoia-stage3.zip
+          ditto -c -k --norsrc --keepParent build/native/out/Ath10kMac.kext build/native/dist/Ath10kMac-Sequoia-stage${{ matrix.stage }}.zip
           cp build/native/out/validation.json build/native/dist/
-          shasum -a 256 build/native/dist/Ath10kMac-Sequoia-stage3.zip > build/native/dist/SHA256SUMS.txt
+          (cd build/native/dist && shasum -a 256 Ath10kMac-Sequoia-stage${{ matrix.stage }}.zip > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v7.0.2
         with:
-          name: Ath10kMac-Sequoia-stage3
+          name: Ath10kMac-Sequoia-stage${{ matrix.stage }}
           path: build/native/dist/*
           if-no-files-found: error
           retention-days: 14

@@ -24,6 +24,8 @@ def prepare(native, destination, diagnostic_stage=0, p256_diagnostic=False):
             'Ath10kNativeExperimental': True, 'IOPCISecondaryMatch': '0x2b511a3b',
             'Ath10kDiagnosticStage': diagnostic_stage, 'Ath10kProbeOnly': False, 'Ath10kStationDFS': True,
         })
+        liteon = dict(personality)
+        liteon.update({'IOPCIMatch': '0x003e168c', 'IOPCISecondaryMatch': '0x080711ad'})
         if p256_diagnostic:
             info['OSBundleLibraries'] = {key: info['OSBundleLibraries'][key] for key in (
                 'com.apple.iokit.IOPCIFamily', 'com.apple.kpi.iokit', 'com.apple.kpi.libkern',
@@ -32,6 +34,8 @@ def prepare(native, destination, diagnostic_stage=0, p256_diagnostic=False):
             personality.pop('IONetworkRootType', None)
             personality.pop('Ath10kNativeExperimental', None)
         info['IOKitPersonalities'] = {'Lunnen-QCA9377': personality}
+        if not p256_diagnostic:
+            info['IOKitPersonalities']['LiteOn-QCA6174'] = liteon
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(plistlib.dumps(info, sort_keys=False))

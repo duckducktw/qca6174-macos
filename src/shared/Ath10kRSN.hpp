@@ -141,4 +141,33 @@ inline bool findIGTKCMAC128(const uint8_t *data,size_t bytes,IGTKCMAC128 &out){
     return found && parseIGTKCMAC128(found,foundBytes,out);
 }
 
+
+enum class EnterpriseMode : uint8_t { WPA2, WPA3 };
+struct EnterpriseSelection {
+    SecurityError error = SecurityError::MalformedRSN;
+    uint8_t akm = 0, pairwise = 0, group = 0;
+    bool pmf = false;
+    explicit operator bool() const { return error == SecurityError::None; }
+};
+// Policy only: macOS eapolclient owns EAP. The driver must still deliver
+// EAPOL and install PTK/GTK through setCIPHER_KEY before this is admitted.
+inline EnterpriseSelection selectEnterprise(const uint8_t *ie, size_t n, EnterpriseMode requested,
+                                             SecurityBackend backend = {}) {
+    RSNInfo ap{};
+    EnterpriseSelection result{};
+    if (!parseRSN(ie, n, ap)) return result;
+    auto reject = [&result](SecurityError error) { result.error = error; return result; };
+    if (!ap.pairwiseHas(4) || ap.group != 4) return reject(SecurityError::UnsupportedCipher);
+    if (ap.capabilities & ((1u << 9) | (1u << 13))) return reject(SecurityError::UnsupportedCapabilities);
+    const uint8_t akm = requested == EnterpriseMode::WPA3 ? 5 : (ap.akmHas(5) ? 5 : 1);
+    if (!ap.akmHas(akm)) return reject(SecurityError::UnsupportedAKM);
+    const bool protectedManagement = requested == EnterpriseMode::WPA3 || ap.mfpr();
+    if (protectedManagement && !ap.mfpc()) return reject(SecurityError::PMFRequired);
+    if (protectedManagement && !backend.pmf) return reject(SecurityError::PMFUnavailable);
+    if (protectedManagement && (ap.groupManagement != 6 || !backend.bipCmac128))
+        return reject(SecurityError::UnsupportedGroupManagement);
+    result.error = SecurityError::None;
+    result.akm = akm; result.pairwise = 4; result.group = 4; result.pmf = protectedManagement;
+    return result;
+}
 }

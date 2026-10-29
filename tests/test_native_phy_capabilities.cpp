@@ -10,6 +10,7 @@ constexpr int kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnNotReady=2,kIOR
 class Ath10kPCIDevice {
 public:
     struct {bool serviceReady=false;UInt32 htCapability=0,vhtCapability=0;} _wmi;
+    struct {UInt32 requestedChainMask=1;} _wmiInit;
     IOReturn nativePHYCapabilities(AthNativeOp,void *);
 };
 #include "native_phy_capabilities.inc"
@@ -50,6 +51,13 @@ int main(){
         if(frame[at]==191){assert(size==14 && !memcmp(frame+at,vht+4,14));foundVHT=true;}
         at+=size;
     }assert(foundHT && foundVHT);
+    // Two-chain QCA6174 must advertise two spatial streams, never fewer or more.
+    d._wmiInit.requestedChainMask=3;
+    assert(d.nativePHYCapabilities(AthNativeOp::getHT_CAPABILITY,ht)==kIOReturnSuccess);
+    assert(ht[9]==0xff && ht[10]==0xff && ht[11]==0);
+    assert(d.nativePHYCapabilities(AthNativeOp::getVHT_CAPABILITY,vht)==kIOReturnSuccess);
+    {const UInt16 two=ATH10K_MAX_WIDTH==20?0xfff5:0xfffa;assert(Ath10k::htcReadLE16(vht+10)==two && Ath10k::htcReadLE16(vht+14)==two);}
+    d._wmiInit.requestedChainMask=1;
     // Missing optional firmware capability bits are not fabricated as SGI support.
     d._wmi.htCapability=1;d._wmi.vhtCapability=0;
     assert(d.nativePHYCapabilities(AthNativeOp::getHT_CAPABILITY,ht)==kIOReturnSuccess);
