@@ -35,6 +35,7 @@ COMMON=(
   -fno-pic
   -fno-exceptions
   -fno-rtti
+  -DKERNEL
   -Wall -Wextra -Werror
   -I"$ROOT/build-support"
   -I"$SDK_ROOT/Headers"
