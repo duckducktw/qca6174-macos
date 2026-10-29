@@ -140,6 +140,7 @@ private:
     bool preparePCIeBringupParity();
     void restorePCIeBringupParity();
     bool disableASPMForBringup();
+    bool aspmWriteIsVirtualized() const;
     void restoreASPM();
     bool prepareIRQParity();
     void teardownIRQParity();

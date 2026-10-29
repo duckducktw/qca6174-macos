@@ -498,7 +498,23 @@ bool Ath10kPCIDevice::disableASPMForBringup()
 
     IOLog("Ath10kMac: PCIe Link Control ASPM-disable readback=%s value=0x%04x\n",
           _aspmDisabled ? "PASS" : "FAIL", _pcieLinkControlDuring);
+    if (!_aspmDisabled && aspmWriteIsVirtualized()) {
+        // Hypervisors (QEMU vfio-pci) emulate Link Control and drop guest
+        // writes; the host owns ASPM for the physical link. Proceed but keep
+        // reporting the observed (virtual) value.
+        IOLog("Ath10kMac: PCIe Link Control write ignored by hypervisor; ASPM is host-managed\n");
+        _aspmDisabled = true;
+    }
     return _aspmDisabled;
+}
+
+bool Ath10kPCIDevice::aspmWriteIsVirtualized() const
+{
+    // CPUID.1:ECX[31] = hypervisor present. Only then is a dropped Link
+    // Control write treated as expected; on bare metal it stays fatal.
+    uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+    return (ecx & (1u << 31)) != 0;
 }
 
 void Ath10kPCIDevice::restoreASPM()
