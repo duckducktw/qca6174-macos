@@ -1,0 +1,9 @@
+verification summary (2026-10-29T09:53:10Z)
+unit_tests   exit=0
+fixture_probe exit=0
+cxx_smoke    exit=0
+aggregate    exit=0
+
+NOTE: the macOS kext itself is NOT built here -- Linux has no Xcode /
+macOS kernel SDK. Only host-testable logic + the C/C++ boundary are
+exercised. See docs/BUILD.md and docs/STATUS.md.

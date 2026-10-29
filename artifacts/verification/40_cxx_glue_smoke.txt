@@ -1,0 +1,4 @@
+clang++ -std=c++17 -Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion -Wpointer-arith -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Isrc/common tests/cxx_glue_smoke.cpp build/obj/fw_file.o build/obj/board_file.o build/obj/qca6174_regs.o build/obj/hw_params.o build/obj/fw_load_sm.o -o build/cxx_glue_smoke
+build/cxx_glue_smoke
+cxx glue smoke: OK (hw=qca6174 hw3.0, chip offset bounds arithmetic, SM stops at BMI/ENOTSUP)
+exit=0

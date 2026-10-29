@@ -1,0 +1,18 @@
+=== wrote artifacts/verification/00_environment.txt ===
+=== wrote artifacts/verification/10_fixture_headers.txt ===
+=== unit tests exit=0 -> artifacts/verification/20_unit_tests.txt ===
+=== fixture probe exit=0 -> artifacts/verification/30_fixture_probe.txt ===
+=== cxx smoke exit=0 -> artifacts/verification/40_cxx_glue_smoke.txt ===
+=== wrote artifacts/verification/50_static_analysis.txt ===
+=== wrote artifacts/verification/60_info_plist.txt ===
+verification summary (2026-10-29T09:53:10Z)
+unit_tests   exit=0
+fixture_probe exit=0
+cxx_smoke    exit=0
+aggregate    exit=0
+
+NOTE: the macOS kext itself is NOT built here -- Linux has no Xcode /
+macOS kernel SDK. Only host-testable logic + the C/C++ boundary are
+exercised. See docs/BUILD.md and docs/STATUS.md.
+
+parent_review_exit=0

@@ -1,0 +1,14 @@
+QCA6174 macOS driver -- host verification
+generated: 2026-10-29T09:53:10Z
+
+=== host ===
+Linux acer-ubuntu 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+
+=== compilers ===
+Ubuntu clang version 21.1.8 (6ubuntu1)
+Target: x86_64-pc-linux-gnu
+Thread model: posix
+
+=== target hardware presence on THIS host ===
+(the QCA6174 is 168c:003e; this build host may differ)
+0000:00:14.3 Network controller [0280]: Intel Corporation Alder Lake-P PCH CNVi WiFi [8086:51f0] (rev 01)

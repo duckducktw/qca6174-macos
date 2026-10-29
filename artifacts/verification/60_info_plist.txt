@@ -1,0 +1,6 @@
+Info.plist well-formedness + personality sanity
+CFBundleIdentifier: com.opensource.qca6174.QCA6174Wifi
+IOClass          : QCA6174Wifi
+IOProviderClass  : IOPCIDevice
+IOPCIPrimaryMatch: 0x003e168c
+OK: non-Apple id, matches only 168c:003e

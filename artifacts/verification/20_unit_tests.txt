@@ -1,0 +1,64 @@
+mkdir -p build/obj
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion -Wpointer-arith -Wstrict-prototypes -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Isrc/common -c src/common/fw_file.c -o build/obj/fw_file.o
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion -Wpointer-arith -Wstrict-prototypes -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Isrc/common -c src/common/board_file.c -o build/obj/board_file.o
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion -Wpointer-arith -Wstrict-prototypes -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Isrc/common -c src/common/qca6174_regs.c -o build/obj/qca6174_regs.o
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion -Wpointer-arith -Wstrict-prototypes -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Isrc/common -c src/common/hw_params.c -o build/obj/hw_params.o
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion -Wpointer-arith -Wstrict-prototypes -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Isrc/common -c src/common/fw_load_sm.c -o build/obj/fw_load_sm.o
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion -Wpointer-arith -Wstrict-prototypes -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Isrc/common tests/run_unit.c tests/test_fw_file.c tests/test_board_file.c tests/test_regs.c tests/test_hw_params.c tests/test_fw_load_sm.c build/obj/fw_file.o build/obj/board_file.o build/obj/qca6174_regs.o build/obj/hw_params.o build/obj/fw_load_sm.o -o build/run_unit
+build/run_unit
+== QCA6174 host unit tests ==
+[ RUN  ] test_valid_minimal
+[  OK  ] test_valid_minimal
+[ RUN  ] test_bad_magic
+[  OK  ] test_bad_magic
+[ RUN  ] test_too_short
+[  OK  ] test_too_short
+[ RUN  ] test_null
+[  OK  ] test_null
+[ RUN  ] test_truncated_ie
+[  OK  ] test_truncated_ie
+[ RUN  ] test_dangling_tail
+[  OK  ] test_dangling_tail
+[ RUN  ] test_bad_fixed_len
+[  OK  ] test_bad_fixed_len
+[ RUN  ] test_zero_len_ie
+[  OK  ] test_zero_len_ie
+[ RUN  ] test_empty_container
+[  OK  ] test_empty_container
+[ RUN  ] test_single_board
+[  OK  ] test_single_board
+[ RUN  ] test_aliases
+[  OK  ] test_aliases
+[ RUN  ] test_find
+[  OK  ] test_find
+[ RUN  ] test_board_ext
+[  OK  ] test_board_ext
+[ RUN  ] test_bad_magic
+[  OK  ] test_bad_magic
+[ RUN  ] test_truncated_nested
+[  OK  ] test_truncated_nested
+[ RUN  ] test_too_short
+[  OK  ] test_too_short
+[ RUN  ] test_mmio_access_ok
+[  OK  ] test_mmio_access_ok
+[ RUN  ] test_bar_window
+[  OK  ] test_bar_window
+[ RUN  ] test_ce_reg_addr
+[  OK  ] test_ce_reg_addr
+[ RUN  ] test_chip_id_decode
+[  OK  ] test_chip_id_decode
+[ RUN  ] test_lookup
+[  OK  ] test_lookup
+[ RUN  ] test_board_key
+[  OK  ] test_board_key
+[ RUN  ] test_board_key_overflow
+[  OK  ] test_board_key_overflow
+[ RUN  ] test_blocked_without_parse
+[  OK  ] test_blocked_without_parse
+[ RUN  ] test_reaches_board_then_stops
+[  OK  ] test_reaches_board_then_stops
+[ RUN  ] test_state_names
+[  OK  ] test_state_names
+----
+26 test(s), 144 check(s), 0 failure(s)
+exit=0

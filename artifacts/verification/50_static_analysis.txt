@@ -1,0 +1,9 @@
+clang --analyze on src/common (static analysis)
+
+--- src/common/board_file.c ---
+--- src/common/fw_file.c ---
+--- src/common/fw_load_sm.c ---
+--- src/common/hw_params.c ---
+--- src/common/qca6174_regs.c ---
+
+analyzer aggregate exit=0 (no output above == no warnings)

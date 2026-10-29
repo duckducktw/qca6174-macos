@@ -1,0 +1,15 @@
+# Build output and decompressed firmware fixtures must never be committed.
+/build/
+*.o
+*.plist.tmp
+
+# Firmware blobs are redistributed by linux-firmware under their own license;
+# they are decompressed into build/ at test time only, never tracked here.
+*.bin
+*.bin.zst
+
+# Local agent output and generated Xcode project.
+.cc_*.json
+.cc_*.log
+QCA6174Wifi.xcodeproj/
+.DS_Store

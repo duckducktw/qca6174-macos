@@ -1,0 +1,24 @@
+First 64 bytes of each decompressed fixture (ABI grounding evidence).
+
+decompressed board-2.bin
+decompressed board.bin
+decompressed firmware-4.bin
+decompressed firmware-6.bin
+decompressed firmware-sdio-6.bin
+decompressed notice_ath10k_firmware-4.txt
+decompressed notice_ath10k_firmware-6.txt
+decompressed notice_ath10k_firmware-sdio-6.txt
+fixtures ready in build/fixtures (8 file(s))
+
+--- build/fixtures/firmware-6.bin ---
+00000000: 5143 412d 4154 4831 304b 0077 0000 0000  QCA-ATH10K.w....
+00000010: 1400 0000 574c 414e 2e52 4d2e 342e 342e  ....WLAN.RM.4.4.
+00000020: 312d 3030 3330 392d 0100 0000 0400 0000  1-00309-........
+00000030: 5db5 1964 0400 0000 6d5f 0000 5347 4d54  ]..d....m_..SGMT
+
+--- build/fixtures/board-2.bin ---
+00000000: 5143 412d 4154 4831 304b 2d42 4f41 5244  QCA-ATH10K-BOARD
+00000010: 006d 6d6d 0000 0000 1820 0000 0000 0000  .mmm..... ......
+00000020: 4b00 0000 6275 733d 7063 692c 7665 6e64  K...bus=pci,vend
+00000030: 6f72 3d31 3638 632c 6465 7669 6365 3d30  or=168c,device=0
+

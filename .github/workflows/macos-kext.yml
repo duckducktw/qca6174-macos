@@ -1,0 +1,66 @@
+name: macOS kext build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "kext/**"
+      - "src/common/**"
+      - "project.yml"
+      - ".github/workflows/macos-kext.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          find "$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers" -maxdepth 2 -type f | head -20 || true
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned kext
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project QCA6174Wifi.xcodeproj \
+            -scheme QCA6174Wifi \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Collect artifact
+        if: always()
+        run: |
+          mkdir -p artifacts
+          cp "$RUNNER_TEMP/xcodebuild.log" artifacts/ 2>/dev/null || true
+          find "$RUNNER_TEMP/DerivedData" -type d -name 'QCA6174Wifi.kext' -exec cp -R {} artifacts/ \; 2>/dev/null || true
+          if [ -d artifacts/QCA6174Wifi.kext ]; then
+            plutil -p artifacts/QCA6174Wifi.kext/Contents/Info.plist > artifacts/kext-info.txt
+            file artifacts/QCA6174Wifi.kext/Contents/MacOS/QCA6174Wifi > artifacts/kext-file.txt
+            shasum -a 256 artifacts/QCA6174Wifi.kext/Contents/MacOS/QCA6174Wifi > artifacts/SHA256SUMS
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: QCA6174Wifi-macos-unsigned
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 14

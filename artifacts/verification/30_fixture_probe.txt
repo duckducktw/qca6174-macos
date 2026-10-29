@@ -1,0 +1,44 @@
+clang -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion -Wpointer-arith -Wstrict-prototypes -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Isrc/common tests/fixture_probe.c build/obj/fw_file.o build/obj/board_file.o build/obj/qca6174_regs.o build/obj/hw_params.o build/obj/fw_load_sm.o -o build/fixture_probe
+./scripts/prepare_fixtures.sh build/fixtures
+decompressed board-2.bin
+decompressed board.bin
+decompressed firmware-4.bin
+decompressed firmware-6.bin
+decompressed firmware-sdio-6.bin
+decompressed notice_ath10k_firmware-4.txt
+decompressed notice_ath10k_firmware-6.txt
+decompressed notice_ath10k_firmware-sdio-6.txt
+fixtures ready in build/fixtures (8 file(s))
+build/fixture_probe build/fixtures
+== QCA6174 fixture probe (dir=build/fixtures) ==
+[fw ] build/fixtures/firmware-6.bin (706360 bytes)
+      version   : "WLAN.RM.4.4.1-00309-" (20 bytes)
+      timestamp : 0x6419b55d
+      wmi op ver: 4
+      htt op ver: 3
+      fw image  : 681821 bytes
+      otp image : 24429 bytes
+      codeswap  : 0 bytes
+      features  : 2 bytes
+      total IEs : 7 (unknown: 0)
+[brd] build/fixtures/board-2.bin (740076 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=168c,subsystem-device=334e  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=168c,subsystem-device=3360  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=168c,subsystem-device=3362  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=168c,subsystem-device=3363  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=168c,subsystem-device=3361  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=1a56,subsystem-device=525a  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=144f,subsystem-device=7143  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=168c,subsystem-device=3366  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=14cd,subsystem-device=9008  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=14cd,subsystem-device=9801  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=14cd,subsystem-device=9802  (data 8124 bytes)
+        [brd] bus=pci,vendor=168c,device=003e,subsystem-vendor=1a56,subsystem-device=1435  (data 8124 bytes)
+      board elems: 90, names: 90, data blocks: 90, entries: 90
+      first 12 name(s):
+        ... and 78 more
+      lookup full key: bus=pci,vendor=168c,device=003e,subsystem-vendor=11ad,subsystem-device=0807
+         -> MATCH
+      lookup generic : bus=pci,vendor=168c,device=003e -> no exact match
+== fixture probe done ==
+exit=0
