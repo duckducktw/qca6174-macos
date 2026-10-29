@@ -13,6 +13,7 @@ import sys
 BOARD_MAGIC = b"QCA-ATH10K-BOARD\0"
 FW_MAGIC = b"QCA-ATH10K\0"
 BOARD_KEY = "bus=pci,vendor=168c,device=003e,subsystem-vendor=1028,subsystem-device=0310"
+LITEON_QCA6174_BOARD_KEY = "bus=pci,vendor=168c,device=003e,subsystem-vendor=11ad,subsystem-device=0807"
 BOARD_SIZE = 8124
 QCA9377_BOARD_KEY = "bus=pci,vendor=168c,device=0042,subsystem-vendor=1235,subsystem-device=0901"
 
@@ -149,7 +150,8 @@ def parse_segments(image):
     raise ValueError("SGMT DONE marker missing")
 
 
-def prepare_profile(root, folder, namespace, board_key, profile, identity, allow_fallback=False):
+def prepare_profile(root, folder, namespace, board_key, profile, identity, allow_fallback=False,
+                    output_name=None):
     board_container = (folder / "board-2.bin").read_bytes()
     fw_container = (folder / "firmware-6.bin").read_bytes()
     selection = "board-api2-exact"
@@ -215,7 +217,7 @@ def prepare_profile(root, folder, namespace, board_key, profile, identity, allow
     header += ["};", f"static constexpr UInt32 kFirmwareSegmentCount = {len(segments)};",
                f"static constexpr UInt32 kFirmwareSegmentDataBytes = {sum(s['length'] for s in segments)};",
                f"static constexpr UInt32 kFirmwareEntryAddress = 0x{entry:08x}u;", "}", ""]
-    outdir = root / "firmware/prepared" / ("QCA9377" if allow_fallback else "")
+    outdir = root / "firmware/prepared" / (output_name if output_name is not None else ("QCA9377" if allow_fallback else ""))
     outputs = {
         outdir / "board.bin": board,
         outdir / "otp.bin": parts[4],
@@ -241,8 +243,12 @@ def prepare(root):
               '#pragma once', '#include "Ath10kPayloadProfile.hpp"']
     entries = []
     profiles = [
-        (root / 'firmware', 'Ath10kPayload', BOARD_KEY, 'QCA6174/hw3.2',
+        (root / 'firmware', 'Ath10kPayload', BOARD_KEY, 'QCA6174/hw3.2-Dell-1028-0310',
          ('0x003e', '0x1028', '0x0310', '10', '0x05030000u'), False),
+        (root / 'firmware', 'Ath10kPayloadLiteOn', LITEON_QCA6174_BOARD_KEY,
+         'QCA6174/hw3.2-LiteOn-11ad-0807',
+         ('0x003e', '0x11ad', '0x0807', '10', '0x05030000u'), False,
+         'QCA6174-LiteOn'),
         (root / 'firmware/QCA9377/hw1.0', 'Ath10kPayload9377', QCA9377_BOARD_KEY, 'QCA9377/hw1.1',
          ('0x0042', '0x1235', '0x0901', '1', '0x05020001u'), True),
     ]

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import struct
 import unittest
@@ -35,6 +36,23 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(entry, 0xa0400)
         self.assertEqual(len(segments), 6)
         self.assertEqual(sum(s['length'] for s in segments), 681749)
+
+    def test_liteon_qca6174_profile(self):
+        files, header, entry = p.prepare_profile(
+            ROOT, ROOT / 'firmware', 'Ath10kPayloadLiteOn',
+            p.LITEON_QCA6174_BOARD_KEY, 'QCA6174/hw3.2-LiteOn-11ad-0807',
+            ('0x003e', '0x11ad', '0x0807', '10', '0x05030000u'), False,
+            'QCA6174-LiteOn')
+        manifest = json.loads(files[ROOT / 'firmware/prepared/QCA6174-LiteOn/manifest.json'])
+        self.assertEqual(manifest['board_key'], p.LITEON_QCA6174_BOARD_KEY)
+        self.assertEqual(manifest['board_selection'], 'board-api2-exact')
+        self.assertEqual(manifest['board_bytes'], 8124)
+        self.assertIn('0x11ad', entry)
+        self.assertIn('0x0807', entry)
+        self.assertIn('Ath10kPayloadLiteOn', '\n'.join(header))
+        self.assertNotEqual(
+            p.select_board((ROOT / 'firmware/board-2.bin').read_bytes(), p.BOARD_KEY),
+            p.select_board((ROOT / 'firmware/board-2.bin').read_bytes(), p.LITEON_QCA6174_BOARD_KEY))
 
     def test_qca9377_profile(self):
         folder = ROOT / 'firmware/QCA9377/hw1.0'

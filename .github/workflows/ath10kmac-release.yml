@@ -103,7 +103,10 @@ jobs:
           set -euo pipefail
           make clean
           make -j"$(sysctl -n hw.logicalcpu)" kext
+          make app
           plutil -lint build/out/Ath10kMac.kext/Contents/Info.plist
+          plutil -lint "build/Ath10k Connectivity.app/Contents/Info.plist"
+          codesign --verify --strict --verbose=2 "build/Ath10k Connectivity.app"
           xcrun lipo build/out/Ath10kMac.kext/Contents/MacOS/Ath10kMac -verify_arch x86_64
           test "$(xcrun lipo build/out/Ath10kMac.kext/Contents/MacOS/Ath10kMac -archs)" = "x86_64"
           xcrun dwarfdump --uuid build/out/Ath10kMac.kext/Contents/MacOS/Ath10kMac
@@ -117,6 +120,7 @@ jobs:
           archive="Ath10kMac-${PACKAGE_VERSION}-x86_64.zip"
           mkdir -p "$stage/Licenses" build/dist
           ditto build/out/Ath10kMac.kext "$stage/Ath10kMac.kext"
+          ditto "build/Ath10k Connectivity.app" "$stage/Ath10k Connectivity.app"
           chmod 755 "$stage/Ath10kMac.kext/Contents/MacOS/Ath10kMac"
 
           if [[ -f README.md ]]; then
