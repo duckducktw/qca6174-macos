@@ -191,9 +191,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build/native/dist
-          ditto -c -k --norsrc build/native/out/Ath10kMac.kext build/native/dist/Ath10kMac-Sequoia-stage${{ matrix.stage }}.zip
+          ditto -c -k --norsrc --keepParent build/native/out/Ath10kMac.kext build/native/dist/Ath10kMac-Sequoia-stage${{ matrix.stage }}.zip
           cp build/native/out/validation.json build/native/dist/
-          shasum -a 256 build/native/dist/Ath10kMac-Sequoia-stage${{ matrix.stage }}.zip > build/native/dist/SHA256SUMS.txt
+          (cd build/native/dist && shasum -a 256 Ath10kMac-Sequoia-stage${{ matrix.stage }}.zip > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: Ath10kMac-Sequoia-stage${{ matrix.stage }}
