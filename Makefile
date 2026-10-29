@@ -100,4 +100,4 @@ clean:
 
 .PHONY: app
 app:
-	./scripts/build-connectivity.sh
+	sh ./scripts/build-connectivity.sh
