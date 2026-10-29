@@ -12,7 +12,7 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "11.0"
 targets:
   QCA6174Wifi:
-    type: kernel-extension
+    type: com.apple.product-type.kernel-extension
     platform: macOS
     deploymentTarget: "11.0"
     sources:
