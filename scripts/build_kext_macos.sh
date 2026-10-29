@@ -35,9 +35,8 @@ COMMON=(
   -fno-pic
   -fno-exceptions
   -fno-rtti
-  -UTARGET_OS_OSX
-  -DTARGET_OS_OSX=0
   -Wall -Wextra -Werror
+  -I"$ROOT/build-support"
   -I"$SDK_ROOT/Headers"
   -I"$ROOT/src/common"
   -I"$ROOT/kext/QCA6174Wifi"
