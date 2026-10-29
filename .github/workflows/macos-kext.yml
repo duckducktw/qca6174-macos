@@ -36,7 +36,7 @@ jobs:
         run: ./scripts/build_kext_macos.sh "$RUNNER_TEMP/kext-build"
 
       - name: Collect artifact
-        if: always()
+        if: success()
         run: |
           mkdir -p artifacts
           if [ -d "$RUNNER_TEMP/kext-build/QCA6174Wifi.kext" ]; then
@@ -47,7 +47,7 @@ jobs:
           fi
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
           name: QCA6174Wifi-macos-unsigned
           path: artifacts
