@@ -13,3 +13,4 @@
 .cc_*.log
 QCA6174Wifi.xcodeproj/
 .DS_Store
+MacKernelSDK/

@@ -7,7 +7,7 @@ on:
     paths:
       - "kext/**"
       - "src/common/**"
-      - "project.yml"
+      - "scripts/build_kext_macos.sh"
       - ".github/workflows/macos-kext.yml"
 
 permissions:
@@ -20,38 +20,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
-
       - name: Show toolchain
         run: |
           sw_vers
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-path
-          find "$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers" -maxdepth 2 -type f | head -20 || true
 
-      - name: Generate Xcode project
-        run: xcodegen generate
+      - name: Fetch pinned MacKernelSDK
+        run: |
+          git clone --filter=blob:none https://github.com/acidanthera/MacKernelSDK.git MacKernelSDK
+          git -C MacKernelSDK checkout 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+          test -f MacKernelSDK/Library/x86_64/libkmod.a
 
       - name: Build unsigned kext
-        run: |
-          set -o pipefail
-          xcodebuild \
-            -project QCA6174Wifi.xcodeproj \
-            -scheme QCA6174Wifi \
-            -configuration Release \
-            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build | tee "$RUNNER_TEMP/xcodebuild.log"
+        run: ./scripts/build_kext_macos.sh "$RUNNER_TEMP/kext-build"
 
       - name: Collect artifact
         if: always()
         run: |
           mkdir -p artifacts
-          cp "$RUNNER_TEMP/xcodebuild.log" artifacts/ 2>/dev/null || true
-          find "$RUNNER_TEMP/DerivedData" -type d -name 'QCA6174Wifi.kext' -exec cp -R {} artifacts/ \; 2>/dev/null || true
-          if [ -d artifacts/QCA6174Wifi.kext ]; then
+          if [ -d "$RUNNER_TEMP/kext-build/QCA6174Wifi.kext" ]; then
+            cp -R "$RUNNER_TEMP/kext-build/QCA6174Wifi.kext" artifacts/
             plutil -p artifacts/QCA6174Wifi.kext/Contents/Info.plist > artifacts/kext-info.txt
             file artifacts/QCA6174Wifi.kext/Contents/MacOS/QCA6174Wifi > artifacts/kext-file.txt
             shasum -a 256 artifacts/QCA6174Wifi.kext/Contents/MacOS/QCA6174Wifi > artifacts/SHA256SUMS
