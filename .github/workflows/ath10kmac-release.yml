@@ -178,7 +178,7 @@ jobs:
           make NATIVE=1 DIAGNOSTIC_STAGE=${{ matrix.stage }} -j2 kext
           codesign --force --sign - build/native/out/Ath10kMac.kext
           codesign --verify --strict --verbose=2 build/native/out/Ath10kMac.kext
-          python3 scripts/windows/validate.py build/native/out/Ath10kMac.kext
+          python3 scripts/windows/validate.py build/native/out/Ath10kMac.kext --diagnostic-stage ${{ matrix.stage }}
           python3 - <<'PY'
           import plistlib
           p=plistlib.load(open('build/native/out/Ath10kMac.kext/Contents/Info.plist','rb'))

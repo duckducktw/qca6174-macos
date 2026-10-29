@@ -5,6 +5,7 @@ import struct,json,hashlib,plistlib,argparse,re
 parser=argparse.ArgumentParser(description="Validate a signed Sequoia diagnostic kext offline.")
 parser.add_argument('bundle',type=Path)
 parser.add_argument('--kernel-collection',type=Path)
+parser.add_argument('--diagnostic-stage',type=int,choices=[0,1,2,3],default=3)
 args=parser.parse_args()
 bundle=args.bundle.resolve();out=bundle.parent
 path=bundle/'Contents/MacOS/Ath10kMac';data=path.read_bytes()
@@ -108,8 +109,11 @@ for cd in directories:
     verified.append(dict(algorithm='sha1' if hashtype==1 else 'sha256',pages=ncode))
 assert any(x['algorithm']=='sha256' for x in verified)
 assert not any(data[sigoff+slength:sigoff+sigsize])
-info=plistlib.loads((bundle/'Contents/Info.plist').read_bytes());p=info['IOKitPersonalities']['Lunnen-QCA9377']
-assert p['Ath10kDiagnosticStage']==3 and not p['Ath10kProbeOnly']
+info=plistlib.loads((bundle/'Contents/Info.plist').read_bytes())
+personalities=info['IOKitPersonalities']
+assert set(personalities)=={'Lunnen-QCA9377','LiteOn-QCA6174'}
+for p in personalities.values():
+    assert p['Ath10kDiagnosticStage']==args.diagnostic_stage and not p['Ath10kProbeOnly']
 assert info['OSBundleLibraries']['com.apple.iokit.IO80211Family']
 getters={}
 for name in ['__ZNK15Ath10kPCIDevice11getWorkLoopEv','__ZNK15Ath10kPCIDevice12getWorkQueueEv']:
@@ -119,6 +123,6 @@ for name in ['__ZNK15Ath10kPCIDevice11getWorkLoopEv','__ZNK15Ath10kPCIDevice12ge
     assert match, 'Unexpected getter encoding: '+name
     getters[name]={'field':struct.unpack('<i',match[1])[0]}
 assert len({v['field'] for v in getters.values()})==2
-report=dict(result='PASS_OFFLINE_NOT_BOOT_TESTED',architecture='x86_64',filetype='MH_KEXT_BUNDLE',uuid=uuid,bytes=len(data),sha256=hashlib.sha256(data).hexdigest(),load_commands=cmds,defined_symbols=len(syms),undefined_symbols=len(undefined),undefined_available_in_kernel_collection=True if args.kernel_collection else None,weak_imports=weak,stack_runtime_imports=bad,section_relocations=sum(s['relocations'] for s in sections),external_relocations=external_relocations,local_relocations=local_relocations,adhoc_code_directories_verified=verified,signed_info_and_resources_verified=True,diagnostic_personality_checked=True,stage=3,getters=getters,efi_changed=False)
+report=dict(result='PASS_OFFLINE_NOT_BOOT_TESTED',architecture='x86_64',filetype='MH_KEXT_BUNDLE',uuid=uuid,bytes=len(data),sha256=hashlib.sha256(data).hexdigest(),load_commands=cmds,defined_symbols=len(syms),undefined_symbols=len(undefined),undefined_available_in_kernel_collection=True if args.kernel_collection else None,weak_imports=weak,stack_runtime_imports=bad,section_relocations=sum(s['relocations'] for s in sections),external_relocations=external_relocations,local_relocations=local_relocations,adhoc_code_directories_verified=verified,signed_info_and_resources_verified=True,diagnostic_personality_checked=True,stage=args.diagnostic_stage,getters=getters,efi_changed=False)
 (out/'validation.json').write_text(json.dumps(report,indent=2));(out/'undefined-symbols.txt').write_text('\n'.join(sorted(undefined)))
 print(json.dumps(report,indent=2))
