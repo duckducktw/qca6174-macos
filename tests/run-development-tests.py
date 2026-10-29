@@ -29,6 +29,7 @@ def main():
     run('prepare-firmware', [sys.executable, 'scripts/prepare-firmware.py'])
     run('payload-python', [sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_payload.py', '-v'])
     run('diagnostic-privacy', [sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_native_preflight.py', '-v'])
+    run('native-personality', [sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_native_personality.py', '-v'])
     if args.zig:
         compiler = [str(args.zig.resolve()), 'c++', '-target', 'x86_64-windows-gnu']
     else:
@@ -42,7 +43,7 @@ def main():
         (include / 'IOKit/IOTypes.h').write_text(
             '#pragma once\n#include <cstdint>\nusing UInt8=uint8_t;using UInt16=uint16_t;'
             'using UInt32=uint32_t;using UInt64=uint64_t;\n')
-        for name in ['rsn_policy', 'lunnen_payload', 'security', 'native_wire', 'native_status', 'native_capture']:
+        for name in ['rsn_policy', 'lunnen_payload', 'liteon_qca6174_payload', 'security', 'native_wire', 'native_status', 'native_capture']:
             executable = out / ('test_' + name + ('.exe' if os.name == 'nt' else ''))
             libraries = ['-lbcrypt'] if name == 'security' and os.name == 'nt' else (
                 ['-lcrypto'] if name == 'security' and sys.platform != 'darwin' else [])

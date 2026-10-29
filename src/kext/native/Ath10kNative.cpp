@@ -188,7 +188,11 @@ IONetworkInterface *Ath10kPCIDevice::createInterface() {
 bool Ath10kPCIDevice::prepareNativeInterface() {
     _nativeStopping=false;
     // Strict profile/OS guard; unrelated adapters must not enter the WCL path.
-    if(_vendorId!=0x168c || _deviceId!=0x42 || _subsystemVendorId!=0x1a3b || _subsystemId!=0x2b51)return false;
+    const bool lunnen9377=_vendorId==0x168c && _deviceId==0x42 &&
+        _subsystemVendorId==0x1a3b && _subsystemId==0x2b51;
+    const bool liteon6174=_vendorId==0x168c && _deviceId==0x3e &&
+        _subsystemVendorId==0x11ad && _subsystemId==0x0807;
+    if(!lunnen9377 && !liteon6174)return false;
     _nativeGate=IOCommandGate::commandGate(this);
     if(!_nativeGate || getWorkLoop()->addEventSource(_nativeGate)!=kIOReturnSuccess)return false;
     _nativeSecurity=new NativeSecurity;if(!_nativeSecurity)return false;

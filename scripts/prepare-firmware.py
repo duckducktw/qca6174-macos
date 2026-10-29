@@ -13,6 +13,7 @@ import sys
 BOARD_MAGIC = b"QCA-ATH10K-BOARD\0"
 FW_MAGIC = b"QCA-ATH10K\0"
 BOARD_KEY = "bus=pci,vendor=168c,device=003e,subsystem-vendor=1028,subsystem-device=0310"
+LITEON_QCA6174_BOARD_KEY = "bus=pci,vendor=168c,device=003e,subsystem-vendor=11ad,subsystem-device=0807"
 BOARD_SIZE = 8124
 QCA9377_BOARD_KEY = "bus=pci,vendor=168c,device=0042,subsystem-vendor=1028,subsystem-device=1810"
 LUNNEN_QCA9377_BOARD_KEY = "bus=pci,vendor=168c,device=0042,subsystem-vendor=1a3b,subsystem-device=2b51"
@@ -257,6 +258,10 @@ def prepare(root):
     profiles = [
         (root / 'firmware', 'Ath10kPayload', BOARD_KEY, 'QCA6174/hw3.2',
          ('0x003e', '0x1028', '0x0310', '10', '0x05030000u'), False),
+        (root / 'firmware', 'Ath10kPayloadLiteOn', LITEON_QCA6174_BOARD_KEY,
+         'QCA6174/hw3.2-LiteOn-11ad-0807',
+         ('0x003e', '0x11ad', '0x0807', '10', '0x05030000u'), False,
+         'QCA6174-LiteOn', True, 'Ath10kPayload'),
         (root / 'firmware/QCA9377/hw1.0', 'Ath10kPayload9377', QCA9377_BOARD_KEY, 'QCA9377/hw1.1',
          ('0x0042', '0x1028', '0x1810', '1', '0x05020001u'), True),
         (root / 'firmware/QCA9377/hw1.0', 'Ath10kPayload9377Lunnen', LUNNEN_QCA9377_BOARD_KEY,

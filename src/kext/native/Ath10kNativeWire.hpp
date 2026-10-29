@@ -70,8 +70,10 @@ inline size_t nativeBSSMessage(const Ath10k::WMIBSS &b,UInt8 *buffer,size_t capa
     if(b.rateCount>8)ie(50,b.rates+8,b.rateCount-8);
     UInt8 channel=ch;ie(3,&channel,1);
     if(b.rsnLength){bcopy(b.rsn,out+bytes,b.rsnLength);bytes+=b.rsnLength;}
-    if(b.htPresent)ie(45,b.ht,26);if(b.htOperation)ie(61,b.htOp,22);
-    if(b.vhtPresent)ie(191,b.vht,12);if(b.vhtOperation)ie(192,b.vhtOp,5);
+    if(b.htPresent)ie(45,b.ht,26);
+    if(b.htOperation)ie(61,b.htOp,22);
+    if(b.vhtPresent)ie(191,b.vht,12);
+    if(b.vhtOperation)ie(192,b.vhtOp,5);
     if(b.countryPresent)ie(7,b.country,b.countryLength);
     // Keep the original RSN advertisement intact. Unsupported WPA3/PMF joins
     // are explicitly rejected rather than rewriting the AP's security policy.

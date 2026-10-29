@@ -58,6 +58,18 @@ static bool ath10kBytesEqual(const void *lhs, const void *rhs, UInt32 length)
     return true;
 }
 
+#ifdef ATH10K_NATIVE
+static bool ath10kNativeProfileAllowed(IOPCIDevice *pci, UInt16 vendor, UInt16 device)
+{
+    if (!pci || vendor != 0x168c)
+        return false;
+    const UInt16 subvendor = pci->configRead16(kIOPCIConfigSubSystemVendorID);
+    const UInt16 subdevice = pci->configRead16(kIOPCIConfigSubSystemID);
+    return (device == 0x42 && subvendor == 0x1a3b && subdevice == 0x2b51) ||
+           (device == 0x3e && subvendor == 0x11ad && subdevice == 0x0807);
+}
+#endif
+
 IOService *Ath10kPCIDevice::probe(IOService *provider, SInt32 *score)
 {
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
@@ -74,9 +86,7 @@ IOService *Ath10kPCIDevice::probe(IOService *provider, SInt32 *score)
 
 #ifdef ATH10K_NATIVE
     // Reject foreign subsystem/OS before opening PCI or starting firmware DMA.
-    if(version_major!=24 || version_minor<2 || vendor!=0x168c || device!=0x42 ||
-       pci->configRead16(kIOPCIConfigSubSystemVendorID)!=0x1a3b ||
-       pci->configRead16(kIOPCIConfigSubSystemID)!=0x2b51)return nullptr;
+    if(version_major!=24 || version_minor<2 || !ath10kNativeProfileAllowed(pci,vendor,device))return nullptr;
     // OpenCore diagnostic personality: verify matching without entering the
     // controller, CoreCapture, PCI-open or firmware/DMA startup paths.
     if (auto *probeOnly = OSDynamicCast(OSBoolean, getProperty("Ath10kProbeOnly"))) {
