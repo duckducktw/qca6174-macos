@@ -52,7 +52,11 @@ private:
     // calls an empty slot, finds no fault reporter and panics in logDebug().
     static bool venturaLogPipesSlot(IO80211Controller *, CCPipe **, CCPipe **, CCPipe **);
     static void *venturaFaultReporterSlot(IO80211Controller *);
-    void alignVenturaVtable();
+    static SInt32 venturaVirtualRequestSlot(IO80211Controller *, UInt, int,
+                                            IO80211VirtualInterface *, void *);
+    static SInt32 venturaSkywalkRequestSlot(IO80211Controller *, UInt, int,
+                                            IO80211SkywalkInterface *, void *);
+    bool alignVenturaVtable();
     bool prepareVenturaLogs();
     void releaseVenturaLogs();
     CCPipe *_venturaPipes[3]{};

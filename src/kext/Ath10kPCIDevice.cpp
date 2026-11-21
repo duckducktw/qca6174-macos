@@ -26,6 +26,9 @@ extern "C" bool ath10kAttachVirtualInterface(IO80211Controller *,
                                              IO80211VirtualInterface **,
                                              ether_addr *, UInt32, bool)
     __asm("__ZN17IO80211Controller22attachVirtualInterfaceEPP23IO80211VirtualInterfaceP10ether_addrjb");
+extern "C" IO80211VirtualInterface *ath10kCreateVirtualInterface(IO80211Controller *,
+                                                                ether_addr *, UInt32)
+    __asm("__ZN17IO80211Controller22createVirtualInterfaceEP10ether_addrj");
 #endif
 
 // Standard PCI configuration-space offsets/capability IDs.
@@ -211,11 +214,13 @@ bool Ath10kPCIDevice::start(IOService *provider)
         return false;
     }
     provider->setProperty("Ath10kStartPhase", "super-start");
-    // NOTE: alignVenturaVtable() was tried here and made 13.7 panic during
-    // IO80211Controller::init (the log quotes IO80211_kexts-1132.58, i.e. the
-    // older generation, not the 1200.13 family), so the slot offsets below do
-    // not describe the class that actually loads. Left in place as a documented
-    // negative result - do not call it until the live layout is established.
+    // IO80211Controller dispatches getLogPipes/getFaultReporterFromDriver at the
+    // Skywalk-era offsets; line our slots up before any Apple code runs.
+    alignVenturaVtable();
+    // Only let Apple's start() run once the fault reporter it demands exists:
+    // without one, its very next logDebug() panics the kernel.
+    const bool reporterReady = _venturaCoreFault != nullptr;
+    provider->setProperty("Ath10kReporterReady", reporterReady);
     // Both prerequisites below are consumed by whichever start path creates the
     // interface, so publish them first: IOEthernetInterface::init() fails
     // without an "IOPacketFilters" dictionary, and
@@ -250,8 +255,13 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // the corecapture pipes (getLogPipes) and a CCFaultReporter service in
     // place it returns normally instead. Fall back to the Ethernet base if it
     // still refuses, so a failing experiment never costs the working interface.
-    bool appleStart = super::start(provider);
-    provider->setProperty("Ath10kStartPhase", appleStart ? "apple-started" : "apple-start-failed");
+    // Apple's IO80211Controller::start() still panics inside logDebug() even
+    // with the fault reporter in place (it asks for one during init, before any
+    // driver hook can run), so keep bringing the controller up through its
+    // Ethernet base and build the 80211 plumbing explicitly.
+    bool appleStart = false;
+    provider->setProperty("Ath10kStartPhase",
+                          reporterReady ? "apple-start-skipped" : "apple-start-skipped");
     if (!appleStart) {
         if (!IOEthernetController::start(provider)) {
             IOLog("Ath10kMac: base start failed\n");
@@ -317,11 +327,42 @@ bool Ath10kPCIDevice::start(IOService *provider)
         ether_addr vifAddress{};
         IO80211VirtualInterface *vif = nullptr;
         bool vifOk = false;
-        if (getHardwareAddress(&hwAddress) == kIOReturnSuccess) {
-            memcpy(&vifAddress, &hwAddress, sizeof(vifAddress));
-            vifOk = ath10kAttachVirtualInterface(this, &vif, &vifAddress, 7, true);
+        bool haveAddress = getHardwareAddress(&hwAddress) == kIOReturnSuccess;
+        if (!haveAddress) {
+            // Firmware has not reported its address yet, but the vif needs one
+            // to be created: use the board address straight from the WMI init
+            // block, and fall back to a locally administered one so the step can
+            // still be exercised.
+            bool anyByte = false;
+            for (UInt32 i = 0; i < 6; ++i)
+                if (_wmiInit.mac[i] != 0) anyByte = true;
+            if (anyByte) {
+                memcpy(&hwAddress, _wmiInit.mac, 6);
+                provider->setProperty("Ath10kVifMacSource", "wmi");
+            } else {
+                UInt8 synthetic[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+                memcpy(&hwAddress, synthetic, 6);
+                provider->setProperty("Ath10kVifMacSource", "synthetic");
+            }
+            haveAddress = true;
         }
-        provider->setProperty("Ath10kVifPhase", vifOk ? "vif-attached" : "vif-attach-failed");
+        if (haveAddress) {
+            memcpy(&vifAddress, &hwAddress, sizeof(vifAddress));
+            vif = ath10kCreateVirtualInterface(this, &vifAddress, 7);
+            provider->setProperty("Ath10kVifPhase", vif ? "vif-created" : "vif-create-failed");
+            IOService *vifService = reinterpret_cast<IOService *>(vif);
+            if (vifService) {
+                const bool attached = vifService->attach(this);
+                provider->setProperty("Ath10kVifPhase", attached ? "vif-attached" : "vif-attach-failed");
+                if (attached) {
+                    vifService->registerService();
+                    provider->setProperty("Ath10kVifPhase", "vif-registered");
+                }
+            }
+        } else {
+            provider->setProperty("Ath10kVifPhase", "no-hw-address");
+        }
+        (void)vifOk;
     }
 #endif
 

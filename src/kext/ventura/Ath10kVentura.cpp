@@ -89,16 +89,62 @@ bool Ath10kPCIDevice::venturaLogPipesSlot(IO80211Controller *self, CCPipe **driv
 
 void *Ath10kPCIDevice::venturaFaultReporterSlot(IO80211Controller *self)
 {
-    return static_cast<Ath10kPCIDevice *>(self)->_venturaCoreFault;
+    Ath10kPCIDevice *device = static_cast<Ath10kPCIDevice *>(self);
+    IOService *probe = device->getProvider();
+    // IO80211Controller asks for this before start() has prepared corecapture,
+    // and logDebug() panics on a null answer, so create the chain on demand.
+    if (device->_venturaCoreFault == nullptr) {
+        if (!device->getWorkLoop() && !device->createWorkLoop()) {
+            if (probe) probe->setProperty("Ath10kFaultSlotPhase", "no-workloop");
+            return nullptr;
+        }
+        if (!device->prepareVenturaLogs()) {
+            if (probe) probe->setProperty("Ath10kFaultSlotPhase", "logs-failed");
+            return nullptr;
+        }
+    }
+    if (probe) probe->setProperty("Ath10kFaultSlotPhase", "reporter");
+    return device->_venturaCoreFault;
 }
 
-void Ath10kPCIDevice::alignVenturaVtable()
+bool Ath10kPCIDevice::alignVenturaVtable()
 {
     void **vtable = *reinterpret_cast<void ***>(this);
+    IOService *probe = getProvider();
     if (vtable == nullptr)
-        return;
-    vtable[0xd20 / sizeof(void *)] = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaLogPipesSlot);
-    vtable[0xd58 / sizeof(void *)] = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaFaultReporterSlot);
+        return false;
+    void *logSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaLogPipesSlot);
+    void *faultSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaFaultReporterSlot);
+    void *virtualRequestSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaVirtualRequestSlot);
+    void *skywalkRequestSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaSkywalkRequestSlot);
+    vtable[0xd20 / sizeof(void *)] = logSlot;
+    vtable[0xd58 / sizeof(void *)] = faultSlot;
+    // apple80211VirtualRequest / apple80211SkywalkRequest: the vif asks for its
+    // capabilities through these, and our overrides use the older
+    // apple80211Request signature, so route them to the same dispatcher.
+    vtable[0xcb8 / sizeof(void *)] = virtualRequestSlot;
+    vtable[0xcc0 / sizeof(void *)] = skywalkRequestSlot;
+    const bool ok = vtable[0xd20 / sizeof(void *)] == logSlot &&
+                    vtable[0xd58 / sizeof(void *)] == faultSlot;
+    if (probe) {
+        probe->setProperty("Ath10kAlignPhase", ok ? "aligned" : "write-failed");
+        probe->setProperty("Ath10kVptr", static_cast<UInt64>(reinterpret_cast<uintptr_t>(vtable)), 64);
+    }
+    return ok;
+}
+
+SInt32 Ath10kPCIDevice::venturaVirtualRequestSlot(IO80211Controller *self, UInt type,
+                                                  int number, IO80211VirtualInterface *,
+                                                  void *data)
+{
+    return static_cast<Ath10kPCIDevice *>(self)->apple80211Request(type, number, nullptr, data);
+}
+
+SInt32 Ath10kPCIDevice::venturaSkywalkRequestSlot(IO80211Controller *self, UInt type,
+                                                  int number, IO80211SkywalkInterface *,
+                                                  void *data)
+{
+    return static_cast<Ath10kPCIDevice *>(self)->apple80211Request(type, number, nullptr, data);
 }
 
 bool Ath10kPCIDevice::prepareVenturaLogs()
