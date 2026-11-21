@@ -72,7 +72,9 @@ VM：macOS **13.7.8 / 22H730**，`com.apple.iokit.IO80211Family 1200.13.0`（載
 
 ## 下一個接手的人：照這個順序做
 
-1. **讓 SystemConfiguration 真的把 en2 當 Wi-Fi 服務。** v40 的 ioreg 已經是 `IOInterfaceType=71`，但 `networksetup -listnetworkserviceorder` 還是舊的 `Ethernet 2`（SC 把服務存在 `/Library/Preferences/SystemConfiguration/preferences.plist`，會沿用舊分類）。乾淨驗證法：`sudo networksetup -removenetworkservice "Ethernet 2"` → 重開機（或 `launchctl kickstart -k system/com.apple.configd`）→ 看服務是否變成 `Wi-Fi (Hardware Port: Wi-Fi, Device: en2)`、`getairportpower` 能不能開。
+1. **讓 SystemConfiguration 真的把 en2 當 Wi-Fi 服務。** v40 的 ioreg 已經是 `IOInterfaceType=71`，但 `networksetup -listnetworkserviceorder` 還是舊的 `Ethernet 2`（SC 把服務存在 `/Library/Preferences/SystemConfiguration/preferences.plist`，會沿用舊分類）。
+   實測失敗的一招（別重試）：`sudo networksetup -removenetworkservice "Ethernet 2"` → **`You cannot remove Ethernet 2 because there aren't any other network services on Ethernet.`**（它是該類別唯一的服務，所以砍不掉）。
+   要做的是讓 SC 重新分類：直接動 `/Library/Preferences/SystemConfiguration/preferences.plist` 裡 en2 那筆（`NetworkInterfaces` 的 `Type`／或整筆移除後重開機），或先重開機確認新 boot 的 en2 一出現就是 71（SC 在介面首次出現時才寫入分類，之後就沿用快取）。
 2. **確認 airportd 的請求會進來。** 服務變 Wi-Fi 之後再看 `Ath10kApple80211Requests`；>0 就代表 `apple80211Request` 通道打通，接著要一個一個補真的實作。
 3. **把 stubbed 的 80211 動作接到真正的 WMI。** 目前 `venturaScan()` 只清 index、`venturaAssociate()` 直接回 `kIOReturnUnsupported`、`venturaScanResult()` 回 `NotFound`——**掃描/連線核心邏輯完全沒接**（firmware 已經 ready，WMI 掃描通道 `_wmiScan` 在 Sequoia 分支有實作可直接搬）。
 4. **實機驗證。** 以上在 VM 通了之後才把 kext 部署回實體 ESP 並在真機重驗（ASPM 在真機是可控的，`Ath10kASPMControl` 應該不會出現 `write-ignored-continued`）。
