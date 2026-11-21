@@ -260,8 +260,33 @@ void Ath10kPCIDevice::venturaPublishState(UInt32 state)
                                     0);
 }
 
+// Every apple80211 request from airportd funnels through here so the boot
+// breadcrumbs can answer "did the request arrive, and what did we answer".
+// airportd surfaces only "Off (forced)" for both a missing request and a
+// refused one.
 SInt32 Ath10kPCIDevice::apple80211Request(unsigned int requestType, int requestNumber,
-                                          IO80211Interface *, void *data)
+                                          IO80211Interface *iface, void *data)
+{
+    ++_venturaRequestCount;
+    _venturaLastRequest = static_cast<UInt32>(requestNumber);
+    _venturaLastRequestIsSet = requestType == 1;
+    const SInt32 status = venturaDispatchRequest(requestType, requestNumber, iface, data);
+    _venturaLastRequestStatus = status;
+    if (IOService *provider = getProvider()) {
+        provider->setProperty("Ath10kApple80211Requests",
+                              static_cast<UInt64>(_venturaRequestCount), 32);
+        provider->setProperty("Ath10kLastApple80211Request",
+                              static_cast<UInt64>(_venturaLastRequest), 32);
+        provider->setProperty("Ath10kLastApple80211Status",
+                              static_cast<UInt64>(static_cast<UInt32>(status)), 32);
+        provider->setProperty("Ath10kLastApple80211Verb",
+                              _venturaLastRequestIsSet ? "set" : "get");
+    }
+    return status;
+}
+
+SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int requestNumber,
+                                               IO80211Interface *, void *data)
 {
     if (data == nullptr)
         return kIOReturnBadArgument;
@@ -390,6 +415,8 @@ IOReturn Ath10kPCIDevice::venturaPower(bool on)
 {
     _venturaPowerOn = on;
     venturaPublishState(APPLE80211_S_INIT);
+    if (IOService *provider = getProvider())
+        provider->setProperty("Ath10kPowerPhase", on ? "power-on-request" : "power-off-request");
     return kIOReturnSuccess;
 }
 

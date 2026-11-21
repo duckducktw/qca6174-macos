@@ -20,6 +20,7 @@ public:
     bool init(IO80211Controller *controller, Ath10kPCIDevice *owner);
     UInt32 inputPacket(mbuf_t packet, UInt32 length = 0,
                        IOOptionBits options = 0, void *param = nullptr) override;
+    IOReturn attachToDataLinkLayer(IOOptionBits options, void *param) override;
 
 private:
     Ath10kPCIDevice *_owner = nullptr;

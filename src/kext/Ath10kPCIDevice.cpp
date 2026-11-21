@@ -317,36 +317,22 @@ bool Ath10kPCIDevice::start(IOService *provider)
             return false;
         }
         provider->setProperty("Ath10kStartPhase", "interface-published");
+        // Only now is the interface attached: IFT_ETHER was needed for
+        // initIfnetParams() to build the unit, and SystemConfiguration classifies
+        // the BSD interface from this property (71 = IFT_IEEE80211), which is what
+        // turns the "Ethernet 2" service into a Wi-Fi one that airportd and the
+        // Wi-Fi pane act on.
+        iface->setProperty("IOInterfaceType", static_cast<UInt64>(0x47), 32);
+        provider->setProperty("Ath10kInterfaceType", "ieee80211-after-attach");
 #if defined(ATH10K_VENTURA)
-        // A BSD unit only appears once IONetworkStack inserts the interface via
-        // IONetworkStack::insertNetworkInterface(). That method is a local symbol
-        // (not exported), and the only stable handle on the class is the vtable
-        // its instance carries, so address it by its fixed offset from that
-        // vtable in this kernel build and refuse to call if the class is not the
-        // one we measured (13.7.8 / 22H730, IONetworkingFamily 3.4).
-        {
-            IOService *stack = IOService::waitForService(
-                IOService::serviceMatching("IONetworkStack"));
-            if (stack) {
-                const bool isStack = stack->getMetaClass() != nullptr &&
-                    strcmp(stack->getMetaClass()->getClassName(), "IONetworkStack") == 0;
-                void **stackVptr = *reinterpret_cast<void ***>(stack);
-                // __ZTV14IONetworkStack 0xffffff8002c71898 (vptr +0x10),
-                // insertNetworkInterface 0xffffff8002c66c14 -> -0xac94.
-                typedef bool (*InsertFn)(IOService *, IONetworkInterface *);
-                InsertFn insert = isStack && stackVptr != nullptr
-                    ? reinterpret_cast<InsertFn>(
-                          reinterpret_cast<UInt8 *>(stackVptr) - 0xac94)
-                    : nullptr;
-                const bool inserted = insert != nullptr && insert(stack, iface);
-                provider->setProperty("Ath10kStackPhase",
-                                      !isStack ? "stack-class-mismatch"
-                                               : (inserted ? "stack-inserted"
-                                                           : "stack-insert-failed"));
-            } else {
-                provider->setProperty("Ath10kStackPhase", "no-stack");
-            }
-        }
+        // Do not ask IONetworkStack for a unit. insertNetworkInterface() is a
+        // local symbol, and calling it by its fixed vtable delta does not merely
+        // fail — it corrupts the stack on 13.7. Measured symptom: en0 stops
+        // working for the whole system ("interface name en0 is unavailable"
+        // floods the serial log, sshd never answers) while the guest keeps
+        // running and the radio itself stays up. The BSD unit has to be built by
+        // the driver, not handed to Apple's stack.
+        provider->setProperty("Ath10kStackPhase", "driver-owns-ifnet");
 #endif
     }
     // The BSD unit (enN) belongs to the IO80211VirtualInterface /
@@ -3177,8 +3163,21 @@ bool Ath10kPCIDevice::preparePCIeBringupParity()
     ATH10K_TRACE("Ath10kMac: PCIe bring-up parity begin (ASPM off + IOPCIFamily IRQ registration)\n");
 
     if (!disableASPMForBringup()) {
-        IOLog("Ath10kMac: PCIe bring-up parity stopped: ASPM disable/readback failed\n");
-        return false;
+        // A hypervisor (QEMU/VFIO on the verification VM) can expose the PCIe
+        // link register yet ignore the ASPM write: the readback stays 0x143
+        // with both L0s and L1 still set. Treating that as fatal stalled the
+        // whole target probe on the very first gate, so no firmware work ever
+        // happened. ASPM-off only widens the reset margin; it is not needed to
+        // bring the chip up. Bail only when the register itself is unreadable
+        // (0xffff) - that is a real PCIe fault.
+        if (_pcieLinkControlBefore == 0xffffu || _pcieLinkControlDuring == 0xffffu) {
+            IOLog("Ath10kMac: PCIe bring-up parity stopped: ASPM register unreadable\n");
+            return false;
+        }
+        if (_pci)
+            _pci->setProperty("Ath10kASPMControl", "write-ignored-continued");
+        IOLog("Ath10kMac: PCIe bring-up parity: ASPM write ignored by platform (0x%04x); continuing\n",
+              _pcieLinkControlDuring);
     }
 
     if (!prepareIRQParity()) {

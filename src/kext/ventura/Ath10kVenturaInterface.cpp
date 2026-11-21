@@ -56,9 +56,31 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
         if (probe) probe->setProperty("Ath10kIfacePhase", "ethernet-init-failed");
         return false;
     }
+    // IOEthernetInterface::initIfnetParams() refuses anything but IFT_ETHER
+    // (it compares the type to 6 and bails), so the unit only appears while the
+    // interface still looks like Ethernet. The 802.11 stamp therefore happens
+    // after the data link layer is attached - see start() - where it updates the
+    // IOInterfaceType property that SystemConfiguration classifies from.
+    const bool typeOk = setInterfaceType(0x6 /* IFT_ETHER: required by initIfnetParams */);
+    if (probe) probe->setProperty("Ath10kInterfaceType",
+                                  typeOk ? "ethernet-pre-attach" : "set-failed");
     _owner = owner;
     if (probe) probe->setProperty("Ath10kIfacePhase", "inited");
     return true;
+}
+
+// IFT_ETHER is what makes initIfnetParams() build an ifnet at all, but
+// SystemConfiguration classifies the published unit from the IOInterfaceType
+// property - with 6 it builds an "Ethernet 2" service and airportd refuses to
+// touch the radio ("all AirPort network services are disabled"). Stamp the
+// 802.11 type on the object that actually got the unit, right after the data
+// link layer attached it.
+IOReturn Ath10kVenturaInterface::attachToDataLinkLayer(IOOptionBits options, void *param)
+{
+    const IOReturn result = IO80211Interface::attachToDataLinkLayer(options, param);
+    if (result == kIOReturnSuccess)
+        setProperty("IOInterfaceType", static_cast<UInt64>(0x47), 32);
+    return result;
 }
 
 UInt32 Ath10kVenturaInterface::inputPacket(mbuf_t packet, UInt32 length,

@@ -73,6 +73,8 @@ private:
     void venturaDisassociate(bool deauth);
     IOReturn venturaScanResult(apple80211_scan_result *result);
     SInt32 venturaChannel(void *data, bool isSet);
+    SInt32 venturaDispatchRequest(unsigned int requestType, int requestNumber,
+                                  IO80211Interface *iface, void *data);
     SInt32 venturaCapabilities(void *data);
     SInt32 venturaSupportedChannels(void *data);
     SInt32 venturaVersion(void *data);
@@ -82,5 +84,12 @@ private:
     bool _venturaPowerOn = false;
     UInt32 _venturaState = APPLE80211_S_INIT;
     UInt8 _venturaScanIndex = 0;
+    // Request breadcrumbs: airportd reports "Off (forced)" when the power
+    // request never reaches the driver, and there is no other channel to tell
+    // "no request arrived" from "request refused".
+    UInt32 _venturaRequestCount = 0;
+    UInt32 _venturaLastRequest = 0xffffffffu;
+    bool _venturaLastRequestIsSet = false;
+    SInt32 _venturaLastRequestStatus = 0;
 
 public:
