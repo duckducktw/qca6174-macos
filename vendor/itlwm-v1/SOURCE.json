@@ -1,0 +1,7 @@
+{
+  "url": "https://github.com/OpenIntelWireless/itlwm",
+  "commit": "53c51c2cdd6e4b69beb91f310d74c53422b0f8bd",
+  "files": ["include/Airport"],
+  "note": "Ventura-era IO80211 v1 declarations, selected with __IO80211_TARGET __MAC_13_0. Header-only; GPL-2.0 notices retained in each file.",
+  "license": "GPL-2.0"
+}

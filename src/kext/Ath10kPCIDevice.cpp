@@ -10,7 +10,7 @@ extern "C" kmod_info_t kmod_info;
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSData.h>
 
-#ifdef ATH10K_NATIVE
+#if defined(ATH10K_VENTURA) || defined(ATH10K_NATIVE)
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(Ath10kPCIDevice, IO80211Controller)
 #else

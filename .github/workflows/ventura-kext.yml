@@ -1,0 +1,70 @@
+# Ventura (macOS 13) native IO80211 build.
+# Produces the v1-ABI kext used on Ventura hardware; the Sequoia adapter in
+# ath10kmac-release.yml targets 15.2+ and cannot load on 13.x.
+name: Ath10kMac Ventura build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+    paths:
+      - "src/kext/ventura/**"
+      - "vendor/itlwm-v1/**"
+      - "Makefile"
+      - "scripts/prepare-kext-info.py"
+      - ".github/workflows/ventura-kext.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ventura:
+    name: Build Ventura (macOS 13) kext
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v6.1.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify toolchain and MacKernelSDK
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          if [[ ! -d MacKernelSDK ]]; then
+            git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git MacKernelSDK
+          fi
+          test -f MacKernelSDK/Library/x86_64/libkmod.a
+
+      - name: Build Ventura kext
+        run: |
+          set -euo pipefail
+          make clean
+          make NATIVE=0 VENTURA=1 -j"$(sysctl -n hw.logicalcpu)" kext
+          plutil -lint build/ventura/out/Ath10kMac.kext/Contents/Info.plist
+          xcrun lipo build/ventura/out/Ath10kMac.kext/Contents/MacOS/Ath10kMac -verify_arch x86_64
+          /usr/libexec/PlistBuddy -c 'Print:OSBundleLibraries:com.apple.iokit.IO80211Family' \
+            build/ventura/out/Ath10kMac.kext/Contents/Info.plist
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p build/dist
+          ditto -c -k --norsrc --keepParent build/ventura/out/Ath10kMac.kext \
+            "build/dist/Ath10kMac-Ventura-${GITHUB_SHA:0:12}.zip"
+          (cd build/dist && shasum -a 256 *.zip > SHA256SUMS.txt)
+          cat build/dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ath10kMac-Ventura
+          path: build/dist/*
+          if-no-files-found: error
+          retention-days: 14

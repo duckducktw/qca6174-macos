@@ -5,14 +5,34 @@ from pathlib import Path
 import plistlib
 
 
-def prepare(native, destination, diagnostic_stage=0, p256_diagnostic=False):
+def prepare(native, destination, diagnostic_stage=0, p256_diagnostic=False, ventura=False):
     if diagnostic_stage not in range(5):
         raise ValueError('unknown diagnostic stage')
     if p256_diagnostic != (diagnostic_stage == 4) or (p256_diagnostic and not native):
         raise ValueError('stage 4 requires native build and explicit P-256 diagnostic compilation')
+    if ventura and not native:
+        raise ValueError('ventura build requires the native personality path')
     root = Path(__file__).resolve().parents[1]
     info = plistlib.loads((root / 'Ath10kMac.kext/Contents/Info.plist').read_bytes())
-    if native:
+    if ventura:
+        # Ventura era IO80211 v1 surface: no Skywalk, no FaultReporter.
+        info['OSBundleLibraries'].update({
+            'com.apple.iokit.IO80211Family': '1200.13.0',
+            'com.apple.driver.corecapture': '1.0.0', 'com.apple.kec.corecrypto': '1.0',
+        })
+        for key in ('com.apple.iokit.IOSkywalkFamily',):
+            info['OSBundleLibraries'].pop(key, None)
+        personality = info['IOKitPersonalities']['QCA9377']
+        personality.update({
+            'IOMatchCategory': 'WiFiDriver', 'IONetworkRootType': 'airport',
+            'Ath10kNativeExperimental': True, 'IOPCISecondaryMatch': '0x2b511a3b',
+            'Ath10kDiagnosticStage': diagnostic_stage, 'Ath10kProbeOnly': False,
+            'Ath10kStationDFS': True, 'Ath10kVenturaABI': True,
+        })
+        liteon = dict(personality)
+        liteon.update({'IOPCIMatch': '0x003e168c', 'IOPCISecondaryMatch': '0x080711ad'})
+        info['IOKitPersonalities'] = {'LiteOn-QCA6174': liteon}
+    elif native:
         info['OSBundleLibraries'].update({
             'com.apple.iokit.IO80211Family': '1200.13.1',
             'com.apple.iokit.IOSkywalkFamily': '1.0',
@@ -47,5 +67,7 @@ if __name__ == '__main__':
     parser.add_argument('destination', type=Path)
     parser.add_argument('--diagnostic-stage', type=int, choices=[0, 1, 2, 3, 4], default=0)
     parser.add_argument('--p256-diagnostic', action='store_true')
+    parser.add_argument('--ventura', action='store_true')
     args = parser.parse_args()
-    prepare(bool(args.native), args.destination, args.diagnostic_stage, args.p256_diagnostic)
+    prepare(bool(args.native), args.destination, args.diagnostic_stage,
+            args.p256_diagnostic, args.ventura)

@@ -2,6 +2,7 @@
 PROJ_ROOT := $(shell pwd)
 BUILD_DIR := $(PROJ_ROOT)/build
 NATIVE ?= 1
+VENTURA ?= 0
 DIAGNOSTIC_STAGE ?= 0
 P256_DIAGNOSTIC ?= 0
 ifeq ($(P256_DIAGNOSTIC),1)
@@ -21,6 +22,9 @@ endif
 endif
 ifeq ($(NATIVE),1)
 BUILD_DIR := $(PROJ_ROOT)/build/native
+endif
+ifeq ($(VENTURA),1)
+BUILD_DIR := $(PROJ_ROOT)/build/ventura
 endif
 OUT_DIR   := $(BUILD_DIR)/out
 OUT_KEXT  := $(OUT_DIR)/Ath10kMac.kext
@@ -60,21 +64,36 @@ LDFLAGS = $(ARCH) -static -nostdlib -Xlinker -kext \
            $(MKSDK)/Library/universal/libkmodc++.a \
            -F$(SDK)/System/Library/Frameworks
 
+ifeq ($(VENTURA),1)
+CXXFLAGS += -DATH10K_VENTURA=1 -UATH10K_NATIVE -I$(PROJ_ROOT)/vendor/itlwm-v1 -I$(PROJ_ROOT)/vendor/itlwm-v1/Airport
+MINOS := -mmacosx-version-min=13.0
+VENTURA_OBJECT := $(BUILD_DIR)/Ath10kVentura.o $(BUILD_DIR)/Ath10kVenturaInterface.o
+endif
+
 ifeq ($(NATIVE),1)
+ifeq ($(VENTURA),1)
+else
 CXXFLAGS += -DATH10K_NATIVE=1 -I$(PROJ_ROOT)/vendor/itlwm
 NATIVE_OBJECT := $(BUILD_DIR)/Ath10kNative.o $(BUILD_DIR)/Ath10kSAEWorker.o $(BUILD_DIR)/Ath10kSAESession.o $(BUILD_DIR)/Ath10kNativeSAEPreparation.o $(BUILD_DIR)/Ath10kP256CheckJob.o $(BUILD_DIR)/Ath10kPMFSession.o
+endif
 endif
 
 ifeq ($(P256_DIAGNOSTIC),1)
 # Standalone registry diagnostic: no controller, networking, firmware or DMA code.
 OBJS := $(BUILD_DIR)/Ath10kSAEWorker.o $(BUILD_DIR)/Ath10kP256CheckJob.o $(BUILD_DIR)/Ath10kP256RegistryJob.o $(BUILD_DIR)/Ath10kP256DiagnosticService.o $(BUILD_DIR)/kmod_info.o
 else
-OBJS := $(NATIVE_OBJECT) $(BUILD_DIR)/Ath10kUserClient.o $(BUILD_DIR)/Ath10kNetwork.o $(BUILD_DIR)/Ath10kRuntime.o $(BUILD_DIR)/Ath10kPower.o $(BUILD_DIR)/Ath10kRecovery.o $(BUILD_DIR)/Ath10kPCIDevice.o $(BUILD_DIR)/kmod_info.o
+OBJS := $(NATIVE_OBJECT) $(VENTURA_OBJECT) $(BUILD_DIR)/Ath10kUserClient.o $(BUILD_DIR)/Ath10kNetwork.o $(BUILD_DIR)/Ath10kRuntime.o $(BUILD_DIR)/Ath10kPower.o $(BUILD_DIR)/Ath10kRecovery.o $(BUILD_DIR)/Ath10kPCIDevice.o $(BUILD_DIR)/kmod_info.o
 endif
 $(OBJS): $(wildcard src/shared/*.hpp)
 ifeq ($(NATIVE),1)
 $(OBJS): $(wildcard src/kext/native/*)
 endif
+
+$(BUILD_DIR)/Ath10kVentura.o: src/kext/ventura/Ath10kVentura.cpp $(wildcard src/kext/ventura/*) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/Ath10kVenturaInterface.o: src/kext/ventura/Ath10kVenturaInterface.cpp $(wildcard src/kext/ventura/*) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/Ath10kNative.o: src/kext/native/Ath10kNative.cpp $(wildcard src/kext/native/*) $(wildcard src/kext/*.hpp) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -164,7 +183,7 @@ native-preflight:
 
 $(OUT_BIN): Makefile $(OBJS) Ath10kMac.kext/Contents/Info.plist scripts/prepare-kext-info.py
 	@mkdir -p "$(OUT_KEXT)/Contents/MacOS"
-	$(PYTHON) scripts/prepare-kext-info.py $(NATIVE) "$(OUT_KEXT)/Contents/Info.plist" --diagnostic-stage $(DIAGNOSTIC_STAGE) $(if $(filter 1,$(P256_DIAGNOSTIC)),--p256-diagnostic,)
+	$(PYTHON) scripts/prepare-kext-info.py $(NATIVE) "$(OUT_KEXT)/Contents/Info.plist" --diagnostic-stage $(DIAGNOSTIC_STAGE) $(if $(filter 1,$(P256_DIAGNOSTIC)),--p256-diagnostic,) $(if $(filter 1,$(VENTURA)),--ventura,)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
 
 clean:

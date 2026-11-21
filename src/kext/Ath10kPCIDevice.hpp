@@ -1,6 +1,10 @@
 #pragma once
 
-#ifdef ATH10K_NATIVE
+#if defined(ATH10K_VENTURA)
+#include "ventura/Ath10kVenturaABI.hpp"
+#include "ventura/Ath10kVenturaInterface.hpp"
+#define ATH10K_CONTROLLER_BASE IO80211Controller
+#elif defined(ATH10K_NATIVE)
 #include "native/Ath10kNativeInterface.hpp"
 #define ATH10K_CONTROLLER_BASE IO80211Controller
 #else
@@ -41,7 +45,9 @@
 class Ath10kPCIDevice : public ATH10K_CONTROLLER_BASE
 {
     OSDeclareDefaultStructors(Ath10kPCIDevice)
-#ifdef ATH10K_NATIVE
+#if defined(ATH10K_VENTURA)
+#include "ventura/Ath10kVenturaDecl.inc"
+#elif defined(ATH10K_NATIVE)
 #include "native/Ath10kControllerDecl.inc"
 #endif
 
