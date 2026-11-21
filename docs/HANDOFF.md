@@ -6,9 +6,9 @@
 
 **誠實狀態（2026-11-22 01:20）**：這輪把「無線電完全沒開機」這個更底層的阻塞解掉了，VM 內 **firmware 首次真的跑起來**（`Ath10kRecoveryPhase = ready`、`Ath10kWMIInitSucceeded = Yes`、serial 有 `READY Qualcomm Atheros QCA6174`），同時 `en2` 這個 **BSD 介面單元**也出現了。但 Wi-Fi 服務被 SystemConfiguration 歸類成 **Ethernet**（`IOInterfaceType = 6`），所以 `airportd` 一個 apple80211 請求都沒送進來（計數器實測 0），系統設定仍看不到可用的 Wi-Fi、B～E 後半全部未達成。
 
-分支：`ventura-io80211`，最新 commit `5cf75ba`（已推遠端）。VM 目前跑 **v40 bundle**（`/tmp/vk40`，radio up + en2 + SSH 正常）。
+分支：`ventura-io80211`，最新 commit `13d3877`（已推遠端）。VM 目前跑 **v43 bundle**（`/tmp/vk43`，radio up + en2 + SSH 正常）。
 
-## 目前唯一權威狀態（v40）
+## 目前唯一權威狀態（v43）
 
 VM：macOS **13.7.8 / 22H730**，`com.apple.iokit.IO80211Family 1200.13.0`（載入基址 `0xffffff8001f35000`，長度 `0x19bff9`，結束於 `0x20d0ff9`），`IONetworkingFamily 3.4`。kext `br.com.jonasw8.driver.ath10kmac 0.0.105`，OpenCore 1.0.5 DEBUG（`Target=67`、`ShowPicker=false`、`Timeout=0`）。v40 hash 前 20 碼 `a0ac30d702e698c8d1d6`。
 
@@ -72,9 +72,15 @@ VM：macOS **13.7.8 / 22H730**，`com.apple.iokit.IO80211Family 1200.13.0`（載
 
 ## 下一個接手的人：照這個順序做
 
-1. **讓 SystemConfiguration 真的把 en2 當 Wi-Fi 服務。** v40 的 ioreg 已經是 `IOInterfaceType=71`，但 `networksetup -listnetworkserviceorder` 還是舊的 `Ethernet 2`（SC 把服務存在 `/Library/Preferences/SystemConfiguration/preferences.plist`，會沿用舊分類）。
-   實測失敗的一招（別重試）：`sudo networksetup -removenetworkservice "Ethernet 2"` → **`You cannot remove Ethernet 2 because there aren't any other network services on Ethernet.`**（它是該類別唯一的服務，所以砍不掉）。
-   要做的是讓 SC 重新分類：直接動 `/Library/Preferences/SystemConfiguration/preferences.plist` 裡 en2 那筆（`NetworkInterfaces` 的 `Type`／或整筆移除後重開機），或先重開機確認新 boot 的 en2 一出現就是 71（SC 在介面首次出現時才寫入分類，之後就沿用快取）。
+0. **先讀這段：SC 分類這一關卡在哪（本輪已把機制量測清楚，別重複試）**
+   - SystemConfiguration 給介面的分類記錄在 `/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist`：v43 boot 實測 en2 那筆是 `SCNetworkInterfaceType = IEEE80211`、`SCNetworkInterfaceInfo.UserDefinedName = Wi-Fi`，**但 `IOInterfaceType = 6`**；服務（`preferences.plist` 的 `NetworkServices`）因此被建成 `Type/Hardware = Ethernet` 的 "Ethernet 2"，airportd 於是認定「沒有任何 AirPort 服務」→ `getairportpower` 永遠 `Off (forced)`、`Ath10kApple80211Requests` 永遠不存在。
+   - 這個值是在介面**第一次被 SC 看到**時（`registerService()`）讀的，不是 attach 時。所以「attach 後才蓋 71」一定留下 6 的記錄。
+   - 把 71 提前（在 `init()`、`createInterface()`、或 `initIfnetParams()` 呼叫 base 前後）**都會讓 BSD 單元整個不見**（v42 / v44 實測 `ifconfig -l` 只剩 en0）。原因是 family 的 attach 路徑自己就會讀這個 property 並只接受 IFT_ETHER。
+   - 手動改 `preferences.plist` / 刪 `NetworkInterfaces.plist` 記錄再重開機，SC 會用同樣的 6 重新推導（本輪試過三次）；`networksetup -removenetworkservice` 會拒絕（該類別唯一服務）、`-createnetworkservice "Wi-Fi" en2` 會說 en2 不是合法 hardware port、`launchctl kickstart com.apple.configd` 被 SIP 擋。
+   - **結論：不要再用「把 Ethernet 形狀的介面硬掰成 80211」這條路。** 要嘛走 Apple 的 `IO80211VirtualInterface`/`IO80211InfraInterface` 發布（`vif-create-failed` 那關要先解），要嘛照 AirportItlwm 自己用 net80211 配置 ifnet（`ifnet_allocate` 時 `type = IFT_IEEE80211`，全程不經 `IOEthernetInterface::initIfnetParams`）。
+   - 量測工具：`tools/ifnet-type.c`（guest 內 `xcrun clang -o ifnet-type ifnet-type.c && ./ifnet-type`）直接印 kernel 眼中的 `ifi_type`；v41 實測 en2 是 `0x47`，可見 ifnet 型別可以改，**但 SC 看的不是它**。
+
+1. **走 vif / Infra 或自建 net80211 ifnet**（承上）。`createVirtualInterface(addr, 7)` 失敗點在 `IO80211VirtualInterface::init` 內部：它會依序問 `apple80211RequestIoctl(0xc03069c9, 0xc/0xe/0x50, this, …)`（反組譯 `IO80211Interface::init` 可見），而 `apple80211RequestIoctl` 是**非虛擬**的 Apple 方法，尾巴跳 `[vptr + 0xcb0]`——這個 slot 目前被 `alignVenturaVtable()` 填成 `venturaSkywalkRequestSlot`，值得確認它是否真的被呼叫（把計數器搬到那個 thunk 上就知道了）。
 2. **確認 airportd 的請求會進來。** 服務變 Wi-Fi 之後再看 `Ath10kApple80211Requests`；>0 就代表 `apple80211Request` 通道打通，接著要一個一個補真的實作。
 3. **把 stubbed 的 80211 動作接到真正的 WMI。** 目前 `venturaScan()` 只清 index、`venturaAssociate()` 直接回 `kIOReturnUnsupported`、`venturaScanResult()` 回 `NotFound`——**掃描/連線核心邏輯完全沒接**（firmware 已經 ready，WMI 掃描通道 `_wmiScan` 在 Sequoia 分支有實作可直接搬）。
 4. **實機驗證。** 以上在 VM 通了之後才把 kext 部署回實體 ESP 並在真機重驗（ASPM 在真機是可控的，`Ath10kASPMControl` 應該不會出現 `write-ignored-continued`）。
