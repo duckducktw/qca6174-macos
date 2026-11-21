@@ -64,9 +64,9 @@ static void venturaPhase(IOService *p, const char *phase)
 
 void Ath10kPCIDevice::getLogPipes(CCPipe **driver, CCPipe **datapath, CCPipe **snapshot)
 {
-    if (driver) *driver = _venturaPipes[0];
-    if (datapath) *datapath = _venturaPipes[1];
-    if (snapshot) *snapshot = _venturaPipes[2];
+    // Defer to the family: it hands back the controller's own corecapture pipes,
+    // which is what its fault-reporter lookup expects.
+    IO80211Controller::getLogPipes(driver, datapath, snapshot);
 }
 
 // ---------------------------------------------------------------------------

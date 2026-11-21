@@ -18,6 +18,9 @@ bool Ath10kPCIDevice::createWorkLoop()
 {
     // IONetworkController sets a policy on this loop's thread. The Sequoia
     // IO80211WorkQueue::getThread() returns NULL and cannot fill that role.
+    // NOTE: referencing IO80211WorkLoop::workLoop() here (like AirportItlwm)
+    // makes OpenCore skip the whole kext on 13.7 - the binary links, but the
+    // injected kext never appears in kmutil - so keep the plain work loop.
     if (!_networkWorkLoop) _networkWorkLoop=IOWorkLoop::workLoop();
     if (!_networkWorkLoop) return false;
 #ifdef ATH10K_NATIVE

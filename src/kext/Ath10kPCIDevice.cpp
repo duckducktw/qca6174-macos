@@ -216,7 +216,9 @@ bool Ath10kPCIDevice::start(IOService *provider)
     provider->setProperty("Ath10kStartPhase", "super-start");
     // IO80211Controller dispatches getLogPipes/getFaultReporterFromDriver at the
     // Skywalk-era offsets; line our slots up before any Apple code runs.
-    alignVenturaVtable();
+    // Disabled for now: with the base getLogPipes restored the family attaches
+    // its own fault reporter, so no slot surgery is needed.
+    // alignVenturaVtable();
     // Only let Apple's start() run once the fault reporter it demands exists:
     // without one, its very next logDebug() panics the kernel.
     const bool reporterReady = _venturaCoreFault != nullptr;
@@ -255,13 +257,11 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // the corecapture pipes (getLogPipes) and a CCFaultReporter service in
     // place it returns normally instead. Fall back to the Ethernet base if it
     // still refuses, so a failing experiment never costs the working interface.
-    // Apple's IO80211Controller::start() still panics inside logDebug() even
-    // with the fault reporter in place (it asks for one during init, before any
-    // driver hook can run), so keep bringing the controller up through its
-    // Ethernet base and build the 80211 plumbing explicitly.
-    bool appleStart = false;
-    provider->setProperty("Ath10kStartPhase",
-                          reporterReady ? "apple-start-skipped" : "apple-start-skipped");
+    // AirportItlwm proves Apple's start() works on Ventura, so use it: no vtable
+    // surgery and no getLogPipes override, the family attaches its own
+    // reporter exactly like it does for Apple's drivers.
+    bool appleStart = super::start(provider);
+    provider->setProperty("Ath10kStartPhase", appleStart ? "apple-started" : "apple-start-failed");
     if (!appleStart) {
         if (!IOEthernetController::start(provider)) {
             IOLog("Ath10kMac: base start failed\n");

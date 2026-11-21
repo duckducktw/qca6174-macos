@@ -44,6 +44,9 @@ private:
     // its corecapture pipes through this virtual; the default implementation
     // returns nothing, which leaves ivars->_faultReporter null and makes the
     // controller panic inside logDebug().
+    // Kept as an override so the vtable slot stays resolvable, but it now just
+    // defers to Apple's own implementation: returning our private pipes here
+    // made findAndAttachToFaultReporter() take the "no pipe" branch and panic.
     void getLogPipes(CCPipe **, CCPipe **, CCPipe **) override;
     // The IO80211Family build that actually loads on 13.7 is the Skywalk-era
     // generation: it dispatches getLogPipes at +0xd20 and
