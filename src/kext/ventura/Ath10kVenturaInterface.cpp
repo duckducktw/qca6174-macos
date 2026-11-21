@@ -13,6 +13,21 @@
 
 #include <IOKit/IOCommandGate.h>
 
+// Apple's own IOEthernetInterface::init(IONetworkController*), addressed by its
+// mangled name. A normal qualified C++ call compiles to a virtual dispatch and
+// therefore lands back in IO80211Interface::init(), which is the implementation
+// this branch has to avoid (it needs controller state that only
+// IO80211Controller::start() creates).
+extern "C" bool ath10kEthernetInterfaceInit(IOEthernetInterface *self,
+                                            IONetworkController *controller)
+    __asm("__ZN19IOEthernetInterface4initEP19IONetworkController");
+
+// Diagnostic ladder: the same two implementations one level down, also by
+// mangled name, so each stage can report its own outcome.
+extern "C" bool ath10kNetworkInterfaceInit(IONetworkInterface *self,
+                                           IONetworkController *controller)
+    __asm("__ZN18IONetworkInterface4initEP19IONetworkController");
+
 #define super IO80211Interface
 OSDefineMetaClassAndStructors(Ath10kVenturaInterface, IO80211Interface)
 
@@ -21,9 +36,24 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
     if (controller == nullptr || owner == nullptr)
         return false;
     IOService *probe = owner->getProvider();
-    if (probe) probe->setProperty("Ath10kIfacePhase", "super-init");
-    if (!super::init(controller)) {
-        if (probe) probe->setProperty("Ath10kIfacePhase", "super-init-failed");
+    if (probe) probe->setProperty("Ath10kIfacePhase",
+                                  OSDynamicCast(IONetworkController, controller)
+                                      ? "ethernet-init" : "controller-not-network");
+    // IO80211Interface::init() reads controller state (fault reporter, log
+    // stream, monitor) that only IO80211Controller::start() creates, and this
+    // branch deliberately bypasses that start() (it panics without an attached
+    // fault reporter). The interface Apple actually publishes is allocated and
+    // named one level down, in IONetworkController/IOEthernetInterface, so call
+    // that implementation directly and skip the IO80211-only preconditions.
+    bool netOk = ath10kNetworkInterfaceInit(this, controller);
+    if (probe) probe->setProperty("Ath10kNetworkInitPhase",
+                                  netOk ? "network-init-ok" : "network-init-failed");
+    if (!netOk) {
+        if (probe) probe->setProperty("Ath10kIfacePhase", "network-init-failed");
+        return false;
+    }
+    if (!ath10kEthernetInterfaceInit(this, controller)) {
+        if (probe) probe->setProperty("Ath10kIfacePhase", "ethernet-init-failed");
         return false;
     }
     _owner = owner;

@@ -220,6 +220,43 @@ bool Ath10kPCIDevice::start(IOService *provider)
 #endif
     provider->setProperty("Ath10kStartPhase", "controller-started");
 #if defined(ATH10K_VENTURA)
+    // IOEthernetInterface::init() reads an "IOPacketFilters" dictionary off the
+    // controller and fails outright when it is missing (it checks the
+    // WakeOnLAN groups inside it). Apple's IO80211Controller::start() path
+    // publishes that dictionary through IONetworkController's property
+    // publishing; this branch bypasses it, so publish the same three groups
+    // here before the interface is created.
+    {
+        OSDictionary *packetFilters = OSDictionary::withCapacity(3);
+        if (packetFilters) {
+            OSNumber *netGroup = OSNumber::withNumber(static_cast<UInt64>(0x333), 32);
+            OSNumber *wakeGroup = OSNumber::withNumber(static_cast<UInt64>(0), 32);
+            OSNumber *disabledWakeGroup = OSNumber::withNumber(static_cast<UInt64>(0), 32);
+            if (netGroup) { packetFilters->setObject("IONetworkFilterGroup", netGroup); netGroup->release(); }
+            if (wakeGroup) { packetFilters->setObject("IOEthernetWakeOnLANFilterGroup", wakeGroup); wakeGroup->release(); }
+            if (disabledWakeGroup) { packetFilters->setObject("IOEthernetDisabledWakeOnLANFilterGroup", disabledWakeGroup); disabledWakeGroup->release(); }
+            setProperty("IOPacketFilters", packetFilters);
+            packetFilters->release();
+            provider->setProperty("Ath10kStartPhase", "packet-filters");
+        } else {
+            provider->setProperty("Ath10kStartPhase", "packet-filters-failed");
+            return false;
+        }
+    }
+#endif
+#if defined(ATH10K_VENTURA)
+    // IONetworkController::configureInterface(), called from attachInterface(),
+    // bails out when the controller has no output queue: the bypass skips the
+    // part of IO80211Controller::start() that would have created one.
+    if (!getOutputQueue()) {
+        if (!createOutputQueue()) {
+            provider->setProperty("Ath10kStartPhase", "output-queue-failed");
+            return false;
+        }
+        provider->setProperty("Ath10kStartPhase", "output-queue");
+    }
+#endif
+#if defined(ATH10K_VENTURA)
     // The controller came up through its IONetworkController base, so the
     // interface Apple would normally publish is ours to create and attach.
     if (!_venturaInterface) {
@@ -228,9 +265,33 @@ bool Ath10kPCIDevice::start(IOService *provider)
             provider->setProperty("Ath10kStartPhase", "interface-create-failed");
             return false;
         }
-        if (!attachInterface(&iface, true)) {
-            provider->setProperty("Ath10kStartPhase", "interface-attach-failed");
+        // attachInterface() re-runs createInterface() and then silently bails
+        // when any of its inner steps fail, so walk the same steps here to see
+        // which one refuses.
+        if (!configureInterface(iface)) {
+            provider->setProperty("Ath10kStartPhase", "configure-failed");
             OSSafeReleaseNULL(iface);
+            return false;
+        }
+        provider->setProperty("Ath10kStartPhase", "configured");
+        if (!iface->attach(this)) {
+            provider->setProperty("Ath10kStartPhase", "attach-failed");
+            OSSafeReleaseNULL(iface);
+            return false;
+        }
+        provider->setProperty("Ath10kStartPhase", "attached");
+        // IO80211Controller::attachInterface() also records the interface in
+        // its own ivar (offset 0x200, visible in that method's code); the
+        // IO80211 paths (getInterface/enable/apple80211) read it back.
+        *(IONetworkInterface **)((char *)this + 0x200) = iface;
+        _venturaInterface = static_cast<Ath10kVenturaInterface *>(iface);
+        iface->registerService();
+        provider->setProperty("Ath10kStartPhase", "interface-registered");
+        // The 80211 stack normally takes this step from inside the controller
+        // start path we bypass; without it the interface has no BSD unit and
+        // never appears in System Settings / networksetup.
+        if (!iface->attachToDataLinkLayer(0, nullptr)) {
+            provider->setProperty("Ath10kStartPhase", "data-link-failed");
             return false;
         }
         provider->setProperty("Ath10kStartPhase", "interface-published");

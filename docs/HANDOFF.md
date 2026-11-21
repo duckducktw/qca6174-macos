@@ -4,9 +4,9 @@
 
 目標：讓 QCA6174（`168c:003e`，子系統 `11ad:0807`）在 macOS 13.x Ventura 上以 **真正原生** 形式運作——出現在「系統設定 → Wi-Fi」、可開關、可掃描、可 WPA2 連線，且**不用相容層、不用獨立 app、不要求使用者開終端機**。驗證由 agent 自己在 VM 內完成（使用者留在 Ubuntu，只接實體網路線）。
 
-**誠實狀態**：尚未達成。驅動已能在 VM 內**成功載入並完成 controller 啟動**（過去多輪的 kernel panic 已解決），但目前**介面建立失敗**（`IO80211Interface::init()` 回傳 false），因此系統設定仍看不到 Wi-Fi。硬體驗證（實體 ESP 上的 stage0）尚未重新部署。
+**誠實狀態**：介面已能在 VM 內**建立、註冊並發布到 IORegistry**（驗收條件 A 通過：`Ath10kIfacePhase = "inited"`、`Ath10kStartPhase = "interface-published"`、`ioreg -r -c IO80211Interface` 有 23 行）。**尚未**取得 BSD 介面單元（`ifconfig -l` 仍只有 lo0/gif0/stf0/en0，`networksetup` 沒有 Wi-Fi 埠），因此系統設定看不到 Wi-Fi。硬體驗證（實體 ESP 上的 stage0）尚未重新部署。
 
-分支：`ventura-io80211`（HEAD `9f7dc15`，本次修改尚未 commit）。
+分支：`ventura-io80211`（本輪成果 commit 於此分支；介面已發布、BSD 單元未取得）。
 
 ## 目前唯一權威狀態
 
@@ -84,13 +84,20 @@ VM 若在 panic 循環：`cat ~/sudo.pwd | ssh 100.64.0.152 'bash /tmp/disable_b
 
 ## 下一個焦點（含驗收條件）
 
-**已定位的診斷（不用重新查）**：`Ath10kVenturaInterface::init()` 進得去，卡在 `if (!super::init(controller))` —— 也就是 `IO80211Interface::init(IONetworkController*)` 回傳 false。我們為了避開 `_faultReporter` panic 而跳過了 `IO80211Controller::start()`，合理懷疑該介面 init 依賴 Apple start 才會建立的 controller 狀態（log stream / `IO80211WorkLoop` / ivars / 介面命名）。
+**已解決（本輪，勿重查）**：`IO80211Interface::init()` 之所以回傳 false，根因在它尾巴呼叫的 `IOEthernetInterface::init(IONetworkController*)`：
 
-下一步要能回答的問題：
+1. 該函式**要求 controller 上有 `IOPacketFilters`（OSDictionary）屬性**，內含 `IONetworkFilterGroup` / `IOEthernetWakeOnLANFilterGroup` / `IOEthernetDisabledWakeOnLANFilterGroup`（`IOEthernetDisabledWakeOnLANFilterGroup` 必須是 OSNumber）。屬性不存在或型別不對 → 直接 `return false`。
+2. `attachInterface()` 內部的 `configureInterface()` **要求 controller 有 output queue**（`getOutputQueue()` 非 null），bypass 路徑不會建立它。
+3. `attachInterface()` 會**自己再呼叫一次 `createInterface()`**，並把結果寫回 call-by-ref 指標；直接呼叫時要自己補 `configureInterface()` → `iface->attach(this)` → `registerService()` → `attachToDataLinkLayer()`，並把介面寫進 `IO80211Controller` 的 ivar（offset `0x200`）。
+4. 呼叫底層實作必須用 mangled 名稱（`extern "C" ... __asm("__ZN19IOEthernetInterface4initEP19IONetworkController")`）。用 `IOEthernetInterface::init(controller)` 這種 qualified C++ 寫法會被編成 **virtual dispatch**，又繞回 `IO80211Interface::init`。
 
-1. `IO80211Interface::init()` 具體檢查什麼才回傳 false？（建議：從 `/tmp/kc2`（BootKernelExtensions.kc）抽出 IO80211Family，反組譯 `__ZN15IO80211Interface4initEP18IONetworkController`；注意 symtab offset 是 KC 絕對位置。）
-2. 被它需要的 controller 狀態能否由我們先補上？（候選：在 `createInterface()` 前呼叫 `setupControlPathLogging()`、設定 controller 的 log stream、或用 `initSupplicant()` 路徑。）
-3. 若無法滿足，替代方案是先用 `IOEthernetInterface::init(controller)` 完成初始化再 attach，或用 `attachInterface(nullptr, true)` 讓 IONetworkController 自己呼叫 `createInterface()`。
+**當前唯一缺口：BSD 介面單元**。`iface->attachToDataLinkLayer(0, nullptr)` 回傳 true，但 `ifconfig -l` 沒有新介面，`ioreg -r -c IO80211VirtualInterface` / `IO80211InfraInterface` 也都是 0 筆——Ventura 的 BSD 介面屬於 `IO80211InfraInterface`（`IO80211Interface` → `IO80211VirtualInterface` → `IO80211InfraInterface`）那一層，而 virtual interface 是 Apple 的 `IO80211Controller::start()` 建立的，bypass 路徑跳過它。
+
+下一步要做的事：
+
+1. **回頭讓 `IO80211Controller::start()` 真正跑成功**（架構上正確的路），而不是繼續在 bypass 上補洞。缺的最後一塊是 `getFaultReporterFromDriver()` override：`findAndAttachToFaultReporter()` 的流程是 `[vptr+0xd10]`（= `getLogPipes`）→ 結果存進 `ivars+0x50`，接著 `[vptr+0xd48]`（= `getFaultReporterFromDriver`）→ 存進 `ivars+0x68`。我們已經有 `getLogPipes` override，卻沒有第二個；Sequoia 分支的對照實作在 `src/kext/native/Ath10kControllerDecl.inc:15`。**注意**：`vendor/itlwm-v1/Airport/IO80211Controller.h` 沒有宣告這個 virtual，直接加 override 會排到 vtable 尾端導致錯位，必須先把它插進 header 的正確位置（v1 順序：`getLogPipes` 之後）。
+2. 成功後把 Ventura 分支改回 `super::start(provider)`（`IO80211Controller::start`），並移除 `start()` 裡手動 publish packet filters / output queue / create+configure+attach / `attachToDataLinkLayer` 那一整段（Apple 會自己做，含 virtual interface 與 BSD 單元）。
+3. 驗收條件 B–E 照原順序推進。
 
 驗收條件（依序）：
 
