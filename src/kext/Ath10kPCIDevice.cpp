@@ -318,20 +318,31 @@ bool Ath10kPCIDevice::start(IOService *provider)
         }
         provider->setProperty("Ath10kStartPhase", "interface-published");
 #if defined(ATH10K_VENTURA)
-        // A BSD unit only appears once IONetworkStack inserts the interface.
-        // That happens in IONetworkStack::insertNetworkInterface(), which we
-        // cannot link (local symbol), so reach the stack service and drive the
-        // same virtual interfacePublished() uses, at vptr+0x340.
+        // A BSD unit only appears once IONetworkStack inserts the interface via
+        // IONetworkStack::insertNetworkInterface(). That method is a local symbol
+        // (not exported), and the only stable handle on the class is the vtable
+        // its instance carries, so address it by its fixed offset from that
+        // vtable in this kernel build and refuse to call if the class is not the
+        // one we measured (13.7.8 / 22H730, IONetworkingFamily 3.4).
         {
             IOService *stack = IOService::waitForService(
                 IOService::serviceMatching("IONetworkStack"));
             if (stack) {
+                const bool isStack = stack->getMetaClass() != nullptr &&
+                    strcmp(stack->getMetaClass()->getClassName(), "IONetworkStack") == 0;
                 void **stackVptr = *reinterpret_cast<void ***>(stack);
-                typedef bool (*InsertFn)(IOService *, IONetworkInterface *, void *, UInt32);
-                InsertFn insert = reinterpret_cast<InsertFn>(stackVptr[0x340 / sizeof(void *)]);
-                const bool inserted = insert != nullptr && insert(stack, iface, nullptr, 0);
+                // __ZTV14IONetworkStack 0xffffff8002c71898 (vptr +0x10),
+                // insertNetworkInterface 0xffffff8002c66c14 -> -0xac94.
+                typedef bool (*InsertFn)(IOService *, IONetworkInterface *);
+                InsertFn insert = isStack && stackVptr != nullptr
+                    ? reinterpret_cast<InsertFn>(
+                          reinterpret_cast<UInt8 *>(stackVptr) - 0xac94)
+                    : nullptr;
+                const bool inserted = insert != nullptr && insert(stack, iface);
                 provider->setProperty("Ath10kStackPhase",
-                                      inserted ? "stack-inserted" : "stack-insert-failed");
+                                      !isStack ? "stack-class-mismatch"
+                                               : (inserted ? "stack-inserted"
+                                                           : "stack-insert-failed"));
             } else {
                 provider->setProperty("Ath10kStackPhase", "no-stack");
             }
