@@ -10,8 +10,8 @@ def prepare(native, destination, diagnostic_stage=0, p256_diagnostic=False, vent
         raise ValueError('unknown diagnostic stage')
     if p256_diagnostic != (diagnostic_stage == 4) or (p256_diagnostic and not native):
         raise ValueError('stage 4 requires native build and explicit P-256 diagnostic compilation')
-    if ventura and not native:
-        raise ValueError('ventura build requires the native personality path')
+    if ventura:
+        native = True
     root = Path(__file__).resolve().parents[1]
     info = plistlib.loads((root / 'Ath10kMac.kext/Contents/Info.plist').read_bytes())
     if ventura:
