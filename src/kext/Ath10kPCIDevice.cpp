@@ -307,8 +307,6 @@ bool Ath10kPCIDevice::start(IOService *provider)
         // IO80211 paths (getInterface/enable/apple80211) read it back.
         *(IONetworkInterface **)((char *)this + 0x200) = iface;
         _venturaInterface = static_cast<Ath10kVenturaInterface *>(iface);
-        iface->registerService();
-        provider->setProperty("Ath10kStartPhase", "interface-registered");
         // The 80211 stack normally takes this step from inside the controller
         // start path we bypass; without it the interface has no BSD unit and
         // never appears in System Settings / networksetup.
@@ -316,14 +314,16 @@ bool Ath10kPCIDevice::start(IOService *provider)
             provider->setProperty("Ath10kStartPhase", "data-link-failed");
             return false;
         }
-        provider->setProperty("Ath10kStartPhase", "interface-published");
-        // Only now is the interface attached: IFT_ETHER was needed for
-        // initIfnetParams() to build the unit, and SystemConfiguration classifies
-        // the BSD interface from this property (71 = IFT_IEEE80211), which is what
-        // turns the "Ethernet 2" service into a Wi-Fi one that airportd and the
-        // Wi-Fi pane act on.
+        provider->setProperty("Ath10kStartPhase", "data-link-attached");
+        // IFT_ETHER was needed for initIfnetParams() to build the unit, and
+        // SystemConfiguration classifies the BSD interface from this property -
+        // but it reads it when the interface first appears, so the 802.11 stamp
+        // has to precede registerService(). 71 = IFT_IEEE80211 is what turns the
+        // "Ethernet 2" service into a Wi-Fi one that airportd acts on.
         iface->setProperty("IOInterfaceType", static_cast<UInt64>(0x47), 32);
         provider->setProperty("Ath10kInterfaceType", "ieee80211-after-attach");
+        iface->registerService();
+        provider->setProperty("Ath10kStartPhase", "interface-published");
 #if defined(ATH10K_VENTURA)
         // Do not ask IONetworkStack for a unit. insertNetworkInterface() is a
         // local symbol, and calling it by its fixed vtable delta does not merely

@@ -64,8 +64,33 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
     const bool typeOk = setInterfaceType(0x6 /* IFT_ETHER: required by initIfnetParams */);
     if (probe) probe->setProperty("Ath10kInterfaceType",
                                   typeOk ? "ethernet-pre-attach" : "set-failed");
+    // setInterfaceType() also rewrites the IOInterfaceType property, and
+    // SystemConfiguration reads that property when it first discovers the
+    // interface. Discovery must therefore happen after the 802.11 stamp (see the
+    // registerService() order below); stamping it here would make
+    // initIfnetParams' own type check read 71 and refuse to build the ifnet.
     _owner = owner;
     if (probe) probe->setProperty("Ath10kIfacePhase", "inited");
+    return true;
+}
+
+// The documented subclass hook: call the superclass implementation (which
+// requires IFT_ETHER) and then set the type-specific fields. Rewriting
+// params->type to IFT_IEEE80211 is what makes the ifnet a Wi-Fi interface -
+// SystemConfiguration classifies the BSD unit from the ifnet type, so without
+// this the adapter shows up as "Ethernet 2" and airportd will not manage it.
+bool Ath10kVenturaInterface::initIfnetParams(struct ifnet_init_params *params)
+{
+    if (params == nullptr)
+        return false;
+    // The documented subclass hook: call the base body (it insists on IFT_ETHER)
+    // and then set the type-specific field. Rewriting params->type to
+    // IFT_IEEE80211 is what makes the ifnet itself a Wi-Fi interface; changing
+    // the IOInterfaceType property *before* this call was measured to make the
+    // base body refuse, so the property keeps the Ethernet value here.
+    if (!IO80211Interface::initIfnetParams(params))
+        return false;
+    params->type = 0x47 /* IFT_IEEE80211 */;
     return true;
 }
 

@@ -21,6 +21,7 @@ public:
     UInt32 inputPacket(mbuf_t packet, UInt32 length = 0,
                        IOOptionBits options = 0, void *param = nullptr) override;
     IOReturn attachToDataLinkLayer(IOOptionBits options, void *param) override;
+    bool initIfnetParams(struct ifnet_init_params *params) override;
 
 private:
     Ath10kPCIDevice *_owner = nullptr;

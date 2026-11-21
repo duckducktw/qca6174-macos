@@ -26,6 +26,12 @@ IONetworkInterface *Ath10kPCIDevice::createInterface()
         interface->release();
         return nullptr;
     }
+    // SystemConfiguration classifies the interface from IOInterfaceType when it
+    // first discovers it, i.e. at the registerService() right after this
+    // returns. Stamping 71 here was measured to break the unit entirely (the
+    // family's own attach path refuses anything but IFT_ETHER), so the 802.11
+    // value is applied later, in start(), and the discovery-time record stays
+    // Ethernet until the unit is published through Apple's vif layer instead.
     _venturaInterface = interface;
     return interface;
 }
