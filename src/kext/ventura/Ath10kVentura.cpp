@@ -64,9 +64,11 @@ static void venturaPhase(IOService *p, const char *phase)
 
 void Ath10kPCIDevice::getLogPipes(CCPipe **driver, CCPipe **datapath, CCPipe **snapshot)
 {
-    // Defer to the family: it hands back the controller's own corecapture pipes,
-    // which is what its fault-reporter lookup expects.
-    IO80211Controller::getLogPipes(driver, datapath, snapshot);
+    // Hand the family our corecapture pipes: findAndAttachToFaultReporter()
+    // asks for them, and without an answer it panics in logDebug().
+    if (driver) *driver = _venturaPipes[0];
+    if (datapath) *datapath = _venturaPipes[1];
+    if (snapshot) *snapshot = _venturaPipes[2];
 }
 
 // ---------------------------------------------------------------------------
@@ -117,15 +119,15 @@ bool Ath10kPCIDevice::alignVenturaVtable()
     void *faultSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaFaultReporterSlot);
     void *virtualRequestSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaVirtualRequestSlot);
     void *skywalkRequestSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaSkywalkRequestSlot);
-    vtable[0xd20 / sizeof(void *)] = logSlot;
-    vtable[0xd58 / sizeof(void *)] = faultSlot;
+    vtable[0xd10 / sizeof(void *)] = logSlot;
+    vtable[0xd48 / sizeof(void *)] = faultSlot;
     // apple80211VirtualRequest / apple80211SkywalkRequest: the vif asks for its
     // capabilities through these, and our overrides use the older
     // apple80211Request signature, so route them to the same dispatcher.
-    vtable[0xcb8 / sizeof(void *)] = virtualRequestSlot;
-    vtable[0xcc0 / sizeof(void *)] = skywalkRequestSlot;
-    const bool ok = vtable[0xd20 / sizeof(void *)] == logSlot &&
-                    vtable[0xd58 / sizeof(void *)] == faultSlot;
+    vtable[0xca8 / sizeof(void *)] = virtualRequestSlot;
+    vtable[0xcb0 / sizeof(void *)] = skywalkRequestSlot;
+    const bool ok = vtable[0xd10 / sizeof(void *)] == logSlot &&
+                    vtable[0xd48 / sizeof(void *)] == faultSlot;
     if (probe) {
         probe->setProperty("Ath10kAlignPhase", ok ? "aligned" : "write-failed");
         probe->setProperty("Ath10kVptr", static_cast<UInt64>(reinterpret_cast<uintptr_t>(vtable)), 64);

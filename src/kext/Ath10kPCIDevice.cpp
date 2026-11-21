@@ -214,11 +214,10 @@ bool Ath10kPCIDevice::start(IOService *provider)
         return false;
     }
     provider->setProperty("Ath10kStartPhase", "super-start");
-    // IO80211Controller dispatches getLogPipes/getFaultReporterFromDriver at the
-    // Skywalk-era offsets; line our slots up before any Apple code runs.
-    // Disabled for now: with the base getLogPipes restored the family attaches
-    // its own fault reporter, so no slot surgery is needed.
-    // alignVenturaVtable();
+    // IO80211Controller dispatches getLogPipes/getFaultReporterFromDriver at
+    // vptr+0xd10 / vptr+0xd48 (vtable 0xd20 / 0xd58); point those slots at our
+    // implementations before any Apple code runs.
+    alignVenturaVtable();
     // Only let Apple's start() run once the fault reporter it demands exists:
     // without one, its very next logDebug() panics the kernel.
     const bool reporterReady = _venturaCoreFault != nullptr;
@@ -260,8 +259,10 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // AirportItlwm proves Apple's start() works on Ventura, so use it: no vtable
     // surgery and no getLogPipes override, the family attaches its own
     // reporter exactly like it does for Apple's drivers.
-    bool appleStart = super::start(provider);
-    provider->setProperty("Ath10kStartPhase", appleStart ? "apple-started" : "apple-start-failed");
+    bool appleStart = reporterReady && super::start(provider);
+    provider->setProperty("Ath10kStartPhase",
+                          appleStart ? "apple-started"
+                                     : (reporterReady ? "apple-start-failed" : "apple-start-skipped"));
     if (!appleStart) {
         if (!IOEthernetController::start(provider)) {
             IOLog("Ath10kMac: base start failed\n");
@@ -316,6 +317,26 @@ bool Ath10kPCIDevice::start(IOService *provider)
             return false;
         }
         provider->setProperty("Ath10kStartPhase", "interface-published");
+#if defined(ATH10K_VENTURA)
+        // A BSD unit only appears once IONetworkStack inserts the interface.
+        // That happens in IONetworkStack::insertNetworkInterface(), which we
+        // cannot link (local symbol), so reach the stack service and drive the
+        // same virtual interfacePublished() uses, at vptr+0x340.
+        {
+            IOService *stack = IOService::waitForService(
+                IOService::serviceMatching("IONetworkStack"));
+            if (stack) {
+                void **stackVptr = *reinterpret_cast<void ***>(stack);
+                typedef bool (*InsertFn)(IOService *, IONetworkInterface *, void *, UInt32);
+                InsertFn insert = reinterpret_cast<InsertFn>(stackVptr[0x340 / sizeof(void *)]);
+                const bool inserted = insert != nullptr && insert(stack, iface, nullptr, 0);
+                provider->setProperty("Ath10kStackPhase",
+                                      inserted ? "stack-inserted" : "stack-insert-failed");
+            } else {
+                provider->setProperty("Ath10kStackPhase", "no-stack");
+            }
+        }
+#endif
     }
     // The BSD unit (enN) belongs to the IO80211VirtualInterface /
     // IO80211InfraInterface layer, not to the base interface, and only the 80211
