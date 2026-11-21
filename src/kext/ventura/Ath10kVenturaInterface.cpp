@@ -20,9 +20,14 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
 {
     if (controller == nullptr || owner == nullptr)
         return false;
-    if (!super::init(controller))
+    IOService *probe = owner->getProvider();
+    if (probe) probe->setProperty("Ath10kIfacePhase", "super-init");
+    if (!super::init(controller)) {
+        if (probe) probe->setProperty("Ath10kIfacePhase", "super-init-failed");
         return false;
+    }
     _owner = owner;
+    if (probe) probe->setProperty("Ath10kIfacePhase", "inited");
     return true;
 }
 

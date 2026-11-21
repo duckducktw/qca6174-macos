@@ -12,10 +12,13 @@
 #include <IOKit/IOService.h>
 #include "CCStream.h"
 
+#ifndef ATH10K_CCSTREAMLOGLEVEL_DEFINED
+#define ATH10K_CCSTREAMLOGLEVEL_DEFINED
 enum CCStreamLogLevel
 {
     LEVEL_1,
 };
+#endif
 
 class CCLogStream : public CCStream {
     OSDeclareDefaultStructors(CCLogStream)

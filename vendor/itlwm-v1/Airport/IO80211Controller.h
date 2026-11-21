@@ -70,10 +70,13 @@ typedef enum IO80211FeatureCode IO80211FeatureCode;
 
 class IOSkywalkInterface;
 class IO80211ScanManager;
+#ifndef ATH10K_CCSTREAMLOGLEVEL_DEFINED
+#define ATH10K_CCSTREAMLOGLEVEL_DEFINED
 enum CCStreamLogLevel
 {
     LEVEL_1,
 };
+#endif
 
 enum scanSource
 {

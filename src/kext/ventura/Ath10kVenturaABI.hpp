@@ -24,3 +24,7 @@
 #include "IO80211Interface.h"
 #include "apple80211_var.h"
 #include "apple80211_ioctl.h"
+#include "CCPipe.h"
+#include "CCStream.h"
+#include "CCLogStream.h"
+#include "FaultReporter.h"

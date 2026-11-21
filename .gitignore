@@ -6,3 +6,5 @@ __pycache__/
 /.cache/
 /src/kext/Ath10kPayload.hpp
 /firmware/prepared/
+/artifacts-ci/
+/artifacts-ci-dev/

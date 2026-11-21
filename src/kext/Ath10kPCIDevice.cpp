@@ -92,6 +92,9 @@ static bool ath10kNativePCIIdentity(UInt16 vendor,UInt16 device,UInt16 subsystem
 
 IOService *Ath10kPCIDevice::probe(IOService *provider, SInt32 *score)
 {
+    // Kernel logging is not observable on every host, so expose the match
+    // decision through the registry as well.
+    if (provider) provider->setProperty("Ath10kProbeEntry", kOSBooleanTrue);
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     if (!pci)
         return nullptr;
@@ -124,6 +127,7 @@ IOService *Ath10kPCIDevice::probe(IOService *provider, SInt32 *score)
 #endif
     if (score)
         *score += 1000;
+    if (provider) provider->setProperty("Ath10kProbeMatched", kOSBooleanTrue);
 
     return this;
 }
@@ -144,6 +148,7 @@ bool Ath10kPCIDevice::start(IOService *provider)
         const UInt32 value=timeout->unsigned32BitValue();_connection.beaconTimeoutMs=value>=10000 && value<=120000?value:30000;
     }
     IOLog("Ath10kMac: start v%s (deferred device initialization)\n", kmod_info.version);
+    provider->setProperty("Ath10kStartPhase", "entry");
 
 #ifdef ATH10K_NATIVE
     if (version_major!=24 || version_minor<2) return false;
@@ -178,10 +183,59 @@ bool Ath10kPCIDevice::start(IOService *provider)
     }
     nativeStartupPhase("controller-start");
 #endif
-    if (!super::start(provider)) {
-        IOLog("Ath10kMac: super::start failed\n");
+#if defined(ATH10K_VENTURA)
+    // IO80211Controller::start() calls findAndAttachToFaultReporter(), which
+    // panics via logDebug() unless our corecapture pipes and the FaultReporter
+    // stream already exist.
+    provider->setProperty("Ath10kStartPhase", "corecapture");
+    // IO80211Controller only creates its work loop inside start(), but the
+    // corecapture pipes must exist before that call, so build it up front.
+    if (!getWorkLoop() && !createWorkLoop()) {
+        provider->setProperty("Ath10kStartPhase", "workloop-create-failed");
         return false;
     }
+    if (!prepareVenturaLogs()) {
+        IOLog("Ath10kMac: corecapture setup failed, refusing controller start\n");
+        provider->setProperty("Ath10kStartPhase", "corecapture-failed");
+        releaseVenturaLogs();
+        return false;
+    }
+    provider->setProperty("Ath10kStartPhase", "super-start");
+#endif
+#if defined(ATH10K_VENTURA)
+    // IO80211Controller::start() insists on an attached fault reporter and
+    // panics inside logDebug() when none can be found on this IO80211 build,
+    // so bring the controller up through its IONetworkController base instead.
+    if (!IOEthernetController::start(provider)) {
+        IOLog("Ath10kMac: base start failed\n");
+        provider->setProperty("Ath10kStartPhase", "base-start-failed");
+        return false;
+    }
+#else
+    if (!super::start(provider)) {
+        IOLog("Ath10kMac: super::start failed\n");
+        provider->setProperty("Ath10kStartPhase", "super-start-failed");
+        return false;
+    }
+#endif
+    provider->setProperty("Ath10kStartPhase", "controller-started");
+#if defined(ATH10K_VENTURA)
+    // The controller came up through its IONetworkController base, so the
+    // interface Apple would normally publish is ours to create and attach.
+    if (!_venturaInterface) {
+        IONetworkInterface *iface = createInterface();
+        if (!iface) {
+            provider->setProperty("Ath10kStartPhase", "interface-create-failed");
+            return false;
+        }
+        if (!attachInterface(&iface, true)) {
+            provider->setProperty("Ath10kStartPhase", "interface-attach-failed");
+            OSSafeReleaseNULL(iface);
+            return false;
+        }
+        provider->setProperty("Ath10kStartPhase", "interface-published");
+    }
+#endif
 
 #ifdef ATH10K_NATIVE
     nativeStartupPhase("controller-started");
@@ -514,6 +568,9 @@ void Ath10kPCIDevice::free()
 #ifdef ATH10K_NATIVE
     releaseNativeInterface();
     releaseNativeLogs();
+#endif
+#if defined(ATH10K_VENTURA)
+    releaseVenturaLogs();
 #endif
     // Keep both queues alive through the base controller's timer/gate cleanup.
     // super::free() can destroy this object: use only saved local pointers after it.

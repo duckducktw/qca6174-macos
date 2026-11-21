@@ -40,6 +40,111 @@ SInt32 Ath10kPCIDevice::stopDMA()
     return kIOReturnSuccess;
 }
 
+void Ath10kPCIDevice::_RESERVEDIO80211Controller0() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller1() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller2() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller3() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller4() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller5() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller6() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller7() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller8() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller9() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller10() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller11() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller12() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller13() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller14() {}
+void Ath10kPCIDevice::_RESERVEDIO80211Controller15() {}
+
+static void venturaPhase(IOService *p, const char *phase)
+{
+    if (p) p->setProperty("Ath10kVenturaLogPhase", phase);
+}
+
+void Ath10kPCIDevice::getLogPipes(CCPipe **driver, CCPipe **datapath, CCPipe **snapshot)
+{
+    if (driver) *driver = _venturaPipes[0];
+    if (datapath) *datapath = _venturaPipes[1];
+    if (snapshot) *snapshot = _venturaPipes[2];
+}
+
+bool Ath10kPCIDevice::prepareVenturaLogs()
+{
+    IOService *owner = getProvider();
+    if (!getWorkLoop()) { venturaPhase(owner, "no-workloop"); return false; }
+    venturaPhase(owner, "begin");
+    static const char *names[] = {"DriverLogs", "DatapathEvents", "StateSnapshots"};
+    for (unsigned i = 0; i < 3; ++i) {
+        CCPipeOptions options{};
+        if (i == 2) {
+            options.pipe_type = 0x200000001ULL;
+            options.log_data_type = 2;
+            options.pipe_size = 128;
+        } else {
+            options.pipe_type = 0;
+            options.log_data_type = (i == 0) ? 1 : 0;
+            options.pipe_size = 0x200000;
+            options.min_log_size_notify = 0xccccc;
+            options.notify_threshold = 1000;
+            options.pad9 = (i == 0) ? 0x1000000 : 2;
+            options.pad10 = (i == 0) ? 2 : 0x2800000;
+        }
+        strlcpy(options.file_name, names[i], sizeof(options.file_name));
+        if (i != 1) strlcpy(options.name, (i == 0) ? "wlan0" : "0", sizeof(options.name));
+        strlcpy(options.directory_name, "WiFi", sizeof(options.directory_name));
+        _venturaPipes[i] = CCPipe::withOwnerNameCapacity(this, "br.com.jonasw8.driver.ath10kmac",
+                                                         names[i], &options);
+        if (!_venturaPipes[i]) { venturaPhase(owner, "pipe-create-failed"); return false; }
+        if (!(_venturaPipesStarted[i] = _venturaPipes[i]->CCPipe::startPipe())) {
+            venturaPhase(owner, "pipe-start-failed"); return false;
+        }
+        if (i == 0) {
+            CCStreamOptions loggerOptions{};
+            CCStream *logger = CCStream::withPipeAndName(_venturaPipes[0], "Ath10kMac", &loggerOptions);
+            _venturaLogger = OSDynamicCast(CCLogStream, logger);
+            if (!_venturaLogger) { OSSafeReleaseNULL(logger); venturaPhase(owner, "logstream-failed"); return false; }
+        }
+    }
+    CCStreamOptions faultOptions{};
+    faultOptions.stream_type = 1;
+    faultOptions.console_level = ~0ULL;
+    _venturaFaultStream = CCStream::withPipeAndName(_venturaPipes[2], "FaultReporter", &faultOptions);
+    auto data = OSDynamicCast(CCDataStream, _venturaFaultStream);
+    if (!data) { venturaPhase(owner, "fault-stream-failed"); return false; }
+    // Ventura ships CCFaultReporter but not IO80211FaultReporter (that class
+    // arrived with the newer IO80211 family). Importing it made OpenCore abort
+    // the injection, so stop at the CCFaultReporter the 13.x kernel exports.
+    _venturaCoreFault = CCFaultReporter::withStreamWorkloop(data, getWorkLoop());
+    if (!_venturaCoreFault) { venturaPhase(owner, "core-fault-failed"); return false; }
+    venturaPhase(owner, "ready");
+    return true;
+}
+
+void Ath10kPCIDevice::releaseVenturaLogs()
+{
+    OSSafeReleaseNULL(_venturaCoreFault);
+    OSSafeReleaseNULL(_venturaFaultStream);
+    OSSafeReleaseNULL(_venturaLogger);
+    for (unsigned i = 0; i < 3; ++i) {
+        if (_venturaPipesStarted[i] && _venturaPipes[i]) _venturaPipes[i]->CCPipe::stopPipe();
+        _venturaPipesStarted[i] = false;
+        OSSafeReleaseNULL(_venturaPipes[i]);
+    }
+}
+
+// Skywalk-era overloads: the 10.15+ class declares them virtual, and OpenCore
+// refuses to inject a kext whose vtable leaves those slots unresolved.
+IOReturn Ath10kPCIDevice::enable(IO80211SkywalkInterface *)
+{
+    return kIOReturnSuccess;
+}
+
+IOReturn Ath10kPCIDevice::disable(IO80211SkywalkInterface *)
+{
+    return kIOReturnSuccess;
+}
+
 UInt32 Ath10kPCIDevice::hardwareOutputQueueDepth(IO80211Interface *)
 {
     return 1024;
