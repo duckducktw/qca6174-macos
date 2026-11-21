@@ -18,6 +18,16 @@ OSDefineMetaClassAndStructors(Ath10kPCIDevice, IO80211Controller)
 OSDefineMetaClassAndStructors(Ath10kPCIDevice, IOEthernetController)
 #endif
 
+#if defined(ATH10K_VENTURA)
+// Apple's own station-virtual-interface plumbing, called by mangled name: the
+// BSD unit (enN) belongs to the IO80211VirtualInterface/IO80211InfraInterface
+// layer that only the 80211 stack creates.
+extern "C" bool ath10kAttachVirtualInterface(IO80211Controller *,
+                                             IO80211VirtualInterface **,
+                                             ether_addr *, UInt32, bool)
+    __asm("__ZN17IO80211Controller22attachVirtualInterfaceEPP23IO80211VirtualInterfaceP10ether_addrjb");
+#endif
+
 // Standard PCI configuration-space offsets/capability IDs.
 static constexpr UInt8 kPCIConfigProgIf        = 0x09;
 static constexpr UInt8 kPCIConfigSubclass      = 0x0a;
@@ -201,31 +211,15 @@ bool Ath10kPCIDevice::start(IOService *provider)
         return false;
     }
     provider->setProperty("Ath10kStartPhase", "super-start");
-#endif
-#if defined(ATH10K_VENTURA)
-    // IO80211Controller::start() insists on an attached fault reporter and
-    // panics inside logDebug() when none can be found on this IO80211 build,
-    // so bring the controller up through its IONetworkController base instead.
-    if (!IOEthernetController::start(provider)) {
-        IOLog("Ath10kMac: base start failed\n");
-        provider->setProperty("Ath10kStartPhase", "base-start-failed");
-        return false;
-    }
-#else
-    if (!super::start(provider)) {
-        IOLog("Ath10kMac: super::start failed\n");
-        provider->setProperty("Ath10kStartPhase", "super-start-failed");
-        return false;
-    }
-#endif
-    provider->setProperty("Ath10kStartPhase", "controller-started");
-#if defined(ATH10K_VENTURA)
-    // IOEthernetInterface::init() reads an "IOPacketFilters" dictionary off the
-    // controller and fails outright when it is missing (it checks the
-    // WakeOnLAN groups inside it). Apple's IO80211Controller::start() path
-    // publishes that dictionary through IONetworkController's property
-    // publishing; this branch bypasses it, so publish the same three groups
-    // here before the interface is created.
+    // NOTE: alignVenturaVtable() was tried here and made 13.7 panic during
+    // IO80211Controller::init (the log quotes IO80211_kexts-1132.58, i.e. the
+    // older generation, not the 1200.13 family), so the slot offsets below do
+    // not describe the class that actually loads. Left in place as a documented
+    // negative result - do not call it until the live layout is established.
+    // Both prerequisites below are consumed by whichever start path creates the
+    // interface, so publish them first: IOEthernetInterface::init() fails
+    // without an "IOPacketFilters" dictionary, and
+    // IONetworkController::configureInterface() fails without an output queue.
     {
         OSDictionary *packetFilters = OSDictionary::withCapacity(3);
         if (packetFilters) {
@@ -243,11 +237,6 @@ bool Ath10kPCIDevice::start(IOService *provider)
             return false;
         }
     }
-#endif
-#if defined(ATH10K_VENTURA)
-    // IONetworkController::configureInterface(), called from attachInterface(),
-    // bails out when the controller has no output queue: the bypass skips the
-    // part of IO80211Controller::start() that would have created one.
     if (!getOutputQueue()) {
         if (!createOutputQueue()) {
             provider->setProperty("Ath10kStartPhase", "output-queue-failed");
@@ -255,7 +244,29 @@ bool Ath10kPCIDevice::start(IOService *provider)
         }
         provider->setProperty("Ath10kStartPhase", "output-queue");
     }
+    // Preferred path: let IO80211Controller::start() run, so the 80211 core
+    // creates the interface, its virtual interfaces and the BSD unit itself.
+    // It used to panic in findAndAttachToFaultReporter(); with the work loop,
+    // the corecapture pipes (getLogPipes) and a CCFaultReporter service in
+    // place it returns normally instead. Fall back to the Ethernet base if it
+    // still refuses, so a failing experiment never costs the working interface.
+    bool appleStart = super::start(provider);
+    provider->setProperty("Ath10kStartPhase", appleStart ? "apple-started" : "apple-start-failed");
+    if (!appleStart) {
+        if (!IOEthernetController::start(provider)) {
+            IOLog("Ath10kMac: base start failed\n");
+            provider->setProperty("Ath10kStartPhase", "base-start-failed");
+            return false;
+        }
+    }
+#else
+    if (!super::start(provider)) {
+        IOLog("Ath10kMac: super::start failed\n");
+        provider->setProperty("Ath10kStartPhase", "super-start-failed");
+        return false;
+    }
 #endif
+    provider->setProperty("Ath10kStartPhase", "controller-started");
 #if defined(ATH10K_VENTURA)
     // The controller came up through its IONetworkController base, so the
     // interface Apple would normally publish is ours to create and attach.
@@ -295,6 +306,22 @@ bool Ath10kPCIDevice::start(IOService *provider)
             return false;
         }
         provider->setProperty("Ath10kStartPhase", "interface-published");
+    }
+    // The BSD unit (enN) belongs to the IO80211VirtualInterface /
+    // IO80211InfraInterface layer, not to the base interface, and only the 80211
+    // stack creates it. Ask the controller for a station virtual interface
+    // (type 7) so the core has a vif to hang the ifnet on; this runs after
+    // either start path.
+    {
+        IOEthernetAddress hwAddress{};
+        ether_addr vifAddress{};
+        IO80211VirtualInterface *vif = nullptr;
+        bool vifOk = false;
+        if (getHardwareAddress(&hwAddress) == kIOReturnSuccess) {
+            memcpy(&vifAddress, &hwAddress, sizeof(vifAddress));
+            vifOk = ath10kAttachVirtualInterface(this, &vif, &vifAddress, 7, true);
+        }
+        provider->setProperty("Ath10kVifPhase", vifOk ? "vif-attached" : "vif-attach-failed");
     }
 #endif
 

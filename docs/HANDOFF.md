@@ -93,6 +93,13 @@ VM 若在 panic 循環：`cat ~/sudo.pwd | ssh 100.64.0.152 'bash /tmp/disable_b
 
 **當前唯一缺口：BSD 介面單元**。`iface->attachToDataLinkLayer(0, nullptr)` 回傳 true，但 `ifconfig -l` 沒有新介面，`ioreg -r -c IO80211VirtualInterface` / `IO80211InfraInterface` 也都是 0 筆——Ventura 的 BSD 介面屬於 `IO80211InfraInterface`（`IO80211Interface` → `IO80211VirtualInterface` → `IO80211InfraInterface`）那一層，而 virtual interface 是 Apple 的 `IO80211Controller::start()` 建立的，bypass 路徑跳過它。
 
+**兩個已試過但失敗的路（勿重試）**：
+
+1. `super::start(provider)`（= `IO80211Controller::start`）→ kernel panic `"No ivars->_faultReporter" @IO80211Controller.cpp:3604`。
+2. 手動把 vtable 的 `+0xd20`（`getLogPipes`）/`+0xd58`（`getFaultReporterFromDriver`）改成我們的實作 → 一樣 panic，而且 panic 訊息引用的字串是 **`IO80211_kexts-1132.58`**，不是 `kmutil` 看到的 `IO80211Family 1200.13`。也就是說「實際承載我們 controller 的那份 IO80211 是舊世代」，`/tmp/vt_both.txt` 裡 0x20d86f8 那份（Skywalk 世代）不是它。程式碼保留在 `alignVenturaVtable()` 並標註為負面結果，**不要呼叫**。
+
+**下一步（重新校正方向）**：先用正確的 vptr 慣例（物件 vptr 指向 `&vtable[2]`，所以 kernel 端 `[vptr+0xNNN]` 等於 `vtable + 0xNNN + 0x10`）把「實際世代」的 `findAndAttachToFaultReporter` 呼叫鏈逐一解出來，再決定要補哪個 virtual；在那之前不要再改任何 slot。
+
 下一步要做的事：
 
 1. **回頭讓 `IO80211Controller::start()` 真正跑成功**（架構上正確的路），而不是繼續在 bypass 上補洞。缺的最後一塊是 `getFaultReporterFromDriver()` override：`findAndAttachToFaultReporter()` 的流程是 `[vptr+0xd10]`（= `getLogPipes`）→ 結果存進 `ivars+0x50`，接著 `[vptr+0xd48]`（= `getFaultReporterFromDriver`）→ 存進 `ivars+0x68`。我們已經有 `getLogPipes` override，卻沒有第二個；Sequoia 分支的對照實作在 `src/kext/native/Ath10kControllerDecl.inc:15`。**注意**：`vendor/itlwm-v1/Airport/IO80211Controller.h` 沒有宣告這個 virtual，直接加 override 會排到 vtable 尾端導致錯位，必須先把它插進 header 的正確位置（v1 順序：`getLogPipes` 之後）。

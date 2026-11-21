@@ -45,6 +45,14 @@ private:
     // returns nothing, which leaves ivars->_faultReporter null and makes the
     // controller panic inside logDebug().
     void getLogPipes(CCPipe **, CCPipe **, CCPipe **) override;
+    // The IO80211Family build that actually loads on 13.7 is the Skywalk-era
+    // generation: it dispatches getLogPipes at +0xd20 and
+    // getFaultReporterFromDriver at +0xd58, while the v1 headers we compile
+    // against place them at +0xd48 and not at all. Without this the kernel
+    // calls an empty slot, finds no fault reporter and panics in logDebug().
+    static bool venturaLogPipesSlot(IO80211Controller *, CCPipe **, CCPipe **, CCPipe **);
+    static void *venturaFaultReporterSlot(IO80211Controller *);
+    void alignVenturaVtable();
     bool prepareVenturaLogs();
     void releaseVenturaLogs();
     CCPipe *_venturaPipes[3]{};

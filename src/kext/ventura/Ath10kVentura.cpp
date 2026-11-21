@@ -69,6 +69,38 @@ void Ath10kPCIDevice::getLogPipes(CCPipe **driver, CCPipe **datapath, CCPipe **s
     if (snapshot) *snapshot = _venturaPipes[2];
 }
 
+// ---------------------------------------------------------------------------
+// Vtable alignment with the loaded IO80211Family generation
+// ---------------------------------------------------------------------------
+// 13.7 ships the Skywalk-era IO80211Controller layout: getLogPipes sits at
+// object offset 0xd20 and getFaultReporterFromDriver at 0xd58. The vendored v1
+// declarations put getLogPipes at 0xd48 and have no fault-reporter virtual at
+// all, so the family's own dispatch never reached our overrides and
+// findAndAttachToFaultReporter() panicked later inside logDebug(). Point those
+// two slots at our implementations before any Apple code runs.
+
+bool Ath10kPCIDevice::venturaLogPipesSlot(IO80211Controller *self, CCPipe **driver,
+                                          CCPipe **datapath, CCPipe **snapshot)
+{
+    Ath10kPCIDevice *device = static_cast<Ath10kPCIDevice *>(self);
+    device->getLogPipes(driver, datapath, snapshot);
+    return (driver && *driver) || (datapath && *datapath) || (snapshot && *snapshot);
+}
+
+void *Ath10kPCIDevice::venturaFaultReporterSlot(IO80211Controller *self)
+{
+    return static_cast<Ath10kPCIDevice *>(self)->_venturaCoreFault;
+}
+
+void Ath10kPCIDevice::alignVenturaVtable()
+{
+    void **vtable = *reinterpret_cast<void ***>(this);
+    if (vtable == nullptr)
+        return;
+    vtable[0xd20 / sizeof(void *)] = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaLogPipesSlot);
+    vtable[0xd58 / sizeof(void *)] = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaFaultReporterSlot);
+}
+
 bool Ath10kPCIDevice::prepareVenturaLogs()
 {
     IOService *owner = getProvider();
