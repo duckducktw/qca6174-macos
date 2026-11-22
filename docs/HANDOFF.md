@@ -154,6 +154,51 @@ symtab 實查：`createVirtualInterface`、`attachVirtualInterface`、`IO80211Vi
 
 ---
 
+## 6.5 根因（2026-11-22 離線比對 KC 得出，已可重現驗證）
+
+**13.7.8 的 KC 裡有兩個不同的 `IO80211Controller` 類別，分屬兩個 bundle：**
+
+| 表 | 位址 | bundle | 佈局 |
+|---|---|---|---|
+| A | `0xffffff8002240b60` | `com.apple.iokit.IO80211FamilyLegacy` | 舊 v1：`apple80211Request(ji P16IO80211Interface Pv)`、`getLogPipes` @ vt+0xd48、無 `getFaultReporterFromDriver` |
+| B | `0xffffff80020d86f8` | `com.apple.iokit.IO80211Family`（**live，載入範圍 0x1f35000–0x20d0ff9**） | Skywalk 期：`apple80211VirtualRequest`/`apple80211SkywalkRequest`、`getLogPipes` @ vt+0xd20、`getFaultReporterFromDriver` @ vt+0xd58 |
+
+**實測方法（零開機、可重複）**：
+1. `otool -rv <kext>` 取 relocation（`addr ... UNSIGND ... <symbol>`）與 `otool -s __DATA __const` 取原始 8-byte 字，重組出 `__ZTV15Ath10kPCIDevice` 的完整 slot 序列（v48 binary：vtable @ `0x1e5940`）。
+2. 用 KC symtab 解析 `__ZTV17IO80211Controller` 兩份的 slot 序列（本輪腳本見 §11）。
+3. 逐 slot 比對：**v48 與表 A 吻合 391 個、只有 7 個不符（全是 reserved pad）；與表 B 有 40 個不符。**
+
+**結論**：`vendor/itlwm-v1/Airport/IO80211Controller.h` 描述的是 **Legacy** 的佈局，我們的 vtable 因此是 A 形狀；但實際在跑、會呼叫我們的是 **B（live）**。這解釋了所有未解症狀：
+
+- `super::start()` 呼叫 `[vptr+0xc58]` 想拿 `getWorkQueue()`（B 的 vt+0xc68），我們的 0xc58 是 `_RESERVEDIOEthernetController…` → 回 null → `IO80211CommandGate::allocWithParams(null)` → **start 回 false**（不 panic，所以先前誤判為「Apple 的路走不通」）。實測 `Ath10kFaultSlotPhase=reporter` 證明 fault reporter 這關已經過了。
+- 舊的 `alignVenturaVtable()` 補丁（0xd10/0xd48/0xca8/0xcb0）其實位置本來就對（B 的 `getLogPipes`/`getFaultReporterFromDriver`/兩個 request）——只是物件其餘 450 個 slot 還是 A 形狀，補四個洞救不了。
+- `apple80211Request` 在 live 根本沒有這個 slot（airportd 走 `apple80211VirtualRequest`/`apple80211SkywalkRequest`）→ `Ath10kApple80211Requests` 永遠 0。
+- HANDOFF §6.4 的「兩份同名符號」不是複製貼上，是兩個 bundle；`attachIfnet` 只在 Legacy，`prepareBSDInterface` 只在 live。
+
+**正解方向**：把 Ventura 分支的 `IO80211Controller` 宣告改成 **B 的順序**（`0xc60` 起：`createWorkQueue`、`getWorkQueue`、`requestPacketTx`、`getIO80211CommandGate`、`getHardwareAddressForInterface(IOEthernetAddress*)`、`useAppleRSNSupplicant(IO80211VirtualInterface*)`、…、`getLogPipes`、…、`getFaultReporterFromDriver`、… 、`createVirtualInterface` 0xda8、`attachVirtualInterface` 0xdb0、`enable/disable(IO80211SkywalkInterface*)` 0xdc0/0xdc8、RESERVED 0–15），overrides 一起改簽名；介面端（`IO80211Interface`）也要用同一份 live 表比對。驗證方式：重編後照上面 1–3 步比對 vtable，**順序對了才開機**。
+
+---
+
+## 6.6 ABI 修正後的第一輪實測（v51，2026-11-22）
+
+改了什麼：
+1. `vendor/itlwm-v1/Airport/IO80211Controller.h` 的類別尾段（`0xc60` 起）整段改寫成 **live B 順序**，並補 `IO80211WorkQueue`/`IO80211CommandGate` forward decl。
+2. overrides 依新簽名重排：`apple80211VirtualRequest`/`apple80211SkywalkRequest` 取代 `apple80211Request`；`hardwareOutputQueueDepth()`、`performCountryCodeOperation(IO80211CountryCodeOp)`、`monitorModeSetEnabled(bool,UInt)`、`dataLinkLayerAttachComplete()`、`useAppleRSNSupplicant(IO80211VirtualInterface*)`；移除 `stopDMA`；`alignVenturaVtable()` 不再寫 slot，只回報（`Ath10kAlignPhase=abi-native`）。
+3. 補 `createWorkQueue()`/`getWorkQueue()` override（`IO80211WorkQueue::workQueue()`，live 有 EXT 匯出）。
+
+離線驗證（不開機）：新 binary 的 `__ZTV15Ath10kPCIDevice` 與 live B 逐 slot 比對，**繼承 slot 385 吻合、13 個差異全部可解釋**（同位置不同類別實作 7 個、`IONetworkController` reserved pad 版本差 6 個）。關鍵 slot 全對：`0xc60 createWorkQueue`、`0xc68 getWorkQueue`、`0xcb8/0xcc0` = 我們的兩個 request、`0xd20 getLogPipes` = 我們的、`0xd58 getFaultReporterFromDriver` = 我們的、`0xda8/0xdb0/0xdb8` = live vif 三兄弟、`0xdc0/0xdc8` = 我們的 enable/disable。
+
+實測結果：
+- 第一次開機 panic：`apple80211VirtualRequestIoctl + 0x26`（page fault）。反組譯：`call [vptr+0xc58]` = `getWorkQueue()` 回 null → `mov rcx,[rax]` 撞 null。frame 是 `Ath10kPCIDevice::start + 0x787 → IO80211Controller::createVirtualInterface → IO80211VirtualInterface::init`，**證明 Apple 的 `start()` 已經跑到自己建 vif 這步**。
+- 補 `createWorkQueue/getWorkQueue` 後（v51 重編）：不 panic、`Ath10kWorkQueue=Yes`、`Ath10kFaultSlotPhase=reporter`、**`Ath10kApple80211Requests = 1`（專案史上第一次非零）**、`ioreg -r -c IO80211VirtualInterface` **1 筆**（role=SoftAP，無 BSD Name）。
+
+仍卡：SystemConfiguration 還是把 en2 記成 `IOInterfaceType = 6` / 服務 `Ethernet 2`、`getairportpower en2` = `Off (forced)`。量測：
+- 介面物件 property `IOInterfaceType = 71`、`tools/ifnet-type` 讀到 `en2 type=0x47 (71)` —— 兩個值都對。
+- 刪掉 `NetworkInterfaces.plist` 的 en2 記錄＋`preferences.plist` 的該服務後重開，SC **重新推導仍然寫 6**。
+→ **結論：SC 的分類不吃 `IOInterfaceType` property，也不吃 `ifi_type`。** 它八成看的是「這個介面有沒有掛進 IO80211 plane / 是不是 80211 core 發布的介面」。所以下一步不是繼續掰 SC，而是走 vif 發布路線：把 ifnet 交給 `IO80211VirtualInterface::prepareBSDInterface(ifnet, 0)`，照 §6.2 補 `built-in` / `IOInterfaceName` / `IOInterfaceUnit` / `IOInterfaceNamePrefix` / `IOMACAddress` 再 `registerService()`，讓 80211 core 自己發布 BSD 單元（那時 SC 記的就會是 Wi-Fi）。
+
+---
+
 ## 7. 下一個接手的人：照這個順序
 
 ### 7.1 先解結構性問題（優先，零風險）

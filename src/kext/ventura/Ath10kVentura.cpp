@@ -41,11 +41,6 @@ IONetworkInterface *Ath10kPCIDevice::createInterface()
 // Controller-mandated virtuals
 // ---------------------------------------------------------------------------
 
-SInt32 Ath10kPCIDevice::stopDMA()
-{
-    return kIOReturnSuccess;
-}
-
 void Ath10kPCIDevice::_RESERVEDIO80211Controller0() {}
 void Ath10kPCIDevice::_RESERVEDIO80211Controller1() {}
 void Ath10kPCIDevice::_RESERVEDIO80211Controller2() {}
@@ -71,49 +66,51 @@ static void venturaPhase(IOService *p, const char *phase)
 void Ath10kPCIDevice::getLogPipes(CCPipe **driver, CCPipe **datapath, CCPipe **snapshot)
 {
     // Hand the family our corecapture pipes: findAndAttachToFaultReporter()
-    // asks for them, and without an answer it panics in logDebug().
+    // asks for them, and leaves ivars->_faultReporter null (panic in logDebug)
+    // when the answer is empty. It runs inside IO80211Controller::start(), so
+    // build the chain here if start() has not done it yet.
+    if (!_venturaPipesStarted[0] && !_venturaCoreFault) {
+        if (!getWorkLoop() && !createWorkLoop()) {
+            if (IOService *p = getProvider()) p->setProperty("Ath10kFaultSlotPhase", "no-workloop");
+            return;
+        }
+        if (!prepareVenturaLogs()) {
+            if (IOService *p = getProvider()) p->setProperty("Ath10kFaultSlotPhase", "logs-failed");
+            return;
+        }
+    }
     if (driver) *driver = _venturaPipes[0];
     if (datapath) *datapath = _venturaPipes[1];
     if (snapshot) *snapshot = _venturaPipes[2];
+    if (IOService *p = getProvider()) p->setProperty("Ath10kFaultSlotPhase", "pipes");
+}
+
+void *Ath10kPCIDevice::getFaultReporterFromDriver()
+{
+    if (_venturaCoreFault == nullptr) {
+        if (!getWorkLoop() && !createWorkLoop()) {
+            if (IOService *p = getProvider()) p->setProperty("Ath10kFaultSlotPhase", "no-workloop");
+            return nullptr;
+        }
+        if (!prepareVenturaLogs()) {
+            if (IOService *p = getProvider()) p->setProperty("Ath10kFaultSlotPhase", "logs-failed");
+            return nullptr;
+        }
+    }
+    if (IOService *p = getProvider()) p->setProperty("Ath10kFaultSlotPhase", "reporter");
+    return _venturaCoreFault;
 }
 
 // ---------------------------------------------------------------------------
 // Vtable alignment with the loaded IO80211Family generation
 // ---------------------------------------------------------------------------
-// 13.7 ships the Skywalk-era IO80211Controller layout: getLogPipes sits at
-// object offset 0xd20 and getFaultReporterFromDriver at 0xd58. The vendored v1
-// declarations put getLogPipes at 0xd48 and have no fault-reporter virtual at
-// all, so the family's own dispatch never reached our overrides and
-// findAndAttachToFaultReporter() panicked later inside logDebug(). Point those
-// two slots at our implementations before any Apple code runs.
-
-bool Ath10kPCIDevice::venturaLogPipesSlot(IO80211Controller *self, CCPipe **driver,
-                                          CCPipe **datapath, CCPipe **snapshot)
-{
-    Ath10kPCIDevice *device = static_cast<Ath10kPCIDevice *>(self);
-    device->getLogPipes(driver, datapath, snapshot);
-    return (driver && *driver) || (datapath && *datapath) || (snapshot && *snapshot);
-}
-
-void *Ath10kPCIDevice::venturaFaultReporterSlot(IO80211Controller *self)
-{
-    Ath10kPCIDevice *device = static_cast<Ath10kPCIDevice *>(self);
-    IOService *probe = device->getProvider();
-    // IO80211Controller asks for this before start() has prepared corecapture,
-    // and logDebug() panics on a null answer, so create the chain on demand.
-    if (device->_venturaCoreFault == nullptr) {
-        if (!device->getWorkLoop() && !device->createWorkLoop()) {
-            if (probe) probe->setProperty("Ath10kFaultSlotPhase", "no-workloop");
-            return nullptr;
-        }
-        if (!device->prepareVenturaLogs()) {
-            if (probe) probe->setProperty("Ath10kFaultSlotPhase", "logs-failed");
-            return nullptr;
-        }
-    }
-    if (probe) probe->setProperty("Ath10kFaultSlotPhase", "reporter");
-    return device->_venturaCoreFault;
-}
+// The declarations in vendor/itlwm-v1/Airport/IO80211Controller.h now follow
+// the LIVE com.apple.iokit.IO80211Family slot order (13.7.8), so getLogPipes,
+// getFaultReporterFromDriver, apple80211VirtualRequest and
+// apple80211SkywalkRequest are overrides on the slots the kernel actually
+// dispatches. This routine only reports where the object's vptr points and
+// whether the four slots carry our code, so a header regression shows up as a
+// breadcrumb instead of as a panic inside framework code.
 
 bool Ath10kPCIDevice::alignVenturaVtable()
 {
@@ -121,38 +118,14 @@ bool Ath10kPCIDevice::alignVenturaVtable()
     IOService *probe = getProvider();
     if (vtable == nullptr)
         return false;
-    void *logSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaLogPipesSlot);
-    void *faultSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaFaultReporterSlot);
-    void *virtualRequestSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaVirtualRequestSlot);
-    void *skywalkRequestSlot = reinterpret_cast<void *>(&Ath10kPCIDevice::venturaSkywalkRequestSlot);
-    vtable[0xd10 / sizeof(void *)] = logSlot;
-    vtable[0xd48 / sizeof(void *)] = faultSlot;
-    // apple80211VirtualRequest / apple80211SkywalkRequest: the vif asks for its
-    // capabilities through these, and our overrides use the older
-    // apple80211Request signature, so route them to the same dispatcher.
-    vtable[0xca8 / sizeof(void *)] = virtualRequestSlot;
-    vtable[0xcb0 / sizeof(void *)] = skywalkRequestSlot;
-    const bool ok = vtable[0xd10 / sizeof(void *)] == logSlot &&
-                    vtable[0xd48 / sizeof(void *)] == faultSlot;
     if (probe) {
-        probe->setProperty("Ath10kAlignPhase", ok ? "aligned" : "write-failed");
+        probe->setProperty("Ath10kAlignPhase", "abi-native");
         probe->setProperty("Ath10kVptr", static_cast<UInt64>(reinterpret_cast<uintptr_t>(vtable)), 64);
+        probe->setProperty("Ath10kVtLogPipes", static_cast<UInt64>(reinterpret_cast<uintptr_t>(vtable[0xd10 / sizeof(void *)])), 64);
+        probe->setProperty("Ath10kVtFaultReporter", static_cast<UInt64>(reinterpret_cast<uintptr_t>(vtable[0xd48 / sizeof(void *)])), 64);
+        probe->setProperty("Ath10kVtVirtualRequest", static_cast<UInt64>(reinterpret_cast<uintptr_t>(vtable[0xca8 / sizeof(void *)])), 64);
     }
-    return ok;
-}
-
-SInt32 Ath10kPCIDevice::venturaVirtualRequestSlot(IO80211Controller *self, UInt type,
-                                                  int number, IO80211VirtualInterface *,
-                                                  void *data)
-{
-    return static_cast<Ath10kPCIDevice *>(self)->apple80211Request(type, number, nullptr, data);
-}
-
-SInt32 Ath10kPCIDevice::venturaSkywalkRequestSlot(IO80211Controller *self, UInt type,
-                                                  int number, IO80211SkywalkInterface *,
-                                                  void *data)
-{
-    return static_cast<Ath10kPCIDevice *>(self)->apple80211Request(type, number, nullptr, data);
+    return true;
 }
 
 bool Ath10kPCIDevice::prepareVenturaLogs()
@@ -231,13 +204,28 @@ IOReturn Ath10kPCIDevice::disable(IO80211SkywalkInterface *)
     return kIOReturnSuccess;
 }
 
-UInt32 Ath10kPCIDevice::hardwareOutputQueueDepth(IO80211Interface *)
+UInt32 Ath10kPCIDevice::hardwareOutputQueueDepth()
 {
     return 1024;
 }
 
-SInt32 Ath10kPCIDevice::performCountryCodeOperation(IO80211Interface *,
-                                                    IO80211CountryCodeOp operation)
+// IO80211Controller stores its IO80211CommandGate on the queue this returns and
+// IO80211VirtualInterface::init() dereferences it through
+// apple80211VirtualRequestIoctl(), so a null answer faults inside the family.
+// IO80211WorkQueue::workQueue() is the shared instance Apple's own drivers use.
+bool Ath10kPCIDevice::createWorkQueue()
+{
+    if (_venturaWorkQueue == nullptr)
+        _venturaWorkQueue = IO80211WorkQueue::workQueue();
+    return _venturaWorkQueue != nullptr;
+}
+
+IO80211WorkQueue *Ath10kPCIDevice::getWorkQueue() const
+{
+    return _venturaWorkQueue;
+}
+
+SInt32 Ath10kPCIDevice::performCountryCodeOperation(IO80211CountryCodeOp operation)
 {
     if (operation == kIO80211CountryCodeReset)
         return kIOReturnSuccess;
@@ -270,13 +258,12 @@ void Ath10kPCIDevice::venturaPublishState(UInt32 state)
 // breadcrumbs can answer "did the request arrive, and what did we answer".
 // airportd surfaces only "Off (forced)" for both a missing request and a
 // refused one.
-SInt32 Ath10kPCIDevice::apple80211Request(unsigned int requestType, int requestNumber,
-                                          IO80211Interface *iface, void *data)
+SInt32 Ath10kPCIDevice::venturaRecordRequest(UInt requestType, int requestNumber, void *data)
 {
     ++_venturaRequestCount;
     _venturaLastRequest = static_cast<UInt32>(requestNumber);
     _venturaLastRequestIsSet = requestType == 1;
-    const SInt32 status = venturaDispatchRequest(requestType, requestNumber, iface, data);
+    const SInt32 status = venturaDispatchRequest(requestType, requestNumber, nullptr, data);
     _venturaLastRequestStatus = status;
     if (IOService *provider = getProvider()) {
         provider->setProperty("Ath10kApple80211Requests",
@@ -289,6 +276,19 @@ SInt32 Ath10kPCIDevice::apple80211Request(unsigned int requestType, int requestN
                               _venturaLastRequestIsSet ? "set" : "get");
     }
     return status;
+}
+
+// The live family reaches a driver through these two, one per interface class.
+SInt32 Ath10kPCIDevice::apple80211VirtualRequest(UInt requestType, int requestNumber,
+                                                 IO80211VirtualInterface *, void *data)
+{
+    return venturaRecordRequest(requestType, requestNumber, data);
+}
+
+SInt32 Ath10kPCIDevice::apple80211SkywalkRequest(UInt requestType, int requestNumber,
+                                                 IO80211SkywalkInterface *, void *data)
+{
+    return venturaRecordRequest(requestType, requestNumber, data);
 }
 
 SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int requestNumber,

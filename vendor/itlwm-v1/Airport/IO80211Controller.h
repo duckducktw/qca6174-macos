@@ -99,6 +99,8 @@ class CCIOReporterLogStream;
 class CCLogStream;
 class IO80211VirtualInterface;
 class IO80211RangingManager;
+class IO80211WorkQueue;
+class IO80211CommandGate;
 class IO80211FlowQueue;
 class IO80211FlowQueueLegacy;
 class FlowIdMetadata;
@@ -166,35 +168,32 @@ public:
     virtual IOReturn outputStart(IONetworkInterface *,UInt) APPLE_KEXT_OVERRIDE;
 #endif
     virtual IOReturn getHardwareAddress(IOEthernetAddress *) APPLE_KEXT_OVERRIDE;
+    // ------------------------------------------------------------------
+    // Virtual order below is the LIVE com.apple.iokit.IO80211Family order
+    // (kernel collection table @ 0xffffff80020d86f8 on 13.7.8), not the
+    // com.apple.iokit.IO80211FamilyLegacy order this header used to describe.
+    // The two bundles both export IO80211Controller; only the live one
+    // dispatches into a driver, and its slots are laid out differently from
+    // 0xc60 on. Getting this order wrong puts every override on a neighbour
+    // virtual, and calls the live code makes (getWorkQueue, createVirtualInterface,
+    // apple80211VirtualRequest) land on unrelated methods.
+    // ------------------------------------------------------------------
+    virtual bool createWorkQueue();
+    virtual IO80211WorkQueue* getWorkQueue() const;
     virtual void requestPacketTx(void*, UInt);
-    virtual IOReturn getHardwareAddressForInterface(IO80211Interface *,IOEthernetAddress *);
-    virtual void inputMonitorPacket(mbuf_t,UInt,void *,unsigned long);
-    virtual int outputRaw80211Packet(IO80211Interface *,mbuf_t);
-    virtual int outputActionFrame(IO80211Interface *,mbuf_t);
-    virtual int bpfOutputPacket(OSObject *,UInt,mbuf_t m);
-    virtual SInt32 monitorModeSetEnabled(IO80211Interface*, bool, UInt);
-    virtual IO80211Interface* getNetworkInterface(void);
-#if __IO80211_TARGET >= __MAC_10_15
-    virtual IO80211SkywalkInterface* getPrimarySkywalkInterface(void);
-#endif
-    virtual SInt32 apple80211_ioctl(IO80211Interface *, IO80211VirtualInterface*, ifnet_t,unsigned long,void *);
-#if __IO80211_TARGET >= __MAC_10_15
-    virtual SInt32 apple80211_ioctl(IO80211SkywalkInterface *,unsigned long,void *);
-#endif
-    virtual SInt32 apple80211_ioctl(IO80211Interface *interface, ifnet_t net,unsigned long id,void *data) {
-        return apple80211_ioctl(interface, NULL, net, id, data);
-    }
-    virtual SInt32 apple80211Request(unsigned int, int, IO80211Interface*, void*) = 0;
-    virtual SInt32 apple80211VirtualRequest(UInt,int,IO80211VirtualInterface *,void *);
-#if __IO80211_TARGET >= __MAC_10_15
-    virtual SInt32 apple80211SkywalkRequest(UInt,int,IO80211SkywalkInterface *,void *);
-#endif
-    virtual SInt32 stopDMA() = 0;
-    virtual UInt32 hardwareOutputQueueDepth(IO80211Interface*) = 0;
-    virtual SInt32 performCountryCodeOperation(IO80211Interface*, IO80211CountryCodeOp) = 0;
-    virtual bool useAppleRSNSupplicant(IO80211Interface *);
+    virtual IO80211CommandGate* getIO80211CommandGate();
+    virtual IOReturn getHardwareAddressForInterface(IOEthernetAddress *);
     virtual bool useAppleRSNSupplicant(IO80211VirtualInterface *);
-    virtual void dataLinkLayerAttachComplete(IO80211Interface *);
+    virtual IO80211SkywalkInterface* getPrimarySkywalkInterface(void);
+    virtual int bpfOutputPacket(OSObject *,UInt,mbuf_t m);
+    virtual SInt32 monitorModeSetEnabled(bool, UInt);
+    virtual SInt32 apple80211_ioctl(IO80211VirtualInterface *, ifnet_t, unsigned long, void *);
+    virtual SInt32 apple80211_ioctl(IO80211SkywalkInterface *,unsigned long,void *);
+    virtual SInt32 apple80211VirtualRequest(UInt,int,IO80211VirtualInterface *,void *);
+    virtual SInt32 apple80211SkywalkRequest(UInt,int,IO80211SkywalkInterface *,void *);
+    virtual UInt32 hardwareOutputQueueDepth();
+    virtual SInt32 performCountryCodeOperation(IO80211CountryCodeOp);
+    virtual void dataLinkLayerAttachComplete();
     virtual SInt32 enableFeature(IO80211FeatureCode, void*) = 0;
     virtual SInt32 setVirtualHardwareAddress(IO80211VirtualInterface *,ether_addr *);
     virtual SInt32 enableVirtualInterface(IO80211VirtualInterface *);
@@ -207,44 +206,34 @@ public:
     }
     virtual IO80211FlowQueueLegacy* requestFlowQueue(FlowIdMetadata const*);
     virtual void releaseFlowQueue(IO80211FlowQueue *);
-#if __IO80211_TARGET >= __MAC_10_15
     virtual void getLogPipes(CCPipe**, CCPipe**, CCPipe**) {};
-#endif
+    virtual void enableFeatureForLoggingFlags(unsigned long long) {};
+    virtual IOReturn requestQueueSizeAndTimeout(unsigned short *, unsigned short *) {
+        return kIOReturnIOError;
+    }
     virtual IOReturn enablePacketTimestamping(void) {
         return kIOReturnUnsupported;
     }
     virtual IOReturn disablePacketTimestamping(void) {
         return kIOReturnUnsupported;
     }
+    virtual UInt getPacketTSCounter();
     virtual UInt32 selfDiagnosticsReport(int,char const*,UInt);
+    virtual void *getFaultReporterFromDriver();
     virtual UInt32 getDataQueueDepth(OSObject *);
-#if __IO80211_TARGET >= __MAC_11_0
     virtual bool isAssociatedToMovingNetwork(void) { return false; }
-#endif
-    virtual mbuf_flags_t inputPacket(mbuf_t);
-    virtual SInt32 apple80211_ioctl_get(IO80211Interface *,IO80211VirtualInterface *,ifnet_t,void *);
-    
-    
-#if __IO80211_TARGET >= __MAC_10_15
+    virtual bool wasDynSARInFailSafeMode(void) { return false; }
     virtual SInt32 apple80211_ioctl_get(IO80211SkywalkInterface *,void *);
-    virtual SInt32 apple80211_ioctl_set(IO80211Interface *,IO80211VirtualInterface *,IO80211SkywalkInterface *,void *);
     virtual SInt32 apple80211_ioctl_set(IO80211SkywalkInterface *,void*);
-    virtual bool attachInterface(IOSkywalkInterface *,IOService *);
-#else
-    virtual SInt32 apple80211_ioctl_set(IO80211Interface *,IO80211VirtualInterface *,ifnet_t,void *);
-#endif
-    
-    
-#if __IO80211_TARGET >= __MAC_11_0
-    virtual bool detachInterface(IOSkywalkInterface *, bool);
-#endif
+    virtual bool attachInterface(OSObject *, IOService *);
+    virtual SInt32 apple80211_ioctl_get(IO80211VirtualInterface *, ifnet_t, void *);
+    virtual SInt32 apple80211_ioctl_set(IO80211VirtualInterface *, ifnet_t, void *);
+    virtual void detachInterface(OSObject *, bool);
     virtual IO80211VirtualInterface* createVirtualInterface(ether_addr *,UInt);
     virtual bool attachVirtualInterface(IO80211VirtualInterface **,ether_addr *,UInt,bool);
     virtual bool detachVirtualInterface(IO80211VirtualInterface *,bool);
-#if __IO80211_TARGET >= __MAC_10_15
     virtual IOReturn enable(IO80211SkywalkInterface *);
     virtual IOReturn disable(IO80211SkywalkInterface *);
-#endif
     
 public:
 #if __IO80211_TARGET >= __MAC_11_0

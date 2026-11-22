@@ -21,6 +21,7 @@
 #include <IOKit/network/IOEthernetInterface.h>
 
 #include "IO80211Controller.h"
+#include "IO80211WorkQueue.h"
 #include "IO80211Interface.h"
 #include "apple80211_var.h"
 #include "apple80211_ioctl.h"

@@ -229,6 +229,14 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // vptr+0xd10 / vptr+0xd48 (vtable 0xd20 / 0xd58); point those slots at our
     // implementations before any Apple code runs.
     alignVenturaVtable();
+    // The command gate IO80211Controller::start() builds hangs off this queue,
+    // and the vif it creates during start() dereferences it, so it has to exist
+    // before Apple's code runs.
+    if (!createWorkQueue()) {
+        provider->setProperty("Ath10kStartPhase", "workqueue-create-failed");
+        return false;
+    }
+    provider->setProperty("Ath10kWorkQueue", _venturaWorkQueue != nullptr);
     // Only let Apple's start() run once the fault reporter it demands exists:
     // without one, its very next logDebug() panics the kernel.
     const bool reporterReady = _venturaCoreFault != nullptr;

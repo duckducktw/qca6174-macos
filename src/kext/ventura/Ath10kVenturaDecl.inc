@@ -3,16 +3,20 @@
 // shared ath10k core.
 public:
     IONetworkInterface *createInterface() override;
-    IOReturn getHardwareAddressForInterface(IO80211Interface *, IOEthernetAddress *) override;
-    SInt32 apple80211Request(unsigned int, int, IO80211Interface *, void *) override;
-    SInt32 stopDMA() override;
-    UInt32 hardwareOutputQueueDepth(IO80211Interface *) override;
-    SInt32 performCountryCodeOperation(IO80211Interface *, IO80211CountryCodeOp) override;
+    // The live 13.7 IO80211Family has no apple80211Request virtual: airportd
+    // reaches a driver through the Virtual/Skywalk request pair instead.
+    SInt32 apple80211VirtualRequest(UInt, int, IO80211VirtualInterface *, void *) override;
+    SInt32 apple80211SkywalkRequest(UInt, int, IO80211SkywalkInterface *, void *) override;
+    UInt32 hardwareOutputQueueDepth() override;
+    SInt32 performCountryCodeOperation(IO80211CountryCodeOp) override;
+    // IO80211Controller keeps its command gate on an IO80211WorkQueue it gets
+    // from getWorkQueue(). Apple's start() asks before anything exists, then
+    // apple80211VirtualRequestIoctl() dereferences the answer while the vif is
+    // being created — a null return is a page fault inside IO80211Family.
+    bool createWorkQueue() override;
+    IO80211WorkQueue *getWorkQueue() const override;
     SInt32 enableFeature(IO80211FeatureCode, void *) override;
-    SInt32 monitorModeSetEnabled(IO80211Interface *, bool, UInt32) override;
-    void dataLinkLayerAttachComplete(IO80211Interface *) override;
-    bool useAppleRSNSupplicant(IO80211Interface *) override;
-    // Skywalk-era overloads exist in the 10.15+ class layout and must resolve
+    // Skywalk-era overloads exist in the class layout and must resolve
     // to real symbols, or OpenCore's vtable reconstruction aborts the injection.
     IOReturn enable(IO80211SkywalkInterface *) override;
     IOReturn disable(IO80211SkywalkInterface *) override;
@@ -48,22 +52,16 @@ private:
     // defers to Apple's own implementation: returning our private pipes here
     // made findAndAttachToFaultReporter() take the "no pipe" branch and panic.
     void getLogPipes(CCPipe **, CCPipe **, CCPipe **) override;
-    // The IO80211Family build that actually loads on 13.7 is the Skywalk-era
-    // generation: it dispatches getLogPipes at +0xd20 and
-    // getFaultReporterFromDriver at +0xd58, while the v1 headers we compile
-    // against place them at +0xd48 and not at all. Without this the kernel
-    // calls an empty slot, finds no fault reporter and panics in logDebug().
-    static bool venturaLogPipesSlot(IO80211Controller *, CCPipe **, CCPipe **, CCPipe **);
-    static void *venturaFaultReporterSlot(IO80211Controller *);
-    static SInt32 venturaVirtualRequestSlot(IO80211Controller *, UInt, int,
-                                            IO80211VirtualInterface *, void *);
-    static SInt32 venturaSkywalkRequestSlot(IO80211Controller *, UInt, int,
-                                            IO80211SkywalkInterface *, void *);
+    // The live family's fault-reporter handoff: returns the CCFaultReporter
+    // built from our FaultReporter stream, or null to let the controller log.
+    void *getFaultReporterFromDriver() override;
+    SInt32 venturaRecordRequest(UInt requestType, int requestNumber, void *data);
     bool alignVenturaVtable();
     bool prepareVenturaLogs();
     void releaseVenturaLogs();
     CCPipe *_venturaPipes[3]{};
     bool _venturaPipesStarted[3]{};
+    IO80211WorkQueue *_venturaWorkQueue = nullptr;
     CCLogStream *_venturaLogger=nullptr;
     CCStream *_venturaFaultStream=nullptr;
     CCFaultReporter *_venturaCoreFault=nullptr;
