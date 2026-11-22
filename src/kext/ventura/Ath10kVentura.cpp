@@ -28,6 +28,7 @@ extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifne
 // likely because our ivars sit inside the live class's ivar block, and every
 // consumer below needs a pointer that survives that.
 static IO80211Interface *gVenturaPublishedInterface = nullptr;
+static UInt32 gVenturaCreateCalls = 0;
 
 IONetworkInterface *Ath10kPCIDevice::createInterface()
 {
@@ -38,14 +39,25 @@ IONetworkInterface *Ath10kPCIDevice::createInterface()
         interface->release();
         return nullptr;
     }
-    // SystemConfiguration classifies the interface from IOInterfaceType when it
-    // first discovers it, i.e. at the registerService() right after this
-    // returns. Stamping 71 here was measured to break the unit entirely (the
-    // family's own attach path refuses anything but IFT_ETHER), so the 802.11
-    // value is applied later, in start(), and the discovery-time record stays
-    // Ethernet until the unit is published through Apple's vif layer instead.
+    // SystemConfiguration classifies the interface from the IOInterfaceType
+    // property, so this object must keep IFT_ETHER all the way through: SC drops
+    // any other value ("unknown interface type"), while the Wi-Fi class comes
+    // from the controller conforming to IO80211Controller. Read the whole story
+    // in HANDOFF §6.9.1 before touching anything here.
     _venturaInterface = interface;
     gVenturaPublishedInterface = interface;
+    ++gVenturaCreateCalls;
+    if (IOService *owner = getProvider()) {
+        owner->setProperty("Ath10kCreateIfaceCalls",
+                           static_cast<UInt64>(gVenturaCreateCalls), 32);
+        owner->setProperty("Ath10kCreateIfacePtr",
+                           static_cast<UInt64>(reinterpret_cast<uintptr_t>(interface)), 64);
+        // Which Ath10kPCIDevice instance ran this? Compared against the same
+        // value from the delayed retry and from start() to tell "two controller
+        // instances" apart from "the file-static is not shared".
+        owner->setProperty("Ath10kInstanceCreate",
+                           static_cast<UInt64>(reinterpret_cast<uintptr_t>(this)), 64);
+    }
     return interface;
 }
 
@@ -595,15 +607,30 @@ void Ath10kPCIDevice::runVifPublish()
     // land on top of one of them.
     void *infraIvar = *reinterpret_cast<void **>(reinterpret_cast<char *>(this) + 0x200);
     provider->setProperty("Ath10kCtrlInfraIvar", infraIvar != nullptr);
+    IO80211Interface *published = venturaPublishedInterface();
+    provider->setProperty("Ath10kCtrlInfraSeen", published != nullptr);
+    provider->setProperty("Ath10kInstanceRetry",
+                          static_cast<UInt64>(reinterpret_cast<uintptr_t>(this)), 64);
+    provider->setProperty("Ath10kStaticCallsSeen", static_cast<UInt64>(gVenturaCreateCalls), 32);
+    provider->setProperty("Ath10kStaticPtrSeen",
+                          static_cast<UInt64>(reinterpret_cast<uintptr_t>(gVenturaPublishedInterface)), 64);
+    // Install it here (three seconds after Apple's start() returned), never in
+    // createInterface(): attachInterface() skips its whole attach/register pass
+    // when the ivar is already set (measured: the Wi-Fi hardware port vanishes).
+    if (infraIvar == nullptr && published != nullptr) {
+        published->retain();
+        *reinterpret_cast<void **>(reinterpret_cast<char *>(this) + 0x200) = published;
+        provider->setProperty("Ath10kCtrlInfraInstalled", "retry");
+    }
     if (infraIvar != nullptr) {
-        IONetworkInterface *published = OSDynamicCast(IONetworkInterface, (OSObject *)infraIvar);
-        if (published != nullptr) {
+        IONetworkInterface *ivarPublished = OSDynamicCast(IONetworkInterface, (OSObject *)infraIvar);
+        if (ivarPublished != nullptr) {
             provider->setProperty("Ath10kCtrlInfraClass",
-                                  published->getMetaClass()->getClassName());
-            OSString *bsd = OSDynamicCast(OSString, published->getProperty("BSD Name"));
+                                  ivarPublished->getMetaClass()->getClassName());
+            OSString *bsd = OSDynamicCast(OSString, ivarPublished->getProperty("BSD Name"));
             if (bsd != nullptr)
                 provider->setProperty("Ath10kCtrlInfraBsd", bsd->getCStringNoCopy());
-            provider->setProperty("Ath10kCtrlInfraIsOurs", published == _venturaInterface);
+            provider->setProperty("Ath10kCtrlInfraIsOurs", ivarPublished == _venturaInterface);
         } else {
             provider->setProperty("Ath10kCtrlInfraClass", "not-an-interface");
         }
@@ -648,6 +675,18 @@ void Ath10kPCIDevice::runVifPublish()
         char key[24];
         snprintf(key, sizeof(key), "Ath10kFindEn%u", static_cast<unsigned>(unit));
         provider->setProperty(key, static_cast<UInt64>(static_cast<UInt32>(rc)), 32);
+    }
+    // Apple's attach runs later than three seconds (measured: the delayed retry
+    // saw the interface pointer still null while createInterface() had already
+    // run by the time of the ioreg read). Re-arm instead of giving up, so the
+    // controller ivar lands as soon as the interface exists.
+    const bool installed = *reinterpret_cast<void **>(reinterpret_cast<char *>(this) + 0x200) != nullptr;
+    if (!installed && ++_vifPublishAttempts <= 8 && _vifPublishCall != nullptr) {
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(5, kSecondScale, &deadline);
+        thread_call_enter_delayed(_vifPublishCall, deadline);
+        provider->setProperty("Ath10kCtrlInfraRetries",
+                              static_cast<UInt64>(_vifPublishAttempts), 32);
     }
 }
 

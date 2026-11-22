@@ -101,6 +101,7 @@ private:
     // thread call.
     IO80211VirtualInterface *_venturaVif = nullptr;
     thread_call_t _vifPublishCall = nullptr;
+    UInt32 _vifPublishAttempts = 0;
     static void vifPublishCall(thread_call_param_t, thread_call_param_t);
     void runVifPublish();
     bool _venturaPowerOn = false;

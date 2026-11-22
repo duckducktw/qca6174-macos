@@ -28,6 +28,14 @@ extern "C" bool ath10kNetworkInterfaceInit(IONetworkInterface *self,
                                            IONetworkController *controller)
     __asm("__ZN18IONetworkInterface4initEP19IONetworkController");
 
+// The real 80211 interface init (exported by the live IO80211Family). Airportd
+// talks to a device through IO80211APIUserClient, which IO80211Interface::init
+// wires up; bypassing it leaves the interface without that plumbing even though
+// an Ethernet-shaped ifnet exists.
+extern "C" bool ath10kIO80211InterfaceInit(IO80211Interface *self,
+                                           IONetworkController *controller)
+    __asm("__ZN16IO80211Interface4initEP19IONetworkController");
+
 #define super IO80211Interface
 OSDefineMetaClassAndStructors(Ath10kVenturaInterface, IO80211Interface)
 
@@ -45,6 +53,20 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
     // fault reporter). The interface Apple actually publishes is allocated and
     // named one level down, in IONetworkController/IOEthernetInterface, so call
     // that implementation directly and skip the IO80211-only preconditions.
+    // Try the real 80211 interface init first: airportd reaches a device through
+    // IO80211APIUserClient, and that plumbing is created there. It used to be
+    // skipped because it reads controller state that only a completed
+    // IO80211Controller::start() provides - Apple's start() now runs to
+    // completion (Ath10kAppleStart=ok), so the preconditions exist.
+    const bool familyInitOk = ath10kIO80211InterfaceInit(this, controller);
+    if (probe) probe->setProperty("Ath10kIfInit80211", familyInitOk ? "ok" : "failed");
+    if (familyInitOk) {
+        setInterfaceType(0x6 /* IFT_ETHER: what SystemConfiguration accepts */);
+        setProperty("IOPrimaryInterface", kOSBooleanTrue);
+        _owner = owner;
+        if (probe) probe->setProperty("Ath10kIfacePhase", "inited");
+        return true;
+    }
     bool netOk = ath10kNetworkInterfaceInit(this, controller);
     if (probe) probe->setProperty("Ath10kNetworkInitPhase",
                                   netOk ? "network-init-ok" : "network-init-failed");
@@ -99,11 +121,34 @@ bool Ath10kVenturaInterface::initIfnetParams(struct ifnet_init_params *params)
 // Keep the property at IFT_ETHER. See initIfnetParams(): the 802.11 value is a
 // controller-level classification in SystemConfiguration, and 71 on this
 // property makes SC drop the interface entirely.
+//
+// This is also the right place to fill in the controller's interface ivar:
+// airportd reaches the device through IO80211Controller::getNetworkInterface()
+// / getInfraInterface(), which only read [controller+0x200], and the aggregate
+// attachInterface() that normally stores it returns early when the ivar is
+// already set - so it has to be written *inside* the attach, after that check.
 IOReturn Ath10kVenturaInterface::attachToDataLinkLayer(IOOptionBits options, void *param)
 {
+    if (IOService *owner = getProvider())
+        owner->setProperty("Ath10kDataLinkEntered", true);
     const IOReturn result = IO80211Interface::attachToDataLinkLayer(options, param);
-    if (result == kIOReturnSuccess)
+    if (IOService *owner = getProvider())
+        owner->setProperty("Ath10kDataLinkStatus",
+                           static_cast<UInt64>(static_cast<UInt32>(result)), 32);
+    if (result == kIOReturnSuccess) {
         setProperty("IOInterfaceType", static_cast<UInt64>(0x6), 32);
+        IONetworkController *controller = getController();
+        if (controller != nullptr) {
+            void **slot = reinterpret_cast<void **>(reinterpret_cast<char *>(controller) + 0x200);
+            if (*slot == nullptr) {
+                retain();
+                *slot = this;
+                setProperty("Ath10kCtrlInfraSlot", "installed-by-attach");
+            } else {
+                setProperty("Ath10kCtrlInfraSlot", "occupied");
+            }
+        }
+    }
     return result;
 }
 

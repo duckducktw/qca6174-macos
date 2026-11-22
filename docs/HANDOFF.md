@@ -1,8 +1,8 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-22（第五輪：**找到並解掉「SC 看不到介面」的真正原因** —— `IOInterfaceType=71` 會讓 SystemConfiguration 直接丟掉整個介面；改回 6 之後 en1 以 IEEE80211 出現在 SC、Wi-Fi 硬體埠成立。剩下的門檻是 airportd：`IO80211Controller` 的 +0x200 介面指標是 null，airportd 因此回「Wireless is not available」）
+最後更新：2026-11-22（第六輪：SC 分類的真兇（`IOInterfaceType=71`）已解，Wi-Fi 硬體埠與服務成立；本輪補上 controller `+0x200` 介面指標、`IO80211Interface::init` 改走正規、刪掉「重試太早」與「IO80211 plane」兩個錯誤方向。剩下 airportd：infra 請求入口（`apple80211_ioctl(IO80211Interface*, …)`）還沒接）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v70**（`/tmp/vk70`）— kext 載入、單元 en1、SC 認得 en1=IEEE80211、無 panic；v64/v62/v52/vk48 都在
+VM 現況：**v75**（`/tmp/vk75`）— kext 載入、en1、SC 認得 IEEE80211、`IO80211Interface::init` 正規、controller +0x200 已補；airportd 仍不認。v74/v64/v62/v52/vk48 都在
 
 ---
 
@@ -353,6 +353,61 @@ static inline int ether_ifattach(struct _ifnet *ifp, IOEthernetInterface *iface)
 
 所以「借 ifnet / 自己 allocate ifnet」對這條路線是**多餘的**；差別只剩它明確呼叫了 `attachInterface()`（會寫 +0x200），而我們的 Apple `start()` 路徑沒有留下那個 ivar。
 
+---
+
+### 6.10 第六輪（v71–v75）：ivar 補上、80811 init 走正規、airportd 仍不認
+
+#### 6.10.1 為什麼「重試讀到的指標是 null」
+
+量到三件事（v72）：
+
+| 斷點 | 值 | 意義 |
+|---|---|---|
+| `Ath10kInstanceCreate` / `Ath10kInstanceStart` / `Ath10kInstanceRetry` | **完全相同** | 只有一顆 controller 實例，不是雙實例 |
+| `Ath10kCreateIfaceCalls` | 1 | `createInterface()` 真的被 Apple 的 `start()` 呼叫了 |
+| `Ath10kStaticCallsSeen`（重試時讀 file-static） | **0** | 重試（3 秒）**比介面建立更早** —— Apple 的 attach 是延遲/非同步的 |
+
+→ 既不是 ivar 佈局重疊、也不是兩份 kext，就是**時序**。原本「3 秒延遲一次」太早。
+
+#### 6.10.2 改成持續重試 + 在 attach 裡補 ivar（v74）
+
+- `runVifPublish()` 改成每 5 秒重新 arm（最多 8 次），直到 `[this+0x200]` 非 null。v74 實測：`Ath10kCtrlInfraSeen = Yes`（第 2 次重試，約 8 秒）→ `Ath10kCtrlInfraInstalled = retry`，ivar 補上了。
+- `Ath10kVenturaInterface::attachToDataLinkLayer()` 也會在 base 成功後補 ivar（`Ath10kDataLinkEntered=Yes`、`Ath10kDataLinkStatus=0`，代表這個 override 真的會被叫到），但 Apple 發布這顆介面時走的是別條路，所以主要還是靠重試。
+- 注意：`AttachToDataLinkLayer` 補 ivar 不可放在 `createInterface()`（§6.9.3 #3 已證明會讓 `attachInterface()` 提前 return、Wi-Fi 埠消失）。
+
+#### 6.10.3 `IO80211Interface::init()` 走正規（v75）
+
+原本 `Ath10kVenturaInterface::init()` 是**繞過** `IO80211Interface::init`，只呼叫 `IONetworkInterface::init` + `IOEthernetInterface::init`（mangled）。airportd 要靠 `IO80211APIUserClient` 下 ioctl，那份 plumbing 就是 `IO80211Interface::init` 建的。v75 改成先呼叫 `__ZN16IO80211Interface4initEP19IONetworkController`（KC 裡是 EXT 匯出，可安全綁定）：
+
+```
+Ath10kIfInit80211 = ok     ← 正規 init 成功
+Ath10kCtrlInfraInstalled = retry
+en1 照樣存在、SC 照樣認得 IEEE80211
+```
+
+失敗時的 fallback 保留（退回舊的兩段式 bypass），所以不會因為 Apple 哪天改行為就整個掛掉。
+
+#### 6.10.4 這一輪排除掉的假設
+
+| 假設 | 量測 | 結論 |
+|---|---|---|
+| 「IO80211 plane 沒掛」 | `ioreg -p IO80211 -c IO80211VirtualInterface` 是空的，**Apple 自己的 vif 也不在裡面** | ❌ 排除，plane 不是 airportd 的入口 |
+| 「airportd 只是開機早期快取」 | `killall airportd` 後重查，仍然 `Wireless is not available` | ❌ 排除 |
+| 「介面缺 `IOUserClientClass`」 | 節點上沒有這個屬性（只有子節點 `IONetworkStackUserClient`） | 🟡 未定（Apple 的介面也未必把這個屬性寫出來） |
+
+#### 6.10.5 剩下的最強假設：我們沒有實作「infra 請求入口」
+
+KC 裡 live IO80211Family 有這組匯出：
+
+```
+IO80211Controller::apple80211_ioctl(IO80211Interface*, IO80211VirtualInterface*, ifnet_t, u_int, void*)
+IO80211Controller::apple80211_ioctl(IO80211SkywalkInterface*, u_int, void*)
+IO80211Controller::apple80211_ioctl(IO80211VirtualInterface*, ifnet_t, u_int, void*)
+```
+
+而 legacy 驅動（`AirPort_BrcmNIC`）覆寫的是 `apple80211Request(unsigned, int, IO80211Interface*, void*)`。我們目前只覆寫了 **Virtual / Skywalk** 兩個入口（`apple80211VirtualRequest` / `apple80211SkywalkRequest`），**infra（`IO80211Interface`）那條沒接**——那正是 airportd 對實體 Wi-Fi 介面走的路。這解釋了為什麼 `Ath10kApple80211Requests` 從頭到尾只有 1 次（那次是 vif 的 CARD_CAPABILITIES 探測）。
+
+
 
 
 ---
@@ -368,7 +423,17 @@ networksetup -listallhardwareports | grep -A2 -i wifi # 目前仍然沒有
 ```
 **注意**：§6.7 已證明 Wi-Fi 硬體埠消失不是「多顆介面」造成的，是 SC 根本看不到這個介面。
 
-### 7.2 讓 airportd 拿得到裝置（**下一輪從這裡開始**）
+### 7.2 接上 airportd 的 infra 請求入口（**下一輪從這裡開始**）
+
+§6.9/§6.10 已經完成：介面在 SC 裡是 Wi-Fi 硬體埠、`IO80211Interface::init` 走正規、controller 的 `+0x200` 介面指標補上（`Ath10kCtrlInfraInstalled = retry`）。airportd 仍回 `Wireless is not available`，最強假設是**請求入口沒接**：
+
+1. **實作 infra 入口**：在 `Ath10kPCIDevice` 覆寫 live IO80211Family 的
+   `apple80211_ioctl(IO80211Interface *, IO80211VirtualInterface *, ifnet_t, u_int, void *)`
+   （必要時連 `apple80211_ioctl_get/set(IO80211Interface*, IO80211VirtualInterface*, ifnet_t, void*)` 一起），把 request 轉給既有的 `venturaDispatchRequest()`。用 KC 的 live vtable 位移驗證槽位，不要靠 vendored header 的順序（§6.5 的教訓）。
+2. **驗收**：`Ath10kApple80211Requests` 從 1 開始持續增加（airportd 會連發 CARD_CAPABILITIES/POWER/STATE/SUPPORTED_CHANNELS）、`ioreg` 出現 airportd 對 IO80211 開的 user client、`networksetup -getairportpower en1` 回 `On/Off` 而不是 `Wireless is not available`。
+3. 若 infra 入口接了仍不認：把 `getCARD_CAPABILITIES` 的位元改成 AirportItlwm 的填法（`/tmp/itlsrc/AirportItlwm/AirportSTAIOCTL.cpp:667`，逐 bit 對 `APPLE80211_CAP_*`，不要用我們的 `bits[0]=0x0f` 自創格式）。
+
+### 7.2-old 讓 airportd 拿得到裝置（**已被本節取代，僅留記錄**）
 
 §6.9 已經把「介面在 SC 裡是 Wi-Fi」這件事做完（B ✅）。剩下的門檻是 airportd：它透過 `IO80211Controller::getNetworkInterface()`／`getInfraInterface()`（兩者都只是讀 `[this+0x200]`）拿介面，而這個 ivar 是 null。
 
@@ -427,6 +492,9 @@ VM 通了之後把 kext 部署回實體 ESP，在真機重驗（真機 ASPM 可�
 | **v67** | 延遲重試裡 `getMatchingServices()` 掃 `IONetworkInterface` | **kernel wedge**（`registry root held busy`），只能主機端換 bundle 救援 |
 | **v68** | 在 `createInterface()` 就寫 `[this+0x200]` | **Wi-Fi 硬體埠消失**（`attachInterface()` 因 ivar 非 null 直接 return，§6.9.3 #3） |
 | **v69–v70** | 改在 Apple 的 `start()` 之後寫 ivar；同時用 file-static 保存介面指標 | `Ath10kCtrlInfraSeen = No`：連 file-static 都讀不到 → 介面指標來源待釐清（`_venturaInterface` 在 +0x668）。VM 穩定、SC 仍認得 en1=IEEE80211 |
+| **v71–v72** | 加 `Ath10kInstanceCreate/Start/Retry`、`Ath10kStaticCallsSeen` 斷點 | 三個 instance 指標**相同**、`CreateIfaceCalls=1`、但重試讀 static 是 **0** → 純時序問題（Apple 的 attach 比 3 秒晚） |
+| **v73–v74** | 重試改成每 5 秒 re-arm（最多 8 次）；介面 `attachToDataLinkLayer()` 成功後也補 ivar | `Ath10kCtrlInfraSeen=Yes`、`Ath10kCtrlInfraInstalled=retry`（第 2 次重試）、`Ath10kDataLinkEntered=Yes`/status 0。airportd 仍不認 |
+| **v75** | `init()` 改走正規 `__ZN16IO80211Interface4initEP19IONetworkController`（失敗才 fallback） | `Ath10kIfInit80211=ok`；en1 與 SC 的 IEEE80211 分類都還在；airportd 仍 `Wireless is not available`。同輪排除 IO80211 plane 與 airportd 快取兩個假設（§6.10.4） |
 
 ---
 

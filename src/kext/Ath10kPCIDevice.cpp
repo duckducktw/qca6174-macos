@@ -327,6 +327,8 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // hardware port disappears). +0x200 cannot collide with our own members;
     // _venturaInterface sits at +0x668.
     if (appleStart) {
+        provider->setProperty("Ath10kInstanceStart",
+                              static_cast<UInt64>(reinterpret_cast<uintptr_t>(this)), 64);
         IO80211Interface *published = venturaPublishedInterface();
         provider->setProperty("Ath10kCtrlInfraSeen", published != nullptr);
         if (published != nullptr) {
