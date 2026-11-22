@@ -410,7 +410,21 @@ bool Ath10kPCIDevice::start(IOService *provider)
                 if (attached) {
                     vifService->registerService();
                     provider->setProperty("Ath10kVifPhase", "vif-registered");
+                    _venturaVif = vif;
+                    // The handoff is retried from a delayed call as well: the
+                    // interface node with the BSD unit is not attached to this
+                    // controller yet while start() is still running.
                     publishVenturaVifBsdUnit(vif, provider);
+                    if (_vifPublishCall == nullptr) {
+                        _vifPublishCall = thread_call_allocate_with_options(
+                            vifPublishCall, this, THREAD_CALL_PRIORITY_KERNEL,
+                            THREAD_CALL_OPTIONS_ONCE);
+                    }
+                    if (_vifPublishCall != nullptr) {
+                        uint64_t deadline = 0;
+                        clock_interval_to_deadline(3, kSecondScale, &deadline);
+                        thread_call_enter_delayed(_vifPublishCall, deadline);
+                    }
                 }
             }
         } else {

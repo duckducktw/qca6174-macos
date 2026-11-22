@@ -1,8 +1,8 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-22（第三輪：§7.1 落地 → 證實 Apple 的 `start()` 會自己發布單元；並量到 **SystemConfiguration 根本看不到這個介面**（`SCNetworkInterfaceCopyAll()` 只有 serial1/en0），所以先前的「SC 分類成 Ethernet」其實是舊快取記錄）
+最後更新：2026-11-22（第四輪：vif 想借 ifnet 卻一個來源都拿不到 → ifnet KPI 在本 kext 失效、介面不是控制器子節點、vif vtable 位移全部量好；下一步改成自己 `ifnet_allocate`）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v53**（`/tmp/vk53`；v52 在 `/tmp/vk52`）— kext 有載入、單元是 **en1**（因為 SC 記錄被清掉，號碼重配）、firmware runtime ready、SSH 正常、無 panic、Apple 的 `start()` 是唯一 publisher；**v48 仍是救援版**
+VM 現況：**v62**（`/tmp/vk62`）— kext 載入、單元 en1、Apple start 唯一 publisher、無 panic；v52/v53/vk48 都在
 
 ---
 
@@ -239,6 +239,30 @@ SCNetworkInterfaceCopyAll() -> 2
 → 所以 vif 路線必須自己生 ifnet（`ifnet_allocate`/`ifnet_attach`，public），再用 `setUnitNumber`＋`initBSDInterfaceParameters`＋`prepareBSDInterface`＋`configureIfnet`＋`attachToBpf` 收尾。
 
 **下一步（§7.2 改寫）**：vif 自己生 ifnet（type 從出生就是 `IFT_IEEE80211`），交給 `prepareBSDInterface`，然後看 `SCNetworkInterfaceCopyAll()` 是否出現該單元。判斷依據只要這一支程式，不用再猜 SC 的分類規則。
+
+---
+
+## 6.8 第四輪（v54–v62）：vif 借 ifnet 這條路的**五個量測結論**（本輪無進展，但把死路全部標記完）
+
+這一輪照 §7.2 動手：讓 vif 拿到 enN 的 ifnet，再走 `prepareBSDInterface` → `configureIfnet` → `attachToBpf`。結果**一個來源都拿不到 ifnet**，而每一次失敗都排除掉一條路：
+
+| # | 取得 ifnet 的方式 | 實測 | 結論 |
+|---|---|---|---|
+| 1 | `_venturaInterface->getIfnet()` | null | 我們手上的介面物件不是拿到單元的那顆（Apple attach 另建） |
+| 2 | 控制器 ivar `+0x200`（`attachInterface` 停車位） | null | Apple 的 start 沒有把介面停在這裡 |
+| 3 | 掃控制器的 registry 子節點找 `"BSD Name"` | 6 個子節點全是 `CCLogPipe`×4 / `CCDataPipe` / `IO80211VirtualInterface` | **介面不是控制器的子節點**（起始時不是，3 秒後也不是） |
+| 4 | `ifnet_find_by_name("en0".."en3")` | **全部回 6（ENXIO），連 en0 也一樣** | 這個 KPI 在我們的 kext 裡等於不能用（重複符號/世代問題），任何 name 路徑都死 |
+| 5 | `ifnet_list_get(IFNET_FAMILY_ANY, …)` | 沒有 `enN`（N≥1）符合 | 同上，ifnet 清單側也看不到我們的單元 |
+
+**其餘量測（重要，別再重試）**
+- `en0` 與 `en1` 底下掛的是**同一個** `IONetworkStack`（id 0x10000019f），所以 §6.7 猜的「stack 必須是介面的 parent」**不成立**（`isParent` 對兩者都為真）。
+- IONetworkStack 只有一個 instance，節點屬性是 `IOProviderClass = IOResources`、`IOResourceMatch = "IOBSD"`、`IOUserClientClass = IONetworkStackUserClient`（configd 開的），另外有一個**驅動白名單** `IONetworkMbufDMADrivers = ("com.apple.driver.AppleVmxnet3Ethernet")` —— 只有 en0 的驅動在裡面，這是目前唯一「en0 有、我們沒有」的結構性差異。
+- `IONetworkInterface::attachToDataLinkLayer`（live `0x2c638a4`）自己就會建兩種參數結構：`memset(0x90)` = `ifnet_init_params`、`memset(0x158)` = `ifnet_init_eparams`，並寫死 `eparams.version=2, len=0x158`；先 `call [vptr+0x9c0]`（= `initIfnetParams`），再從我們的 params 抄 lladdr/addrlen/callbacks 進 eparams，`options` 的 bit 2/3 決定內部 mode 1 或 2。→ 所以「自己手刻 ifnet_init_eparams」不是必要步驟，這條路徑本來就會做。
+- vif 側的 vtable 索引（`vptr = &vtable[2]`，所以 `[vptr+off]` 的 index = `(off+0x10)/8`）：`284 initBSDInterfaceParameters`、`285 prepareBSDInterface`、`286 finalizeBSDInterface`、`287 getBSDInterface`、`288 setBSDName`、`455 setUnitNumber`、`456 attachToBpf`、`457 configureIfnet`。程式裡已用這些位移呼叫（見 `publishVenturaVifBsdUnit`）。
+- `setBSDName()` 只是 `strlcpy(ivars+0x49, name, 16)`，不會生 ifnet。
+
+**結論**：vif 這條路線缺的不是「呼叫哪個 virtual」，而是**能用的 ifnet 參照**；在 ifnet KPI 於本 kext 失效的前提下，唯一乾淨的作法是**自己 `ifnet_allocate` 一顆**（`ifnet_init_params` 由我們填、`ifnet_attach`），再交給 `prepareBSDInterface`。下一輪就從這裡開始，不要再去掃 registry 或 name lookup。
+
 
 ---
 

@@ -254,7 +254,80 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
             source = "interface-ifnet";
         }
     }
+    if (ifp == nullptr) {
+        // The object createInterface() gave us is not the one Apple attached, so
+        // take the interface IO80211Controller::attachInterface parked in its own
+        // ivar (offset 0x200) - that is the published instance.
+        IONetworkInterface *published =
+            *(IONetworkInterface **)((char *)this + 0x200);
+        if (published != nullptr) {
+            ifnet_t candidate = published->getIfnet();
+            if (candidate != nullptr) {
+                ifp = candidate;
+                ifnet_reference(ifp);
+                source = "controller-ivar";
+            }
+        }
+    }
+    if (ifp == nullptr) {
+        // The interface is not a direct child of the controller (its children are
+        // the corecapture pipes and the vif), so walk both the controller and the
+        // vif looking for a node that carries a "BSD Name" - reading the property
+        // is what works, IONetworkInterface::getIfnet() returned null on the very
+        // object that owns the unit.
+        IOService *parents[2] = {this, reinterpret_cast<IOService *>(vif)};
+        for (UInt32 p = 0; p < 2 && ifp == nullptr; ++p) {
+            if (parents[p] == nullptr)
+                continue;
+            UInt32 childCount = 0;
+            OSIterator *iter = parents[p]->getChildIterator(gIOServicePlane);
+            while (iter != nullptr) {
+                IOService *child = OSDynamicCast(IOService, iter->getNextObject());
+                if (child == nullptr)
+                    break;
+                ++childCount;
+                OSString *childName = OSDynamicCast(OSString, child->getProperty("BSD Name"));
+                if (childName == nullptr)
+                    continue;
+                provider->setProperty("Ath10kIfaceChildClass",
+                                      child->getMetaClass()->getClassName());
+                if (ifnet_find_by_name(childName->getCStringNoCopy(), &ifp) == 0 && ifp != nullptr) {
+                    source = p == 0 ? "controller-child" : "vif-child";
+                    break;
+                }
+                ifp = nullptr;
+            }
+            if (iter) iter->release();
+            if (p == 0)
+                provider->setProperty("Ath10kChildCount", static_cast<UInt64>(childCount), 32);
+        }
+    }
     char unitName[16] = {0};
+    if (ifp == nullptr) {
+        // ifnet_find_by_name() returns ENXIO for every name in this kext, even
+        // "en0", so the name-based routes are dead ends here. ifnet_list_get()
+        // walks the attached list instead, and the unit we want is the only enN
+        // whose type is IEEE80211 and whose unit is not 0.
+        ifnet_t *list = nullptr;
+        UInt32 listCount = 0;
+        if (ifnet_list_get(IFNET_FAMILY_ANY, &list, &listCount) == 0 && list != nullptr) {
+            for (UInt32 i = 0; i < listCount; ++i) {
+                ifnet_t candidate = list[i];
+                if (candidate == nullptr)
+                    continue;
+                const char *candidateName = ifnet_name(candidate);
+                if (candidateName == nullptr || strncmp(candidateName, "en", 2) != 0)
+                    continue;
+                if (ifnet_unit(candidate) == 0)
+                    continue;
+                ifp = candidate;
+                ifnet_reference(ifp);
+                source = "ifnet-list";
+                break;
+            }
+            ifnet_list_free(list);
+        }
+    }
     if (ifp == nullptr) {
         // Fallback 1: the interface does carry the unit number and the name
         // prefix (SystemConfiguration reads the same pair), so build enN.
@@ -314,8 +387,95 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
                           status == kIOReturnSuccess ? "prepared" : "prepare-failed");
     provider->setProperty("Ath10kVifBsdStatus",
                           static_cast<UInt64>(static_cast<UInt32>(status)), 32);
+    if (status != kIOReturnSuccess) {
+        ifnet_release(ifp);
+        return false;
+    }
+    // prepareBSDInterface only stores the ifnet in the vif's ivars and sets
+    // MTU/eflags/reporters; the rest of the family's BSD bring-up lives in
+    // configureIfnet() and attachToBpf(). Call them through the *live* vtable
+    // offsets (index*8 - 0x10, because vptr points at &vtable[2]) - the
+    // vendored header describes a different generation, so a named virtual call
+    // could land one slot off. Measured indices on 13.7.8:
+    //   284 initBSDInterfaceParameters, 285 prepareBSDInterface,
+    //   286 finalizeBSDInterface, 287 getBSDInterface,
+    //   455 setUnitNumber, 456 attachToBpf, 457 configureIfnet
+    void **vptr = *reinterpret_cast<void ***>(vif);   // &vtable[2]
+    typedef bool (*VifAttachFn)(void *);
+    typedef void (*VifVoidFn)(void *);
+    typedef ifnet_t (*VifIfnetFn)(void *);
+
+    ifnet_t stored = reinterpret_cast<VifIfnetFn>(vptr[0x8e8 / 8])(vif);
+    provider->setProperty("Ath10kVifIfnetStored", stored != nullptr);
+    if (stored == nullptr) {
+        provider->setProperty("Ath10kVifAttachPhase", "ifnet-not-stored");
+        ifnet_release(ifp);
+        return false;
+    }
+    reinterpret_cast<VifVoidFn>(vptr[0xe38 / 8])(vif);   // configureIfnet()
+    provider->setProperty("Ath10kVifAttachPhase", "ifnet-configured");
+    const bool bpfAttached = reinterpret_cast<VifAttachFn>(vptr[0xe30 / 8])(vif);
+    provider->setProperty("Ath10kVifAttachPhase",
+                          bpfAttached ? "bpf-attached" : "bpf-attach-failed");
     ifnet_release(ifp);
-    return status == kIOReturnSuccess;
+    return bpfAttached;
+}
+
+void Ath10kPCIDevice::vifPublishCall(thread_call_param_t param0, thread_call_param_t)
+{
+    auto *self = static_cast<Ath10kPCIDevice *>(param0);
+    if (self != nullptr)
+        self->runVifPublish();
+}
+
+// Retry of the vif BSD handoff, three seconds after start(). The interface node
+// that carries "BSD Name" is not a child of the controller while start() runs
+// (its children then are the corecapture pipes and the vif), so the handoff can
+// only find the unit once the registry has settled.
+void Ath10kPCIDevice::runVifPublish()
+{
+    IOService *provider = getProvider();
+    if (provider == nullptr)
+        return;
+    if (_venturaVif == nullptr) {
+        provider->setProperty("Ath10kVifPublishRetry", "no-vif");
+        return;
+    }
+    const bool ok = publishVenturaVifBsdUnit(_venturaVif, provider);
+    provider->setProperty("Ath10kVifPublishRetry", ok ? "published" : "failed");
+    // Record what the registry looks like from here three seconds in: during
+    // start() the controller's children are only the corecapture pipes and the
+    // vif, and the same walk still found no "BSD Name" child.
+    UInt32 index = 0;
+    OSIterator *iter = getChildIterator(gIOServicePlane);
+    while (iter != nullptr) {
+        IOService *child = OSDynamicCast(IOService, iter->getNextObject());
+        if (child == nullptr)
+            break;
+        if (++index > 8)
+            break;
+        char key[24];
+        snprintf(key, sizeof(key), "Ath10kRetryChild%u", static_cast<unsigned>(index));
+        provider->setProperty(key, child->getMetaClass()->getClassName());
+        OSString *bsd = OSDynamicCast(OSString, child->getProperty("BSD Name"));
+        if (bsd != nullptr) {
+            char key2[24];
+            snprintf(key2, sizeof(key2), "Ath10kRetryBsd%u", static_cast<unsigned>(index));
+            provider->setProperty(key2, bsd->getCStringNoCopy());
+        }
+    }
+    if (iter) iter->release();
+    // Probe the ifnet lookup itself: every name-based source failed while
+    // `ifconfig` plainly lists en1, so record the raw return codes.
+    for (UInt32 unit = 0; unit < 4; ++unit) {
+        char name[8];
+        snprintf(name, sizeof(name), "en%u", static_cast<unsigned>(unit));
+        ifnet_t probe = nullptr;
+        const int rc = ifnet_find_by_name(name, &probe);
+        char key[24];
+        snprintf(key, sizeof(key), "Ath10kFindEn%u", static_cast<unsigned>(unit));
+        provider->setProperty(key, static_cast<UInt64>(static_cast<UInt32>(rc)), 32);
+    }
 }
 
 SInt32 Ath10kPCIDevice::performCountryCodeOperation(IO80211CountryCodeOp operation)

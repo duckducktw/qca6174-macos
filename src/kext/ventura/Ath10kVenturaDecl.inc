@@ -85,6 +85,15 @@ private:
     SInt32 venturaCountryCode(void *data, bool isSet);
     void venturaPublishState(UInt32 state);
     IO80211Interface *_venturaInterface = nullptr;
+    // The vif is created inside Apple's start(), but its BSD handoff cannot run
+    // there: the controller's registry children at that moment are only the
+    // corecapture pipes and the vif, the interface node that carries "BSD Name"
+    // shows up afterwards. Keep the vif and retry the handoff from a delayed
+    // thread call.
+    IO80211VirtualInterface *_venturaVif = nullptr;
+    thread_call_t _vifPublishCall = nullptr;
+    static void vifPublishCall(thread_call_param_t, thread_call_param_t);
+    void runVifPublish();
     bool _venturaPowerOn = false;
     UInt32 _venturaState = APPLE80211_S_INIT;
     UInt8 _venturaScanIndex = 0;
