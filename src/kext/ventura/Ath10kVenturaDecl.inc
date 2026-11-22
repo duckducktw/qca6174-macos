@@ -66,6 +66,12 @@ private:
     CCStream *_venturaFaultStream=nullptr;
     CCFaultReporter *_venturaCoreFault=nullptr;
     IOReturn venturaPower(bool on);
+    // Hand the ifnet our IO80211Interface already owns to the virtual
+    // interface, so the 80211 core publishes the BSD unit itself instead of
+    // SystemConfiguration filing an Apple-Ethernet-shaped interface as
+    // "Ethernet N". Needs prepareBSDInterface(), which only the live
+    // IO80211Family exports.
+    bool publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOService *provider);
     IOReturn venturaScan(const apple80211_scan_data *request);
     IOReturn venturaAssociate(const apple80211_assoc_data *request);
     void venturaDisassociate(bool deauth);

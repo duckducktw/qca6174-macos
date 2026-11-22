@@ -29,6 +29,12 @@ extern "C" bool ath10kAttachVirtualInterface(IO80211Controller *,
 extern "C" IO80211VirtualInterface *ath10kCreateVirtualInterface(IO80211Controller *,
                                                                 ether_addr *, UInt32)
     __asm("__ZN17IO80211Controller22createVirtualInterfaceEP10ether_addrj");
+// Live-family only: prepareBSDInterface() hands an ifnet to the 80211 core so
+// the core publishes the BSD unit. Absent from IO80211FamilyLegacy's table and
+// from the plain IO80211Interface, which is the whole reason a unit published
+// through the legacy class is filed as Ethernet.
+extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifnet_t, UInt32)
+    __asm("__ZN23IO80211VirtualInterface19prepareBSDInterfaceEP7__ifnetj");
 
 // Both IO80211Controller copies in the 13.7 kernel collection export
 // createVirtualInterface / attachVirtualInterface / gMetaClass, so a mangled-name
@@ -396,6 +402,7 @@ bool Ath10kPCIDevice::start(IOService *provider)
                 if (attached) {
                     vifService->registerService();
                     provider->setProperty("Ath10kVifPhase", "vif-registered");
+                    publishVenturaVifBsdUnit(vif, provider);
                 }
             }
         } else {

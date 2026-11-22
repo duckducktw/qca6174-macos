@@ -4,8 +4,13 @@
 // transmit path, power/state reporting and the apple80211 request dispatcher
 // that airportd uses for everything the Wi-Fi UI shows.
 #include "Ath10kVenturaABI.hpp"
+#include <net/kpi_interface.h>
 
 #ifdef ATH10K_VENTURA
+
+// Live-family only: the step that hands an ifnet to the 80211 core.
+extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifnet_t, UInt32)
+    __asm("__ZN23IO80211VirtualInterface19prepareBSDInterfaceEP7__ifnetj");
 
 #include "Ath10kVenturaInterface.hpp"
 #include "../Ath10kPCIDevice.hpp"
@@ -223,6 +228,82 @@ bool Ath10kPCIDevice::createWorkQueue()
 IO80211WorkQueue *Ath10kPCIDevice::getWorkQueue() const
 {
     return _venturaWorkQueue;
+}
+
+// The last piece the legacy-class publication cannot do: register the ifnet we
+// already own with the 80211 core. On 13.7 prepareBSDInterface(ifnet, flags)
+// lives only on the live family's IO80211SkywalkInterface/IO80211Virtual-
+// Interface, never on the plain IO80211Interface, which is why the unit exists
+// but SystemConfiguration still files it as Ethernet and airportd never sends a
+// request. The live implementation only sets properties, MTU (1500),
+// IOReporters and eflags on the ifnet we hand it, so passing ours is safe.
+bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOService *provider)
+{
+    if (vif == nullptr)
+        return false;
+    // The unit name the kernel picked is not on the object we hold as
+    // "BSD Name" at this point, but the interface does carry the unit number and
+    // the name prefix (SystemConfiguration reads the same pair), so build enN
+    // from those and fall back to a registry scan.
+    char unitName[16] = {0};
+    if (_venturaInterface) {
+        OSNumber *unit = OSDynamicCast(OSNumber, _venturaInterface->getProperty(kIOInterfaceUnit));
+        OSString *prefix = OSDynamicCast(OSString,
+                                         _venturaInterface->getProperty(kIOInterfaceNamePrefix));
+        if (unit)
+            snprintf(unitName, sizeof(unitName), "%s%u",
+                     prefix ? prefix->getCStringNoCopy() : "en",
+                     static_cast<unsigned>(unit->unsigned32BitValue()));
+    }
+    OSString *bsdName = nullptr;
+    if (unitName[0] != 0)
+        bsdName = OSString::withCString(unitName);
+    if (bsdName == nullptr) {
+        // Our own class, not the abstract parent: matching "IO80211Interface"
+        // does not return the registered subclass instances here.
+        OSDictionary *match = IOService::serviceMatching("Ath10kVenturaInterface");
+        OSIterator *iter = match ? IOService::getMatchingServices(match) : nullptr;
+        while (iter && bsdName == nullptr) {
+            IOService *candidate = OSDynamicCast(IOService, iter->getNextObject());
+            if (candidate == nullptr)
+                break;
+            OSString *name = OSDynamicCast(OSString, candidate->getProperty("BSD Name"));
+            if (name == nullptr)
+                continue;
+            bsdName = name;
+            bsdName->retain();
+        }
+        if (iter) iter->release();
+        if (match) match->release();
+    }
+    if (bsdName == nullptr) {
+        provider->setProperty("Ath10kVifBsdPhase", "no-bsd-name");
+        return false;
+    }
+    ifnet_t ifp = nullptr;
+    if (ifnet_find_by_name(bsdName->getCStringNoCopy(), &ifp) != 0 || ifp == nullptr) {
+        provider->setProperty("Ath10kVifBsdPhase", "ifnet-not-found");
+        bsdName->release();
+        return false;
+    }
+    provider->setProperty("Ath10kVifBsdPhase", "ifnet-found");
+
+    // Naming properties a published 80211 interface carries; set them before
+    // prepareBSDInterface so the core publishes the unit under this name.
+    IOService *target = reinterpret_cast<IOService *>(vif);
+    target->setProperty("built-in", kOSBooleanTrue);
+    target->setProperty("IOInterfaceName", bsdName->getCStringNoCopy());
+    target->setProperty(kIOInterfaceUnit, static_cast<UInt64>(ifnet_unit(ifp)), 32);
+    target->setProperty(kIOInterfaceNamePrefix, ifnet_name(ifp));
+
+    const IOReturn status = ath10kPrepareVifBsdInterface(vif, ifp, 0);
+    provider->setProperty("Ath10kVifBsdPhase",
+                          status == kIOReturnSuccess ? "prepared" : "prepare-failed");
+    provider->setProperty("Ath10kVifBsdStatus",
+                          static_cast<UInt64>(static_cast<UInt32>(status)), 32);
+    ifnet_release(ifp);
+    bsdName->release();
+    return status == kIOReturnSuccess;
 }
 
 SInt32 Ath10kPCIDevice::performCountryCodeOperation(IO80211CountryCodeOp operation)
