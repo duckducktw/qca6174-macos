@@ -1,8 +1,8 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-22（本輪做了 radio bring-up、BSD 單元、SC 分類三輪實測，以及照抄社群解法的兩次嘗試）
+最後更新：2026-11-22（第二輪：找到 IO80211 ABI 根因 → 修好 → Apple 的 `start()` 首次跑完、vif 建起來、第一個 apple80211 請求送達；SC 分類仍卡）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v48**（`/tmp/vk48`）— kext 有載入、`en2` 存在、firmware runtime ready、SSH 正常
+VM 現況：**v51**（`/tmp/vk51`）— kext 有載入、`en2` 存在、firmware runtime ready、SSH 正常、無 panic；**v48 仍是救援版**
 
 ---
 
@@ -22,29 +22,30 @@ VM 現況：**v48**（`/tmp/vk48`）— kext 有載入、`en2` 存在、firmware
 
 ---
 
-## 2. 目前權威狀態（v48）
+## 2. 目前權威狀態（v51）
 
-**環境**：macOS **13.7.8 / 22H730**；`com.apple.iokit.IO80211Family 1200.13.0`（載入基址 `0xffffff8001f35000`，長度 `0x19bff9`，**live 範圍 `0x1f35000`–`0x20d0ff9`**）；`IONetworkingFamily 3.4`；kext `br.com.jonasw8.driver.ath10kmac 0.0.105`；OpenCore 1.0.5 DEBUG（`Target=67`、`ShowPicker=false`、`Timeout=0`）。
+**環境**：macOS **13.7.8 / 22H730**；`com.apple.iokit.IO80211Family 1200.13.0`（載入基址 `0xffffff8001f35000`，長度 `0x19bff9`，**live 範圍 `0x1f35000`–`0x20d0ff9`**）＋ **`com.apple.iokit.IO80211FamilyLegacy`（另一個 bundle，見 §6.5）**；`IONetworkingFamily 3.4`；kext `br.com.jonasw8.driver.ath10kmac 0.0.105`；OpenCore 1.0.5 DEBUG（`Target=67`、`ShowPicker=false`、`Timeout=0`）。
 
-| 觀察點 | v48 實測值 | 意義 |
+| 觀察點 | v51 實測值 | 意義 |
 |---|---|---|
 | `ifconfig -l` | `lo0 gif0 stf0 en0 en2` | `en2` 是我們的 BSD 單元 |
-| `Ath10kStartPhase` | `interface-published` | create→configure→attach→data-link→register 全過 |
-| `Ath10kIfacePhase` | `inited` | 介面 init 成功（走繞過 v1 init 的路） |
-| `Ath10kAlignPhase` | `aligned` | vtable slot 補丁已寫入 |
-| `Ath10kStackPhase` | `driver-owns-ifnet` | 不再呼叫 `IONetworkStack`（見 §5.2） |
-| `Ath10kASPMControl` | `write-ignored-continued` | QEMU 不吃 ASPM 寫入，已改為非致命（§4.1） |
-| `Ath10kRecoveryPhase` | `ready` | **firmware runtime 活著** |
-| `Ath10kWMIInitSucceeded` | Yes | WMI init 完成 |
-| `Ath10kColdTargetInitSucceeded` | Yes | 冷啟動 target-init 成功 |
-| `Ath10kFirmwareBootStatus` | `htc-ready-before-reset` | HTC ready 已到 |
-| `Ath10kVifPhase` | `vif-create-failed` | 向 family 要 vif 失敗（§5.4、§6） |
-| `Ath10kApple80211Requests` | **屬性不存在 = 0 次** | airportd 從沒送過請求（§4.4） |
-| `ioreg -r -c IO80211Interface` | 2 筆 | 一筆 state 0（我們 start 內建的）、一筆 `BSD Name=en2` |
-| `networksetup -listallhardwareports` | 有 `Hardware Port: Wi-Fi / Device: en2` | SC 認得這是 Wi-Fi 硬體埠 |
-| `networksetup -listnetworkserviceorder` | `(3) Ethernet 2 (Hardware Port: Ethernet, Device: en2)` | **卡點：服務型別是 Ethernet** |
-| `networksetup -getairportpower en2` | `Off (forced)`；想開會說 “all AirPort network services are disabled” | airportd 不接管 |
-| `tools/ifnet-type`（ifnet 真實型別） | `en0 0x06`、`en2 0x47`（v41 實測） | ifnet 型別可以改成 80211，**但 SC 看的不是它** |
+| `Ath10kAlignPhase` | `abi-native` | header 已是 live B 順序，不再手動補 slot（§6.5） |
+| `Ath10kStartPhase` | `interface-published` | 手動發布路徑的結論（會覆蓋 apple-started 的值，見 §6.6） |
+| `Ath10kIfacePhase` | `inited` | 介面 init 成功 |
+| `Ath10kWorkQueue` | Yes | `IO80211WorkQueue::workQueue()` 已供應（§6.6） |
+| `Ath10kFaultSlotPhase` | `reporter` | live 的 `findAndAttachToFaultReporter` 真的呼叫到我們的 slot |
+| `Ath10kStackPhase` | `driver-owns-ifnet` | 不再呼叫 `IONetworkStack`（§5.2） |
+| `Ath10kASPMControl` | `write-ignored-continued` | QEMU 不吃 ASPM 寫入，非致命（§4.1） |
+| `Ath10kRecoveryPhase` | `ready` | firmware runtime 活著 |
+| `Ath10kVifPhase` | **`vif-registered`** | `createVirtualInterface(this, addr, 7)` 這次真的成功（role=SoftAP） |
+| `Ath10kVifBsdPhase` | **`no-bsd-name`** | vif→`prepareBSDInterface` 交接卡在取名稱（§6.6） |
+| `Ath10kApple80211Requests` | **1** | 第一次有請求送達（vif 能力查詢） |
+| `ioreg -r -c Ath10kVenturaInterface` | **6 筆**（其中 1 筆 `BSD Name=en2`） | 疊出多個介面物件，手動發布路徑現在是多餘的 |
+| `ioreg -r -c IO80211VirtualInterface` | 1 筆 | vif 存在但沒有 BSD 單元 |
+| `networksetup -listallhardwareports` | **本輪 Wi-Fi 硬體埠消失**（v48 時還在） | 多介面干擾 SC 的推導 |
+| `networksetup -listnetworkserviceorder` | `(3) Ethernet 2 (Hardware Port: Ethernet, Device: en2)` | **卡點：服務型別仍是 Ethernet** |
+| `networksetup -getairportpower en2` | `Off (forced)` | airportd 不接管 |
+| `tools/ifnet-type`（ifnet 真實型別） | `en2 type=0x47 (71)` | ifnet 型別已是 80211，SC 不吃這個值 |
 
 ---
 
@@ -201,24 +202,25 @@ symtab 實查：`createVirtualInterface`、`attachVirtualInterface`、`IO80211Vi
 
 ## 7. 下一個接手的人：照這個順序
 
-### 7.1 先解結構性問題（優先，零風險）
-**問清楚「這個 kext 為什麼會被靜默跳過」。**
+### 7.1 ABI 已修好，先清掉重疊的發布路徑（優先）
+`super::start()` 現在會跑完，而且**它自己就建了介面**（`IO80211Interface` 節點曾出現 6 個、本輪 Wi-Fi 硬體埠還從 SC 清單消失）。所以 `Ath10kPCIDevice.cpp` 裡「`start()` 後半段手動 create→configure→attach→蓋 71→register」那整段要先拿掉，只留 vif 那塊，然後確認：
 ```bash
-# 在 guest 內手動載入，取得真正的拒絕原因（kext 已在 ESP，但沒被 OC 注入時）
-sudo kmutil load -p /Library/Extensions/Ath10kMac.kext   # 或從 ESP 複製到 /tmp 再指定
-sudo kmutil showloaded | grep -i ath10k
+ioreg -r -c IO80211Interface | grep -c '+-o'          # 應該只剩 Apple 自己那一顆（+1 顆 vif）
+networksetup -listallhardwareports | grep -A2 -i wifi
+networksetup -listnetworkserviceorder | tail -5
 ```
-搭配：打開 OpenCore 的 kext 載入日誌（`Misc/Debug/Target=67` 已開），或比對「能載入的 v48」與「不能載入的 v49」binary 的 undefined 符號差異（`nm -u` 對 KC 匯出表）。
-→ 有了真正的拒絕原因，才能判斷 §6.1 的 `super::start()` + `IO80211WorkLoop` 是不是可以重啟。
+目標：回到「1 顆介面 + 1 顆 vif、Wi-Fi 硬體埠存在」，再談分類。
 
-### 7.2 然後才是把 ifnet 交給 80211 核心
-依 §6.2，缺的最後一步是 `prepareBSDInterface(ifnet, 0)`。優先序：
-1. 設法取得一個 `IO80211VirtualInterface` / `IO80211InfraInterface` 實例（**不要**用 `new`，見 §5.10；也不要直接把 Skywalk 版 virtual 拿到我們 v1 子類身上呼叫，ivar 佈局不同會踩壞記憶體）。
-2. 在我們的 `attachToDataLinkLayer` 成功後把 `getIfnet()` 交給它的 `prepareBSDInterface(ifnet, 0)`，並照 §6.2 補上那五個屬性再 `registerService()`。
-3. 通了之後 SC 服務會自然變成 Wi-Fi，airportd 才會開始送請求 → 看 `Ath10kApple80211Requests` 是否 >0。
+### 7.2 然後才是把 ifnet 交給 80211 核心（程式已寫好，卡在取名稱）
+`publishVenturaVifBsdUnit()`（`Ath10kVentura.cpp`）已經會做 `prepareBSDInterface(ifnet, 0)` ＋ 四個命名屬性。目前卡在**拿不到 BSD 單元名稱**（`Ath10kVifBsdPhase = no-bsd-name`）：
+- `_venturaInterface` 上沒有 `BSD Name` / `IOInterfaceUnit`；`start()` 建的那顆物件不是擁有 en2 的那顆。
+- `IOService::serviceMatching("IO80211Interface")` **不會**回傳子類別實例；改匹配 `"Ath10kVenturaInterface"` 也還沒拿到（v51 實測）。
+- 未試：`ifnet_get_address_list()` 掃 `en0`–`en9` 比對 MAC（`94:e9:79:ed:af:b9`）找 ifnet；或先清掉 7.1 的重疊介面，剩下唯一一顆時名稱就沒有歧義。
+
+順序：先 7.1 → 再看 `Ath10kVifBsdPhase` 走到 `prepared` → 看 SC 服務是否變 Wi-Fi、`Ath10kApple80211Requests` 是否開始增加。
 
 ### 7.3 再把 80211 動作接到真的 WMI
-`venturaScan()` 只清 index、`venturaScanResult()` 回 `NotFound`、`venturaAssociate()` 回 `kIOReturnUnsupported` —— **掃描/關聯核心邏輯完全沒接**。firmware 已 ready，WMI 掃描通道 `_wmiScan` 在 Sequoia 分支（`src/kext/native/`）有現成實作可搬。
+`venturaScan()` 只清 index、`venturaScanResult()` 回 `NotFound`、`venturaAssociate()` 回 `kIOReturnUnsupported` —— **掃描/關聯核心邏輯完全沒接**。firmware 已 ready，WMI 掃描通道 `_wmiScan` 在 Sequoia 分支（`src/kext/native/`）有現成實作可搬。請求入口已從 `apple80211Request` 改成 live 的 `apple80211VirtualRequest`/`apple80211SkywalkRequest`（都導到 `venturaRecordRequest`），搬邏輯時改這裡。
 
 ### 7.4 最後才是真機驗證
 VM 通了之後把 kext 部署回實體 ESP，在真機重驗（真機 ASPM 可控，`Ath10kASPMControl` 應該不會出現 `write-ignored-continued`）。
@@ -247,6 +249,9 @@ VM 通了之後把 kext 部署回實體 ESP，在真機重驗（真機 ASPM 可�
 | **v48** | 回到 v43 行為 + vif 指標 breadcrumb | **現行可用狀態** |
 | v49 | `new IO80211VirtualInterface` | kext 靜默不載入 |
 | v50 | metaclass alloc | 卡開機 |
+| **v51** | header 尾段改成 **live IO80211Family 順序**、requests 改成 `apple80211VirtualRequest`/`SkywalkRequest`、移除宣告未實作的 override、`alignVenturaVtable` 改純回報 | 第一次：`super::start()` 跑到 `createVirtualInterface`，panic 在 `apple80211VirtualRequestIoctl+0x26`（`getWorkQueue()` 回 null） |
+| **v51b** | 補 `createWorkQueue()`/`getWorkQueue()`（`IO80211WorkQueue::workQueue()`） | **不 panic、vif 建起來（role=SoftAP）、`Ath10kApple80211Requests=1`** |
+| **v51c** | 加 `publishVenturaVifBsdUnit()`（`prepareBSDInterface(ifnet,0)` + 命名屬性）與名稱查找 | `Ath10kVifBsdPhase=no-bsd-name`；介面節點變 6 顆、SC 的 Wi-Fi 硬體埠消失 → 手動發布路徑要拿掉（§7.1） |
 
 ---
 
@@ -255,9 +260,10 @@ VM 通了之後把 kext 部署回實體 ESP，在真機重驗（真機 ASPM 可�
 | 路徑 | 用途 |
 |---|---|
 | `src/kext/Ath10kPCIDevice.cpp` | `probe()`/`start()`：Ventura 分支建 work loop、備 corecapture、publish `IOPacketFilters`、建 output queue、手動 create→configure→attach→attachToDataLinkLayer→蓋型別→register、`preparePCIeBringupParity()`（ASPM 非致命）、vif 嘗試；所有 `Ath10k*Phase` 斷點 |
-| `src/kext/ventura/Ath10kVentura.cpp` | `apple80211Request`（計數 wrapper）→ `venturaDispatchRequest`、`getLogPipes()`、`alignVenturaVtable()` + slot thunk、`createInterface()`、`venturaPower/Scan/Associate…`（**scan/assoc 仍 stub**） |
+| `src/kext/ventura/Ath10kVentura.cpp` | `apple80211VirtualRequest`/`apple80211SkywalkRequest`（→ `venturaRecordRequest` 計數 wrapper）→ `venturaDispatchRequest`、`getLogPipes`（會延遲建 corecapture）、`getFaultReporterFromDriver`、`createWorkQueue`/`getWorkQueue`、`publishVenturaVifBsdUnit`（vif→`prepareBSDInterface`）、`alignVenturaVtable`（純回報）、`createInterface()`、`venturaPower/Scan/Associate…`（**scan/assoc 仍 stub**） |
 | `src/kext/ventura/Ath10kVenturaInterface.cpp/.hpp` | `Ath10kVenturaInterface : IO80211Interface`；`init()` 用 mangled `ath10kNetworkInterfaceInit`+`ath10kEthernetInterfaceInit`，attach 前釘 IFT_ETHER；覆寫 `initIfnetParams()`（改 `params->type=71`）與 `attachToDataLinkLayer()`（成功後蓋 `IOInterfaceType=71`）；`inputPacket()` 把 EAPOL 交給 IO80211 supplicant |
-| `src/kext/ventura/Ath10kVenturaDecl.inc` | Ventura 專屬宣告：Skywalk enable/disable、16 reserved slot、`getLogPipes`、vtable thunk、請求計數器成員 |
+| `src/kext/ventura/Ath10kVenturaDecl.inc` | Ventura 專屬宣告：live 順序的 override（兩個 request、`getLogPipes`、`getFaultReporterFromDriver`、`createWorkQueue`/`getWorkQueue`、`hardwareOutputQueueDepth()`、`performCountryCodeOperation(IO80211CountryCodeOp)`）、16 reserved slot、`publishVenturaVifBsdUnit`、請求計數器成員 |
+| `vendor/itlwm-v1/Airport/IO80211Controller.h` | **已改寫**：`0xc60` 起整段換成 live `IO80211Family` 的虛擬函式順序（原本描述的是 `IO80211FamilyLegacy`）。改動理由與驗證方式見 §6.5，**不要退回舊順序** |
 | `src/kext/Ath10kNetwork.cpp` | `configureInterface()`、`createWorkLoop()`、`createOutputQueue()`、`getHardwareAddress()` |
 | `src/kext/native/*` | Sequoia（v2）對照實作：WMI 掃描/關聯、`getFaultReporterFromDriver()`、`IO80211InfraInterface` 用法 |
 | `tools/ifnet-type.c` | 在 guest 內編譯即印出 kernel 眼中的 `if_data.ifi_type`（判斷單元真型別，別信 ioreg property） |
@@ -297,7 +303,17 @@ cat ~/sudo.pwd | ssh 100.64.0.152 'bash /tmp/install_bundle.sh /tmp/vk48'   # �
 cat ~/sudo.pwd | ssh 100.64.0.152 'bash /tmp/install_bundle.sh /tmp/vk20'   # 最保險的舊穩定版
 cat ~/sudo.pwd | ssh 100.64.0.152 'bash /tmp/disable_boot.sh'               # 可登入但不載入 kext
 ```
-`install_bundle.sh <dir>` 直接從 Acer 的 `/tmp/vkNN` 取 bundle 寫進 ESP 再開機，完全不依賴 guest。Acer 上留著 vk20…vk50。
+`install_bundle.sh <dir>` 直接從 Acer 的 `/tmp/vkNN` 取 bundle 寫進 ESP 再開機，完全不依賴 guest。Acer 上留著 vk20…vk51。
+
+**本輪新增的可重用腳本（Acer `/tmp/`，密碼一律 `cat ~/sudo.pwd |` 餵 stdin）**：
+```bash
+bash /tmp/build_v.sh                       # 本機：tar src → Acer → guest 內 make VENTURA=1 -j2 kext
+ssh 100.64.0.152 'bash /tmp/pull51.sh'     # Acer：從 guest 拉 build 成 /tmp/vk51
+cat ~/sudo.pwd | ssh 100.64.0.152 'bash /tmp/deploy_arg.sh /tmp/vkNN'   # 部署任意版本並開機
+```
+注意：`deploy_arg.sh` 用 `read -r PW` 收密碼，**同一個 ssh 指令裡不要先跑會吃 stdin 的腳本**（例如再包一層 ssh 的 pull），否則密碼會被吃掉、sudo 認證失敗。
+
+**離線驗證 vtable（不開機，改 header 後必做）**：guest 內 `otool -rv` + `otool -s __DATA __const` + `nm -n`，本機用 KC symtab 重建 live 表比對；腳本在 `~/.hermes/cache/scratch/`（`kc_own.py`、`kc_sym.py`），方法見 §6.5。
 
 ---
 
@@ -323,11 +339,15 @@ cat ~/sudo.pwd | ssh 100.64.0.152 'bash /tmp/disable_boot.sh'               # �
 - **guest 的 Wi-Fi 服務狀態會快取**，改 plist 後必須整台重開（`system_reset`）才會重讀。
 - **git push**：若 TLS 卡死，先檢查 `http.https://github.com.proxy` 有沒有被塞 socks5。
 - **pip/gem 不要動系統 python**：capstone 裝在 `/tmp/cs` venv。
+- **`getWorkQueue()` 回 null 會炸在 family 裡面**：`apple80211VirtualRequestIoctl` 第一件事就是 `call [vptr+0xc58]` 然後直接解引用回傳值，null → page fault（frame 卻顯示在 `Ath10kPCIDevice::start`，容易誤判成自己的 bug）。必須 override `createWorkQueue`/`getWorkQueue` 回 `IO80211WorkQueue::workQueue()`。
+- **`IOService::serviceMatching("IO80211Interface")` 不會回傳子類別實例**（`getMatchingServices` 只給精確類別）；要掃自己的介面得用實際類名 `"Ath10kVenturaInterface"`。
+- **`_venturaInterface` 不是擁有 BSD 單元的那顆物件**：`super::start()` 自己會建／發布介面，ioreg 會出現多顆 `Ath10kVenturaInterface`（v51c 量到 6 顆），而 `BSD Name` / `IOInterfaceUnit` 只長在其中一顆上。多介面還會讓 SC 連 Wi-Fi 硬體埠都不列 —— 別再加介面，先減（§7.1）。
+- **改完 header 一律先做離線 vtable 比對再開機**：順序錯了不會編譯失敗，只會在開機時 panic 在看起來無關的 framework 函式裡（§6.5）。
 
 ---
 
 ## 13. 建議技能
 
 - `osx-kvm-headless-install`：VM 生命週期、qemu-nbd、SSH 進 guest。
-- `macos-kext-hardware-bringup`：kext 建置/注入、OpenCore 設定、IO80211 ABI 陷阱（已收錄本輪所有教訓：ASPM 非致命、stack insert 弄壞網路、initIfnetParams 的 IFT_ETHER 硬檢查、SC 分類時機、重複匯出符號、不能在 kext 內 `new` Apple 類別）。
+- `macos-kext-hardware-bringup`：kext 建置/注入、OpenCore 設定、IO80211 ABI 陷阱（已收錄本輪所有教訓：ASPM 非致命、stack insert 弄壞網路、initIfnetParams 的 IFT_ETHER 硬檢查、**IO80211Family 與 IO80211FamilyLegacy 兩份 IO80211Controller 的 ABI 差異與離線 vtable 比對法**、`getWorkQueue()` 必須非 null、SC 不吃 `IOInterfaceType`/`ifi_type`、不能在 kext 內 `new` Apple 類別）。
 - `handoff`：下次交接沿用本文件結構。
