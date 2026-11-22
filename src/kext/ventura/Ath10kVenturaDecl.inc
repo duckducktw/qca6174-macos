@@ -72,6 +72,15 @@ private:
     // "Ethernet N". Needs prepareBSDInterface(), which only the live
     // IO80211Family exports.
     bool publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOService *provider);
+    // The interface object createInterface() published, read back through a
+    // file-static because the member does not survive every path.
+    static IO80211Interface *venturaPublishedInterface();
+    // The ifnet we own: allocated here with IFT_IEEE80211, attached by us, then
+    // handed to the vif. Kept for the driver's life (ifnet_allocate's reference).
+    ifnet_t createVenturaVifIfnet(IOService *provider);
+    ifnet_t _venturaVifIfnet = nullptr;
+    bool _venturaVifBsdDone = false;
+    static constexpr u_int32_t kAth10kVifIfnetUnit = 3;
     IOReturn venturaScan(const apple80211_scan_data *request);
     IOReturn venturaAssociate(const apple80211_assoc_data *request);
     void venturaDisassociate(bool deauth);

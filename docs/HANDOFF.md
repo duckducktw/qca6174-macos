@@ -1,8 +1,8 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-22（第四輪：vif 想借 ifnet 卻一個來源都拿不到 → ifnet KPI 在本 kext 失效、介面不是控制器子節點、vif vtable 位移全部量好；下一步改成自己 `ifnet_allocate`）
+最後更新：2026-11-22（第五輪：**找到並解掉「SC 看不到介面」的真正原因** —— `IOInterfaceType=71` 會讓 SystemConfiguration 直接丟掉整個介面；改回 6 之後 en1 以 IEEE80211 出現在 SC、Wi-Fi 硬體埠成立。剩下的門檻是 airportd：`IO80211Controller` 的 +0x200 介面指標是 null，airportd 因此回「Wireless is not available」）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v62**（`/tmp/vk62`）— kext 載入、單元 en1、Apple start 唯一 publisher、無 panic；v52/v53/vk48 都在
+VM 現況：**v70**（`/tmp/vk70`）— kext 載入、單元 en1、SC 認得 en1=IEEE80211、無 panic；v64/v62/v52/vk48 都在
 
 ---
 
@@ -13,12 +13,12 @@ VM 現況：**v62**（`/tmp/vk62`）— kext 載入、單元 en1、Apple start �
 | 條件 | 內容 | 現況 |
 |---|---|---|
 | **A** | `Ath10kIfacePhase = "inited"`、`Ath10kStartPhase = "controller-started"` | ✅ 已達成（Apple 的 `start()` 是唯一 publisher） |
-| **B** | `ioreg -r -c IO80211Interface` ≥1 筆且有 `BSD Name`；`networksetup -listallhardwareports` 出現 Wi-Fi | 🟡 一半（`en1` 存在、有 MAC、`IOInterfaceType=71`；但**SC 完全看不到這個介面**，見 §6.7） |
-| **C** | 「系統設定 → Wi-Fi」可見、開關可操作（截圖為證） | ❌ 未達成（硬體埠不存在，airportd 不接管 → `Off (forced)`） |
-| **D** | 可掃描到 AP 並以 WPA2 連線取得 IP | ❌ 未達成（scan/associate 仍是 stub，§7.3） |
+| **B** | `ioreg -r -c IO80211Interface` ≥1 筆且有 `BSD Name`；`networksetup -listallhardwareports` 出現 Wi-Fi | ✅ 已達成（v64 起 `SCNetworkInterfaceCopyAll()` 第 3 筆 = `en1 type=IEEE80211`，Wi-Fi 硬體埠成立；一旦替它建了服務，`listallhardwareports` 會把它當「已設定」而不列，屬正常） |
+| **C** | 「系統設定 → Wi-Fi」可見、開關可操作（截圖為證） | 🟡 一半（埠有了、服務有了；但 airportd 說 `Wireless is not available`，因為 controller 的 +0x200 介面指標是 null，airportd 找不到裝置，見 §6.9） |
+| **D** | 可掃描到 AP 並以 WPA2 連線取得 IP | ❌ 未達成（scan/associate 仍是 stub，§7.3；且 airportd 還沒接上） |
 | **E** | 全程不改系統設定以外的東西、不需終端機、無獨立 app；最後部署回實體 ESP 並真機重驗 | ❌ 未開始（§7.4） |
 
-**一句話總結現況**：無線電真的在跑（firmware / WMI / HTC / CE / IRQ ready），Apple 的 `IO80211Controller::start()` 也會跑完並發布 BSD 單元 `en1`（`IOInterfaceType=71`、state 3），但**SystemConfiguration / networkd 根本沒有把這個介面收進它們的清單**（`SCNetworkInterfaceCopyAll()` 看不到），所以沒有硬體埠、沒有服務、沒有 Wi-Fi 設定頁，airportd 也從不送請求。
+**一句話總結現況**：無線電在跑、Apple 的 `start()` 發布了 `en1`，而**第五輪找到了「SC 看不到介面」的真兇**：不是 SC 的分類規則、不是 80211 core 的註冊，而是介面節點上 `IOInterfaceType=71` 這個**屬性**——`SCNetworkInterface.c` 只接受 `IFT_ETHER(6)`/`IFT_IEEE1394(13)`，其他值直接 `"unknown interface type"` 把介面丟掉。改回 6 之後 SC 立刻列 `en1 type=IEEE80211`（因為它改看 controller 是否符合 `IO80211Controller`），Wi-Fi 硬體埠與服務都成立。**最後一哩是 airportd**：它透過 `IO80211Controller` 的 +0x200 ivar（`getNetworkInterface()`/`getInfraInterface()` 都只是讀這個 pointer）找裝置，而該 ivar 實測是 null。
 
 ---
 
@@ -46,11 +46,11 @@ VM 現況：**v62**（`/tmp/vk62`）— kext 載入、單元 en1、Apple start �
 | `Ath10kVifPublishRetry` | `failed` | start 後 3 秒的延遲重試也一樣 |
 | `Ath10kChildCount` | `6` | 控制器子節點 = `CCLogPipe`×4 + `CCDataPipe` + `IO80211VirtualInterface`（**介面不在裡面**） |
 | `Ath10kFindEn0..3` | **`6`（ENXIO）** | `ifnet_find_by_name()` 在本 kext 完全不能用（§6.8） |
-| 介面節點（`en1`） | `IOInterfaceType=71`、`IOInterfaceState=3`、`IOBuiltin=Yes`、`IOPrimaryInterface=No`、`BSD Name=en1` | 個個看起來都對 |
-| `SCNetworkInterfaceCopyAll()` | **只有 `serial1` / `en0`** | **SC / networkd 完全看不到我們的介面**（§6.7 的決定性量測，用 `tools/sc-interfaces.c`） |
-| `networksetup -listallhardwareports` | 沒有 Wi-Fi 硬體埠 | 跟著上一列 |
-| `networksetup -getairportpower en1` | `Off (forced)` | airportd 不接管 |
-| `ipconfig getiflist` | 只有 `en0` | IPConfiguration 也不知道 `en1` |
+| 介面節點（`en1`） | `IOInterfaceType=6`、`IOInterfaceState=3`、`IOBuiltin=Yes`、`IOPrimaryInterface=No`、`BSD Name=en1` | 個個看起來都對；**6 是關鍵**（71 會被 SC 丟掉，§6.9.1） |
+| `SCNetworkInterfaceCopyAll()` | **serial1 / en0 / `en1 type=IEEE80211`** | ✅ v64 起 SC 認得它是 Wi-Fi（§6.9.1） |
+| `networksetup -listallhardwareports` | 有 `Hardware Port: Wi-Fi / Device: en1`；建了服務之後會從這份清單消失（已設定） | 正常行為 |
+| `networksetup -getairportpower en1` | `Wireless is not available` | airportd 找不到裝置（`[controller+0x200]` null，§6.9.2） |
+| `ipconfig getiflist` | 只有 `en0` | IPConfiguration 仍不知道 `en1`（未上層） |
 
 ---
 
@@ -65,7 +65,10 @@ VM 現況：**v62**（`/tmp/vk62`）— kext 載入、單元 en1、Apple start �
 7. **vtable 位移的正確算法**：物件的 vptr 指向 `&vtable[2]`，所以 kernel 端 `[vptr+0xNNN]` 對應的 **vtable index = (0xNNN + 0x10) / 8**。手上有「idx」清單時，vptr 位移 = `idx*8 - 0x10`。用錯會差一格（§5.3 就是這樣踩的）。已知 index：vif 的 285 `prepareBSDInterface`、287 `getBSDInterface`、456 `attachToBpf`、457 `configureIfnet`。
 8. **不要碰 `IONetworkStack` 的插入函式**（vtable 位移硬呼叫會毀掉整個網路堆疊，§5.2）。也**不要**再假設「SC 會自己發現新介面」——量測方法只有 `tools/sc-interfaces.c`（§6.7）。
 9. **`ifnet_find_by_name()` / `ifnet_list_get()` 在本 kext 不可用**（連 `en0` 都回 ENXIO，§6.8）。找自己的 ifnet 只有兩條路：從持有它的物件拿指標，或自己 `ifnet_allocate`。
-10. **SC / networkd 看不到的介面，ioreg 再漂亮都沒用** —— 驗收一律先跑 `tools/sc-interfaces.c`，不要用 `IOInterfaceType`、`ifi_type`、plist 記錄來判斷成敗（那三項都已被證明會誤導，§6.7）。
+10. **SC / networkd 看不到的介面，ioreg 再漂亮都沒用** —— 驗收一律先跑 `tools/sc-interfaces.c`，不要用 `IOInterfaceType`、`ifi_type`、plist 記錄來判斷成敗（§6.7）。
+11. **介面節點的 `IOInterfaceType` 屬性必須是 6（IFT_ETHER），永遠不要蓋成 71。** `SCNetworkInterface.c` 只認 6 與 13，其他值會被 `default:` 直接丟掉，介面就從 SC 清單消失；Wi-Fi 分類是看 **controller 是否符合 `IO80211Controller`**，不是看這個屬性（§6.9.1）。ifnet 型別也一起留在 6。
+12. **不要用 registry 掃描找自己的介面，尤其不要在延遲 thread 裡做。** `IOService::getMatchingServices()` 在 `start()` 後 3 秒的 thread_call 裡會把 kernel 卡死（`registry root held busy`，SSH 永不回 banner、無 panic，只能主機端換 bundle 救援）。
+13. **`[controller+0x200]` 是 airportd 的入口，而且必須在 Apple 的 `start()` 之後才能寫。** 先寫會讓 `attachInterface()` 跳過整個 attach/register 流程（Wi-Fi 硬體埠消失）。
 
 ---
 
@@ -272,6 +275,85 @@ SCNetworkInterfaceCopyAll() -> 2
 
 **結論**：vif 這條路線缺的不是「呼叫哪個 virtual」，而是**能用的 ifnet 參照**；在 ifnet KPI 於本 kext 失效的前提下，唯一乾淨的作法是**自己 `ifnet_allocate` 一顆**（`ifnet_init_params` 由我們填、`ifnet_attach`），再交給 `prepareBSDInterface`。下一輪就從這裡開始，不要再去掃 registry 或 name lookup。
 
+---
+
+### 6.9 第五輪（v63–v70）：SC 的真兇是 `IOInterfaceType` 屬性
+
+#### 6.9.1 根因：SC 只接受 IFT_ETHER / IFT_IEEE1394 的屬性值
+
+`SystemConfiguration` 的 `SCNetworkInterface.c`（開源：apple-oss-distributions/configd）裡，`processNetworkInterface()` 的邏輯是：
+
+```c
+num = interface_dict[kIOInterfaceType];           // ← 介面節點的「屬性」
+if (!isA_CFNumber(num)) return FALSE;             // 沒有屬性 → 丟掉
+ift = num;
+switch (ift) {
+  case IFT_ETHER:      // 6
+      // 這裡才判斷是不是 Wi-Fi：看 controller 是否符合
+      // IO80211Controller / AirPortPCI / AirPortDriver
+      // → kSCNetworkInterfaceTypeIEEE80211（Wi-Fi）
+      break;
+  case IFT_IEEE1394:   // 13
+      break;
+  default:
+      SC_log(LOG_INFO, "unknown interface type = %d", ift);
+      return FALSE;                                // ← 介面直接從清單消失
+}
+```
+
+也就是說：
+
+- 前四輪一直把 `IOInterfaceType` 蓋成 **71（IFT_IEEE80211）**，SC 走到 `default:` 就把整個介面丟掉 → `SCNetworkInterfaceCopyAll()` 只有 serial1/en0、`listallhardwareports` 沒有 Wi-Fi。**這不是「SC 沒看到介面」，是「SC 看到了但拒絕收」**。
+- 值留在 **6** 時，SC 走 `case IFT_ETHER`，再去看 controller 是否符合 `IO80211Controller` → 介面就被歸類成 **IEEE80211（Wi-Fi）**，硬體埠與服務都成立。
+- 802.11 的「味道」來自 **controller 類別**，不是介面的 ifnet 型別，也不是那個屬性值。AirportItlwm 從來沒動過型別（見 6.9.4），所以它在真機上沒這個問題。
+
+**v64 實測**（把 `initIfnetParams()` 的 `params->type=71` 與 `attachToDataLinkLayer()` 的 71 覆寫全部拿掉）：
+
+```
+SCNetworkInterfaceCopyAll() -> 3
+[0] bsd=serial1 type=Modem
+[1] bsd=en0     type=Ethernet
+[2] bsd=en1     type=IEEE80211   hw=94:e9:79:ed:af:b9       ← Wi-Fi
+networksetup -listallhardwareports -> Hardware Port: Wi-Fi / Device: en1
+```
+
+`networksetup -createnetworkservice "Wi-Fi" en1` 也成功（前幾輪是 `en1 is not a valid hardware port name`）。建完服務之後 `listallhardwareports` 就不再列 en1（SC 把「已設定」的介面排除在硬體埠清單外），這是正常行為，不是退化。
+
+#### 6.9.2 剩下的門檻：airportd 找不到裝置（controller +0x200 ivar 是 null）
+
+Wi-Fi 埠、Wi-Fi 服務都有了，但 `networksetup -getairportpower en1` 仍是 `Wireless is not available`，`airportd`（pid 210）**沒有對 IO80211 開任何 user client**。KC 反組譯指出原因：
+
+- `IO80211Controller::getNetworkInterface()` = `safeMetaCast([this+0x200], IO80211Interface::gMetaClass)`
+- `IO80211Controller::getInfraInterface()` 也是讀 `[this+0x200]`
+- `IO80211Controller::attachInterface(IONetworkInterface **, bool)` 在成功之後才寫 `[this+0x200] = *iface`
+
+我們這一版（`Ath10kPublisher=apple`、`AppleStart=ok`、`en1` 有 BSD Name）讀出來的 `[this+0x200]` 卻是 **null**（斷點 `Ath10kCtrlInfraIvar = No`）→ airportd 拿不到介面 → 不送請求（`Ath10kApple80211Requests` 一直是 1，那 1 次是 CARD_CAPABILITIES=12 的單次探測）。
+
+airportd 的執行線索（`strings /usr/libexec/airportd`）：`Received XPC launch event com.apple.iokit.matching for IO80211Controller`、`IO80211VirtualInterfaceRole`，也就是它被 IO80211Controller 的 IOKit match 事件叫起來，然後透過 controller 取介面。
+
+#### 6.9.3 這一輪踩到並標記的死路
+
+| # | 嘗試 | 結果 |
+|---|---|---|
+| 1 | `ifnet_allocate`（type 71、`ifnet_attach` 自己來）→ 交給 vif `prepareBSDInterface` | **panic**：`IOSkywalkNetworkInterface::prepareBSDInterface+0x1a`，`[ivars+0]+0x4c` 解引用 null。ivars 存在但 `ivars[0]`（帶 MTU 的 interface extra）是 null —— 因為這顆 vif 從沒向 Skywalk stack 註冊（`registerNetworkInterface`）。`ifnet_allocate`/`ifnet_attach` 本身沒問題（`Ath10kOwnIfnetPhase=attached` 之前就 panic 在 prepare）|
+| 2 | 延遲重試裡用 `IOService::getMatchingServices()` 掃 registry 找自己的介面 | **kernel wedge**：serial 出現 `registry root held busy, kernelmanagerd has not checked in`，SSH 永不回 banner、無 panic。延遲 thread 裡不要掃 registry |
+| 3 | 在 `createInterface()` 就寫 `[this+0x200] = interface` | **Wi-Fi 硬體埠消失**：`attachInterface()` 開頭有 `cmp [rbx+0x200],0; jne done`，ivar 一旦先被寫，Apple 就跳過整個 attach/register 流程。要在 Apple 的 `start()` **之後**才寫 |
+| 4 | 在 `start()` 之後讀 `_venturaInterface` 再寫 ivar | 讀到 **null**（`Ath10kCtrlInfraSeen = No`），連 `createInterface()` 寫的 file-static 版也是 null → 這條 pointer 的來源本身還沒釐清（下一步：在 `createInterface()` 裡掛呼叫計數 `Ath10kCreateIfaceCalls`，確認 Apple 的 start 到底有沒有走我們的 override）|
+
+#### 6.9.4 AirportItlwm v2.2.0 的真實形狀（本輪把原始碼抓下來看過）
+
+`itl80211/openbsd/sys/_if_ether.h` 在 macOS 分支裡：
+
+```c
+static inline int if_attach(struct _ifnet *ifp) { ifp->if_link_state = -1; return 0; }
+static inline int ether_ifattach(struct _ifnet *ifp, IOEthernetInterface *iface) { ifp->iface = iface; }
+```
+
+→ **它在 macOS 上根本沒有自己建 ifnet**（那顆 `ic_ac.ac_if` 只是 net80211 自己的帳）。BSD 單元完全是 Apple 的 `IO80211Controller::start()` 建的，跟我們一樣；它的 `start()` 自己呼叫 `super::start()` 之後再 `attachInterface((IONetworkInterface **)&fNetIf, true)`。
+
+所以「借 ifnet / 自己 allocate ifnet」對這條路線是**多餘的**；差別只剩它明確呼叫了 `attachInterface()`（會寫 +0x200），而我們的 Apple `start()` 路徑沒有留下那個 ivar。
+
+
 
 ---
 
@@ -286,7 +368,16 @@ networksetup -listallhardwareports | grep -A2 -i wifi # 目前仍然沒有
 ```
 **注意**：§6.7 已證明 Wi-Fi 硬體埠消失不是「多顆介面」造成的，是 SC 根本看不到這個介面。
 
-### 7.2 讓 BSD 單元被 80211 核心／networkd 認可（**下一輪從這裡開始**）
+### 7.2 讓 airportd 拿得到裝置（**下一輪從這裡開始**）
+
+§6.9 已經把「介面在 SC 裡是 Wi-Fi」這件事做完（B ✅）。剩下的門檻是 airportd：它透過 `IO80211Controller::getNetworkInterface()`／`getInfraInterface()`（兩者都只是讀 `[this+0x200]`）拿介面，而這個 ivar 是 null。
+
+1. **先釐清 pointer 從哪來**：在 `createInterface()` 裡掛 `Ath10kCreateIfaceCalls++` 與 `Ath10kCreateIfacePtr`（寫到 provider），確認 Apple 的 `start()` 到底有沒有呼叫我們的 `createInterface()` override。本輪的 `Ath10kCtrlInfraSeen = No` 表示連 `createInterface()` 寫的 file-static 都讀不到，這一點比 ivar 本身更可疑（可能是我們自己 ivar 區與 live `IO80211Controller` 的 ivar 區重疊，`_venturaInterface` 實測在 +0x668）。
+2. **在 Apple 的 `start()` 之後（`Ath10kPublisher=apple` 已確定）寫 `[this+0x200] = <published interface>`**，並且只寫一次、寫之前確認它是 null。**不要在 `createInterface()` 裡寫**（§6.9.3 #3：會讓 `attachInterface()` 直接 return，Wi-Fi 硬體埠消失）。
+3. **驗收**：`networksetup -getairportpower en1` 不再是 `Wireless is not available`、`ioreg` 出現 `pid 210, airportd` 對 IO80211 開的 user client、`Ath10kApple80211Requests` 開始增長（airportd 會持續送 POWER/STATE/CAPABILITIES）。
+4. 若 ivar 還是寫不進去／寫了 airportd 仍不認，改用 `attachInterface((IONetworkInterface **)&iface, true)` 這條 Apple 自己會寫 ivar 的聚合入口，並且**先關掉 Apple `start()` 的介面發布**（否則會多一顆介面，v51c 的教訓）。AirportItlwm 就是這條路（§6.9.4）。
+
+### 7.2-old 讓 BSD 單元被 80211 核心／networkd 認可（**已被 §6.9 取代，僅留記錄**）
 四輪實測（§6.8）已經把所有「借別人的 ifnet」的路封死，所以：
 
 1. **自己生 ifnet**：`ifnet_allocate(&params, &ifp)`（`params.type = IFT_IEEE80211` 從出生就對；欄位抄 `IONetworkInterface::attachToDataLinkLayer` 的填法，見 §6.8 第 3 點）、`ifnet_set_lladdr`、`ifnet_attach(ifp, &sadl)`。**注意** `ifnet_find_by_name`/`ifnet_list_get` 在本 kext 不能用，所以建立後要自己保存指標。
@@ -330,6 +421,12 @@ VM 通了之後把 kext 部署回實體 ESP，在真機重驗（真機 ASPM 可�
 | **v52** | 單一 publisher（手動段只在 `!appleStart` 時跑）＋ `Ath10kPublisher`/`Ath10kAppleStart` ＋ vif 改走 `getIfnet()` 取 ifnet | `Ath10kAppleStart=ok`、`Ath10kPublisher=apple`、單元由 Apple 發布；`Ath10kVifBsdSource=none`（`getIfnet()` 回 null） |
 | **v53** | 介面 `init()` 加 `IOPrimaryInterface=true` | 無效（attach 時被覆寫回 No）。同輪量到 **SC 完全看不到介面**（§6.7） |
 | **v54–v62** | vif 交接補上「控制器 ivar `+0x200`」「掃控制器/vif 子節點找 `BSD Name`」「`ifnet_list_get`」「3 秒延遲重試」等來源，並改用 vif 的 live vtable 位移呼叫 `configureIfnet`/`attachToBpf` | 全部拿不到 ifnet（§6.8）：`getIfnet()` null、介面不是控制器子節點、`ifnet_find_by_name` 連 en0 都回 ENXIO。VM 穩定、`en1` 在、無 panic |
+| **v63** | 真的自己 `ifnet_allocate`（type 71）+ `ifnet_attach`，交給 vif `prepareBSDInterface` | **panic** 在 `IOSkywalkNetworkInterface::prepareBSDInterface+0x1a`（`ivars[0]` null：vif 沒向 Skywalk stack 註冊）。§6.9.3 #1 |
+| **v64** | **把 `IOInterfaceType` 從 71 改回 6**（`initIfnetParams` 不再改 `params->type`、`attachToDataLinkLayer` 覆寫 6、手動段也寫 6） | **里程碑**：`SCNetworkInterfaceCopyAll()` 出現 `en1 type=IEEE80211`、`listallhardwareports` 有 Wi-Fi、`createnetworkservice "Wi-Fi" en1` 成功。airportd 仍 `Wireless is not available` |
+| **v65–v66** | 讀 `[controller+0x200]` 並嘗試從 registry 掃描補進去 | `Ath10kCtrlInfraIvar = No`；registry 掃描版（v67）把 kernel 卡死（§6.9.3 #2） |
+| **v67** | 延遲重試裡 `getMatchingServices()` 掃 `IONetworkInterface` | **kernel wedge**（`registry root held busy`），只能主機端換 bundle 救援 |
+| **v68** | 在 `createInterface()` 就寫 `[this+0x200]` | **Wi-Fi 硬體埠消失**（`attachInterface()` 因 ivar 非 null 直接 return，§6.9.3 #3） |
+| **v69–v70** | 改在 Apple 的 `start()` 之後寫 ivar；同時用 file-static 保存介面指標 | `Ath10kCtrlInfraSeen = No`：連 file-static 都讀不到 → 介面指標來源待釐清（`_venturaInterface` 在 +0x668）。VM 穩定、SC 仍認得 en1=IEEE80211 |
 
 ---
 

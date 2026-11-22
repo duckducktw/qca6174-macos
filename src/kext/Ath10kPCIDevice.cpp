@@ -316,6 +316,25 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // Keep the manual pass only for the case where Apple's start() refused and
     // nothing else would publish a unit at all.
     provider->setProperty("Ath10kPublisher", appleStart ? "apple" : "manual");
+    // airportd reaches the device through this controller ivar:
+    // IO80211Controller::attachInterface(IONetworkInterface **, bool) parks the
+    // interface at +0x200, and getNetworkInterface()/getInfraInterface() just
+    // read it back. Apple's own start() leaves it null on this build (measured
+    // while en1 was up and SC listed it as Wi-Fi), and with a null ivar airportd
+    // answers "Wireless is not currently available on this machine". Install it
+    // here - *after* Apple's attach, because writing it earlier makes
+    // attachInterface skip its whole attach/register pass (measured: the Wi-Fi
+    // hardware port disappears). +0x200 cannot collide with our own members;
+    // _venturaInterface sits at +0x668.
+    if (appleStart) {
+        IO80211Interface *published = venturaPublishedInterface();
+        provider->setProperty("Ath10kCtrlInfraSeen", published != nullptr);
+        if (published != nullptr) {
+            published->retain();
+            *reinterpret_cast<void **>(reinterpret_cast<char *>(this) + 0x200) = published;
+            provider->setProperty("Ath10kCtrlInfraInstalled", "after-apple-start");
+        }
+    }
     if (!appleStart && !_venturaInterface) {
         IONetworkInterface *iface = createInterface();
         if (!iface) {
@@ -350,13 +369,13 @@ bool Ath10kPCIDevice::start(IOService *provider)
             return false;
         }
         provider->setProperty("Ath10kStartPhase", "data-link-attached");
-        // IFT_ETHER was needed for initIfnetParams() to build the unit, and
-        // SystemConfiguration classifies the BSD interface from this property -
-        // but it reads it when the interface first appears, so the 802.11 stamp
-        // has to precede registerService(). 71 = IFT_IEEE80211 is what turns the
-        // "Ethernet 2" service into a Wi-Fi one that airportd acts on.
-        iface->setProperty("IOInterfaceType", static_cast<UInt64>(0x47), 32);
-        provider->setProperty("Ath10kInterfaceType", "ieee80211-after-attach");
+        // SystemConfiguration classifies the published interface from the
+        // controller class (IO80211Controller -> IEEE80211), not from this
+        // property: SCNetworkInterface.c drops any interface whose
+        // IOInterfaceType is not IFT_ETHER/IFT_IEEE1394, so 71 here hides the
+        // unit from SC entirely. Keep it at 6.
+        iface->setProperty("IOInterfaceType", static_cast<UInt64>(0x6), 32);
+        provider->setProperty("Ath10kInterfaceType", "ethernet-for-sc-classify");
         iface->registerService();
         provider->setProperty("Ath10kStartPhase", "interface-published");
         // Do not ask IONetworkStack for a unit. insertNetworkInterface() is a

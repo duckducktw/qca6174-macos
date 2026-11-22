@@ -5,6 +5,7 @@
 // that airportd uses for everything the Wi-Fi UI shows.
 #include "Ath10kVenturaABI.hpp"
 #include <net/kpi_interface.h>
+#include <net/if_dl.h>
 
 #ifdef ATH10K_VENTURA
 
@@ -22,6 +23,12 @@ extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifne
 // Interface publication
 // ---------------------------------------------------------------------------
 
+// The interface createInterface() handed the family. Kept in a file-static as
+// well as in the member: the member reads back null from other paths, most
+// likely because our ivars sit inside the live class's ivar block, and every
+// consumer below needs a pointer that survives that.
+static IO80211Interface *gVenturaPublishedInterface = nullptr;
+
 IONetworkInterface *Ath10kPCIDevice::createInterface()
 {
     Ath10kVenturaInterface *interface = new Ath10kVenturaInterface;
@@ -38,6 +45,7 @@ IONetworkInterface *Ath10kPCIDevice::createInterface()
     // value is applied later, in start(), and the discovery-time record stays
     // Ethernet until the unit is published through Apple's vif layer instead.
     _venturaInterface = interface;
+    gVenturaPublishedInterface = interface;
     return interface;
 }
 
@@ -230,24 +238,154 @@ IO80211WorkQueue *Ath10kPCIDevice::getWorkQueue() const
     return _venturaWorkQueue;
 }
 
-// The last piece the legacy-class publication cannot do: register the ifnet we
-// already own with the 80211 core. On 13.7 prepareBSDInterface(ifnet, flags)
-// lives only on the live family's IO80211SkywalkInterface/IO80211Virtual-
-// Interface, never on the plain IO80211Interface, which is why the unit exists
-// but SystemConfiguration still files it as Ethernet and airportd never sends a
-// request. The live implementation only sets properties, MTU (1500),
-// IOReporters and eflags on the ifnet we hand it, so passing ours is safe.
+// ---------------------------------------------------------------------------
+// Vif ifnet ownership
+// ---------------------------------------------------------------------------
+// Every route that tried to borrow a published ifnet is dead on this build:
+// getIfnet() on our interface object returns null (Apple's attach re-creates the
+// object), the controller has no parked interface, the interface is not a
+// registry child of the controller, and ifnet_find_by_name()/ifnet_list_get()
+// answer ENXIO even for en0. So own the ifnet the way net80211 drivers do:
+// allocate it with IFT_IEEE80211 from birth, attach it ourselves, then hand the
+// pointer to the vif's prepareBSDInterface(). From that point the 80211 core has
+// an ifnet to publish instead of only an Ethernet-shaped unit it never
+// registered.
+
+static const u_int32_t kAth10kIfTypeIeee80211 = 71;   // IFT_IEEE80211
+
+// The datapath is not wired yet: drop what the stack hands us and let it free
+// the mbuf. Returning 0 means "consumed".
+static errno_t venturaVifOutput(ifnet_t, mbuf_t)
+{
+    return 0;
+}
+
+static errno_t venturaVifDemux(ifnet_t, mbuf_t, char *, protocol_family_t *)
+{
+    return EJUSTRETURN;
+}
+
+static errno_t venturaVifAddProto(ifnet_t, protocol_family_t,
+                                  const struct ifnet_demux_desc *, u_int32_t)
+{
+    return 0;
+}
+
+static errno_t venturaVifDelProto(ifnet_t, protocol_family_t)
+{
+    return 0;
+}
+
+static errno_t venturaVifCheckMulti(ifnet_t, const struct sockaddr *)
+{
+    return 0;
+}
+
+ifnet_t Ath10kPCIDevice::createVenturaVifIfnet(IOService *provider)
+{
+    if (_venturaVifIfnet != nullptr)
+        return _venturaVifIfnet;
+
+    UInt8 mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+    const char *macSource = "synthetic";
+    IOEthernetAddress hwAddress{};
+    if (getHardwareAddress(&hwAddress) == kIOReturnSuccess) {
+        memcpy(mac, &hwAddress, 6);
+        macSource = "firmware";
+    } else {
+        bool anyByte = false;
+        for (UInt32 i = 0; i < 6; ++i)
+            if (_wmiInit.mac[i] != 0) anyByte = true;
+        if (anyByte) {
+            memcpy(mac, _wmiInit.mac, 6);
+            macSource = "wmi";
+        }
+    }
+
+    static const UInt8 broadcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    struct ifnet_init_params params;
+    memset(&params, 0, sizeof(params));
+    params.uniqueid = mac;
+    params.uniqueid_len = 6;
+    params.name = "en";
+    params.unit = kAth10kVifIfnetUnit;
+    params.family = IFNET_FAMILY_ETHERNET;   // dlil protocol attach stays known-good
+    params.type = kAth10kIfTypeIeee80211;    // while if_data.ifi_type is 802.11
+    params.output = venturaVifOutput;
+    params.demux = venturaVifDemux;
+    params.add_proto = venturaVifAddProto;
+    params.del_proto = venturaVifDelProto;
+    params.check_multi = venturaVifCheckMulti;
+    params.softc = this;
+    params.broadcast_addr = broadcast;
+    params.broadcast_len = 6;
+
+    ifnet_t ifp = nullptr;
+    const errno_t allocStatus = ifnet_allocate(&params, &ifp);
+    provider->setProperty("Ath10kOwnIfnetAlloc",
+                          static_cast<UInt64>(static_cast<UInt32>(allocStatus)), 32);
+    if (allocStatus != 0 || ifp == nullptr) {
+        provider->setProperty("Ath10kOwnIfnetPhase", "alloc-failed");
+        return nullptr;
+    }
+
+    ifnet_set_lladdr(ifp, mac, 6);
+    ifnet_set_mtu(ifp, 1500);
+    provider->setProperty("Ath10kOwnIfnetMacSource", macSource);
+
+    struct sockaddr_dl linkAddr;
+    memset(&linkAddr, 0, sizeof(linkAddr));
+    linkAddr.sdl_len = sizeof(linkAddr);
+    linkAddr.sdl_family = AF_LINK;
+    linkAddr.sdl_alen = 6;
+    memcpy(LLADDR(&linkAddr), mac, 6);
+
+    const errno_t attachStatus = ifnet_attach(ifp, &linkAddr);
+    provider->setProperty("Ath10kOwnIfnetAttach",
+                          static_cast<UInt64>(static_cast<UInt32>(attachStatus)), 32);
+    if (attachStatus != 0) {
+        provider->setProperty("Ath10kOwnIfnetPhase", "attach-failed");
+        ifnet_release(ifp);
+        return nullptr;
+    }
+
+    char unitName[16] = {0};
+    snprintf(unitName, sizeof(unitName), "%s%u", ifnet_name(ifp),
+             static_cast<unsigned>(ifnet_unit(ifp)));
+    provider->setProperty("Ath10kOwnIfnetPhase", "attached");
+    provider->setProperty("Ath10kOwnIfnetName", unitName);
+    _venturaVifIfnet = ifp;     // keep the allocate reference for the driver's life
+    return ifp;
+}
+
+// The last piece the legacy-class publication cannot do: register an ifnet with
+// the 80211 core. On 13.7 prepareBSDInterface(ifnet, flags) lives only on the
+// live family's IO80211SkywalkInterface/IO80211VirtualInterface, never on the
+// plain IO80211Interface, which is why the unit exists but SystemConfiguration
+// still files it as Ethernet and airportd never sends a request. The live
+// implementation only sets properties, MTU (1500), IOReporters and eflags on
+// the ifnet it is handed, so passing ours is safe.
+IO80211Interface *Ath10kPCIDevice::venturaPublishedInterface()
+{
+    return gVenturaPublishedInterface;
+}
+
 bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOService *provider)
 {
     if (vif == nullptr)
         return false;
-    // Resolve the ifnet first. The published interface object owns it, and
-    // IONetworkInterface::getIfnet() hands it back directly, so there is no need
-    // to guess a BSD name: reading "BSD Name" off the object we hold is what
-    // failed in v51c (Apple's attach re-creates the interface object).
+    if (_venturaVifBsdDone) {
+        provider->setProperty("Ath10kVifBsdPhase", "already-published");
+        return true;
+    }
+    // Own-ifnet is suspended: handing a freshly allocated ifnet to the vif's
+    // prepareBSDInterface() faults inside IOSkywalkNetworkInterface at +0x1a
+    // (ivars->[0], the interface extra that carries the MTU, is null for a vif
+    // the family never registered with the Skywalk stack). Re-enable only after
+    // the vif is registered (registerNetworkInterface) so the extra exists.
     ifnet_t ifp = nullptr;
     const char *source = "none";
-    if (_venturaInterface != nullptr) {
+    if (ifp == nullptr && _venturaInterface != nullptr) {
         ifp = _venturaInterface->getIfnet();
         if (ifp != nullptr) {
             ifnet_reference(ifp);
@@ -369,6 +507,9 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
         provider->setProperty("Ath10kVifBsdPhase", "no-ifnet");
         return false;
     }
+    // ifnet_allocate's reference belongs to the driver when the ifnet is ours;
+    // borrowed pointers were referenced above and are dropped at every exit.
+    const bool borrowed = (ifp != _venturaVifIfnet);
     snprintf(unitName, sizeof(unitName), "%s%u", ifnet_name(ifp),
              static_cast<unsigned>(ifnet_unit(ifp)));
     provider->setProperty("Ath10kVifBsdPhase", "ifnet-found");
@@ -388,7 +529,7 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
     provider->setProperty("Ath10kVifBsdStatus",
                           static_cast<UInt64>(static_cast<UInt32>(status)), 32);
     if (status != kIOReturnSuccess) {
-        ifnet_release(ifp);
+        if (borrowed) ifnet_release(ifp);
         return false;
     }
     // prepareBSDInterface only stores the ifnet in the vif's ivars and sets
@@ -409,7 +550,7 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
     provider->setProperty("Ath10kVifIfnetStored", stored != nullptr);
     if (stored == nullptr) {
         provider->setProperty("Ath10kVifAttachPhase", "ifnet-not-stored");
-        ifnet_release(ifp);
+        if (borrowed) ifnet_release(ifp);
         return false;
     }
     reinterpret_cast<VifVoidFn>(vptr[0xe38 / 8])(vif);   // configureIfnet()
@@ -417,7 +558,8 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
     const bool bpfAttached = reinterpret_cast<VifAttachFn>(vptr[0xe30 / 8])(vif);
     provider->setProperty("Ath10kVifAttachPhase",
                           bpfAttached ? "bpf-attached" : "bpf-attach-failed");
-    ifnet_release(ifp);
+    _venturaVifBsdDone = bpfAttached;
+    if (borrowed) ifnet_release(ifp);
     return bpfAttached;
 }
 
@@ -443,6 +585,37 @@ void Ath10kPCIDevice::runVifPublish()
     }
     const bool ok = publishVenturaVifBsdUnit(_venturaVif, provider);
     provider->setProperty("Ath10kVifPublishRetry", ok ? "published" : "failed");
+    // airportd finds a device through the controller, not through the BSD unit:
+    // IO80211Controller::attachInterface(IONetworkInterface **, bool) parks the
+    // interface in its own ivar at +0x200, and getNetworkInterface() is just a
+    // meta-cast of that ivar. If it is null airportd sees no device at all
+    // (networksetup: "Wireless is not currently available on this machine",
+    // no airportd user client in ioreg), even though the Wi-Fi hardware port
+    // exists. Record the ivar and where our own members live, so a fix cannot
+    // land on top of one of them.
+    void *infraIvar = *reinterpret_cast<void **>(reinterpret_cast<char *>(this) + 0x200);
+    provider->setProperty("Ath10kCtrlInfraIvar", infraIvar != nullptr);
+    if (infraIvar != nullptr) {
+        IONetworkInterface *published = OSDynamicCast(IONetworkInterface, (OSObject *)infraIvar);
+        if (published != nullptr) {
+            provider->setProperty("Ath10kCtrlInfraClass",
+                                  published->getMetaClass()->getClassName());
+            OSString *bsd = OSDynamicCast(OSString, published->getProperty("BSD Name"));
+            if (bsd != nullptr)
+                provider->setProperty("Ath10kCtrlInfraBsd", bsd->getCStringNoCopy());
+            provider->setProperty("Ath10kCtrlInfraIsOurs", published == _venturaInterface);
+        } else {
+            provider->setProperty("Ath10kCtrlInfraClass", "not-an-interface");
+        }
+    }
+    const UInt64 selfAddress = static_cast<UInt64>(reinterpret_cast<uintptr_t>(this));
+    const UInt64 memberAddress = static_cast<UInt64>(reinterpret_cast<uintptr_t>(&_venturaInterface));
+    provider->setProperty("Ath10kIvarIfaceOffset", memberAddress >= selfAddress
+                          ? memberAddress - selfAddress : 0, 32);
+    // The controller ivar was already installed by createInterface(), where the
+    // object was in hand. Do NOT re-scan the registry from here: the
+    // getMatchingServices() pass wedged the kernel ("registry root held busy,
+    // kernelmanagerd has not checked in") three seconds into start().
     // Record what the registry looks like from here three seconds in: during
     // start() the controller's children are only the corecapture pipes and the
     // vif, and the same walk still found no "BSD Name" child.

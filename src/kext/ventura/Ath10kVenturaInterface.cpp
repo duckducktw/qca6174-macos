@@ -80,37 +80,30 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
     return true;
 }
 
-// The documented subclass hook: call the superclass implementation (which
-// requires IFT_ETHER) and then set the type-specific fields. Rewriting
-// params->type to IFT_IEEE80211 is what makes the ifnet a Wi-Fi interface -
-// SystemConfiguration classifies the BSD unit from the ifnet type, so without
-// this the adapter shows up as "Ethernet 2" and airportd will not manage it.
+// Leave the type at IFT_ETHER all the way through. SystemConfiguration does not
+// derive the port class from the ifnet type: SCNetworkInterface.c switches on
+// the IOInterfaceType *property* and rejects anything that is not IFT_ETHER or
+// IFT_IEEE1394 ("unknown interface type = %d" -> interface dropped from
+// SCNetworkInterfaceCopyAll). Stamping 71 there therefore made the unit
+// invisible to SC, not "Wi-Fi". The Wi-Fi classification comes from the
+// controller instead: with IFT_ETHER, SC checks whether the controller conforms
+// to IO80211Controller and builds an IEEE80211 interface from that - the same
+// shape AirportItlwm ships, which never touches the type either.
 bool Ath10kVenturaInterface::initIfnetParams(struct ifnet_init_params *params)
 {
     if (params == nullptr)
         return false;
-    // The documented subclass hook: call the base body (it insists on IFT_ETHER)
-    // and then set the type-specific field. Rewriting params->type to
-    // IFT_IEEE80211 is what makes the ifnet itself a Wi-Fi interface; changing
-    // the IOInterfaceType property *before* this call was measured to make the
-    // base body refuse, so the property keeps the Ethernet value here.
-    if (!IO80211Interface::initIfnetParams(params))
-        return false;
-    params->type = 0x47 /* IFT_IEEE80211 */;
-    return true;
+    return IO80211Interface::initIfnetParams(params);
 }
 
-// IFT_ETHER is what makes initIfnetParams() build an ifnet at all, but
-// SystemConfiguration classifies the published unit from the IOInterfaceType
-// property - with 6 it builds an "Ethernet 2" service and airportd refuses to
-// touch the radio ("all AirPort network services are disabled"). Stamp the
-// 802.11 type on the object that actually got the unit, right after the data
-// link layer attached it.
+// Keep the property at IFT_ETHER. See initIfnetParams(): the 802.11 value is a
+// controller-level classification in SystemConfiguration, and 71 on this
+// property makes SC drop the interface entirely.
 IOReturn Ath10kVenturaInterface::attachToDataLinkLayer(IOOptionBits options, void *param)
 {
     const IOReturn result = IO80211Interface::attachToDataLinkLayer(options, param);
     if (result == kIOReturnSuccess)
-        setProperty("IOInterfaceType", static_cast<UInt64>(0x47), 32);
+        setProperty("IOInterfaceType", static_cast<UInt64>(0x6), 32);
     return result;
 }
 
