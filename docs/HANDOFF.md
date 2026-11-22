@@ -70,8 +70,34 @@ VM：macOS **13.7.8 / 22H730**，`com.apple.iokit.IO80211Family 1200.13.0`（載
 7. **attach 前 `setInterfaceType(71)`** → `initIfnetParams` 失敗 → 沒有 BSD 單元（v38）。
 8. **把 `IOInterfaceType` 蓋在 start 內自建的那個介面上** → 蓋錯物件，en2 那筆還是 6（v39 實測）。
 
+## 社群怎麼解的（AirportItlwm，本輪實查原始碼）
+
+Ventura 可用的版本是 **v2.2.0**（`AirportItlwm/` 目錄，master 另一個 `AirportItlwmV2.cpp` 是 Sonoma+ 的新路線）。它做的四件事剛好是我們判定「死了」的三件事：
+
+1. `AirportItlwm::start()` 第一行就是 `super::start(provider)`（= `IO80211Controller::start`），沒有繞。它的 `createWorkLoop()` 回 `IO80211WorkLoop::workLoop()`。
+2. `AirportItlwm::configureInterface()`：`super::configureInterface(netif)` 之後呼叫 **`ether_ifattach(ifp, netif)`**，其中 `ifp` 是它自己 net80211（`itl80211`，隨 kext 一起編）的 `ic_ac.ac_if`——**它自己有一份 ifnet，而且 `ether_ifattach` 是它自己 bundle 內的符號**（不需要 kernel 匯出）。
+3. `AirportItlwm::start()` 用聚合 API `attachInterface((IONetworkInterface **)&fNetIf, true)`。
+4. `AirportItlwmInterface::init()` 只有一行 `super::init(controller)`（= `IO80211Interface::init`），沒有我們那套「繞過 v1 init」的作法。`useAppleRSNSupplicant()` 預設回 **false**（社群註記：Ventura 開 Apple RSN 會 panic）。
+
+**Sonoma 之後的新路線（`AirportItlwmEthernetInterface : IOEthernetInterface`）更像我們的形狀**，關鍵在 `attachToDataLinkLayer()` 成功後做的事：
+
+```cpp
+interface->setProperty("built-in", ...);
+interface->setProperty("IOInterfaceName", "enN");
+interface->setProperty(kIOInterfaceUnit, ifnet_unit(getIfnet()));
+interface->setProperty(kIOInterfaceNamePrefix, ifnet_name(getIfnet()));
+setProperty(kIOMACAddress, &addr, kIOEthernetAddressSize);
+interface->registerService();
+interface->prepareBSDInterface(getIfnet(), 0);   // ← 關鍵
+```
+
+**`prepareBSDInterface(ifnet, 0)` 才是把 ifnet 交給 80211 核心的那一步。** 在 13.7 的 KC 裡它只存在於新世代類別：`IO80211SkywalkInterface`（live `0x2000ccc`）、`IO80211VirtualInterface`（`0x20173a6`）、`IO80211InfraInterface`（`0x203f9a0`）——**舊的 `IO80211Interface` 沒有這個 virtual**（symtab 實查）。
+
+這正好解釋我們所有症狀：我們用 v1 的 `IO80211Interface` 子類發布，BSD 單元建立得出來（`initIfnetParams` 走 Ethernet 那條），但**沒有任何東西把它登記進 80211 核心**，所以 SC 只能當成一般網路介面（服務分類 Ethernet）、airportd 完全不理、`Ath10kApple80211Requests` 永遠 0。換句話說：不是 SC 分類難搞，是我們用的發布類別在 13.7 已經沒有登記鉤子。
+
 ## 下一個接手的人：照這個順序做
 
+- **（新增，優先做）把 ifnet 交給 80211 核心。** 依社群解法，缺的最後一步是 `prepareBSDInterface(ifnet, 0)`。它只在新世代類別上（`IO80211SkywalkInterface` / `IO80211VirtualInterface` / `IO80211InfraInterface`），所以最小改動是：想辦法弄到一個 `IO80211InfraInterface` 或 `IO80211VirtualInterface` 實例，在我們的 `attachToDataLinkLayer` 成功後把 `getIfnet()` 交給它的 `prepareBSDInterface(ifnet, 0)`，並照 AirportItlwm 補上 `built-in` / `IOInterfaceName` / `IOInterfaceUnit` / `IOInterfaceNamePrefix` / `IOMACAddress` 屬性再 `registerService()`。若那條通，SC 服務就會自然變成 Wi-Fi，airportd 才會開始送請求。**不要**直接把 `IO80211SkywalkInterface::prepareBSDInterface` 拿到我們這個 v1 子類身上呼叫——ivar 佈局不同，會踩壞記憶體。
 0. **先讀這段：SC 分類這一關卡在哪（本輪已把機制量測清楚，別重複試）**
    - SystemConfiguration 給介面的分類記錄在 `/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist`：v43 boot 實測 en2 那筆是 `SCNetworkInterfaceType = IEEE80211`、`SCNetworkInterfaceInfo.UserDefinedName = Wi-Fi`，**但 `IOInterfaceType = 6`**；服務（`preferences.plist` 的 `NetworkServices`）因此被建成 `Type/Hardware = Ethernet` 的 "Ethernet 2"，airportd 於是認定「沒有任何 AirPort 服務」→ `getairportpower` 永遠 `Off (forced)`、`Ath10kApple80211Requests` 永遠不存在。
    - 這個值是在介面**第一次被 SC 看到**時（`registerService()`）讀的，不是 attach 時。所以「attach 後才蓋 71」一定留下 6 的記錄。
