@@ -241,58 +241,71 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
 {
     if (vif == nullptr)
         return false;
-    // The unit name the kernel picked is not on the object we hold as
-    // "BSD Name" at this point, but the interface does carry the unit number and
-    // the name prefix (SystemConfiguration reads the same pair), so build enN
-    // from those and fall back to a registry scan.
-    char unitName[16] = {0};
-    if (_venturaInterface) {
-        OSNumber *unit = OSDynamicCast(OSNumber, _venturaInterface->getProperty(kIOInterfaceUnit));
-        OSString *prefix = OSDynamicCast(OSString,
-                                         _venturaInterface->getProperty(kIOInterfaceNamePrefix));
-        if (unit)
-            snprintf(unitName, sizeof(unitName), "%s%u",
-                     prefix ? prefix->getCStringNoCopy() : "en",
-                     static_cast<unsigned>(unit->unsigned32BitValue()));
-    }
-    OSString *bsdName = nullptr;
-    if (unitName[0] != 0)
-        bsdName = OSString::withCString(unitName);
-    if (bsdName == nullptr) {
-        // Our own class, not the abstract parent: matching "IO80211Interface"
-        // does not return the registered subclass instances here.
-        OSDictionary *match = IOService::serviceMatching("Ath10kVenturaInterface");
-        OSIterator *iter = match ? IOService::getMatchingServices(match) : nullptr;
-        while (iter && bsdName == nullptr) {
-            IOService *candidate = OSDynamicCast(IOService, iter->getNextObject());
-            if (candidate == nullptr)
-                break;
-            OSString *name = OSDynamicCast(OSString, candidate->getProperty("BSD Name"));
-            if (name == nullptr)
-                continue;
-            bsdName = name;
-            bsdName->retain();
-        }
-        if (iter) iter->release();
-        if (match) match->release();
-    }
-    if (bsdName == nullptr) {
-        provider->setProperty("Ath10kVifBsdPhase", "no-bsd-name");
-        return false;
-    }
+    // Resolve the ifnet first. The published interface object owns it, and
+    // IONetworkInterface::getIfnet() hands it back directly, so there is no need
+    // to guess a BSD name: reading "BSD Name" off the object we hold is what
+    // failed in v51c (Apple's attach re-creates the interface object).
     ifnet_t ifp = nullptr;
-    if (ifnet_find_by_name(bsdName->getCStringNoCopy(), &ifp) != 0 || ifp == nullptr) {
-        provider->setProperty("Ath10kVifBsdPhase", "ifnet-not-found");
-        bsdName->release();
+    const char *source = "none";
+    if (_venturaInterface != nullptr) {
+        ifp = _venturaInterface->getIfnet();
+        if (ifp != nullptr) {
+            ifnet_reference(ifp);
+            source = "interface-ifnet";
+        }
+    }
+    char unitName[16] = {0};
+    if (ifp == nullptr) {
+        // Fallback 1: the interface does carry the unit number and the name
+        // prefix (SystemConfiguration reads the same pair), so build enN.
+        if (_venturaInterface != nullptr) {
+            OSNumber *unit = OSDynamicCast(OSNumber, _venturaInterface->getProperty(kIOInterfaceUnit));
+            OSString *prefix = OSDynamicCast(OSString,
+                                             _venturaInterface->getProperty(kIOInterfaceNamePrefix));
+            if (unit)
+                snprintf(unitName, sizeof(unitName), "%s%u",
+                         prefix ? prefix->getCStringNoCopy() : "en",
+                         static_cast<unsigned>(unit->unsigned32BitValue()));
+        }
+        // Fallback 2: scan our own class for a published "BSD Name". Matching
+        // "IO80211Interface" does not return subclass instances, so use the
+        // concrete class name.
+        if (unitName[0] == 0) {
+            OSDictionary *match = IOService::serviceMatching("Ath10kVenturaInterface");
+            OSIterator *iter = match ? IOService::getMatchingServices(match) : nullptr;
+            while (iter) {
+                IOService *candidate = OSDynamicCast(IOService, iter->getNextObject());
+                if (candidate == nullptr)
+                    break;
+                OSString *name = OSDynamicCast(OSString, candidate->getProperty("BSD Name"));
+                if (name == nullptr)
+                    continue;
+                snprintf(unitName, sizeof(unitName), "%s", name->getCStringNoCopy());
+                break;
+            }
+            if (iter) iter->release();
+            if (match) match->release();
+        }
+        if (unitName[0] != 0 && ifnet_find_by_name(unitName, &ifp) == 0 && ifp != nullptr)
+            source = "bsd-name";
+        else
+            ifp = nullptr;
+    }
+    provider->setProperty("Ath10kVifBsdSource", source);
+    if (ifp == nullptr) {
+        provider->setProperty("Ath10kVifBsdPhase", "no-ifnet");
         return false;
     }
+    snprintf(unitName, sizeof(unitName), "%s%u", ifnet_name(ifp),
+             static_cast<unsigned>(ifnet_unit(ifp)));
     provider->setProperty("Ath10kVifBsdPhase", "ifnet-found");
+    provider->setProperty("Ath10kVifBsdName", unitName);
 
     // Naming properties a published 80211 interface carries; set them before
     // prepareBSDInterface so the core publishes the unit under this name.
     IOService *target = reinterpret_cast<IOService *>(vif);
     target->setProperty("built-in", kOSBooleanTrue);
-    target->setProperty("IOInterfaceName", bsdName->getCStringNoCopy());
+    target->setProperty("IOInterfaceName", unitName);
     target->setProperty(kIOInterfaceUnit, static_cast<UInt64>(ifnet_unit(ifp)), 32);
     target->setProperty(kIOInterfaceNamePrefix, ifnet_name(ifp));
 
@@ -302,7 +315,6 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
     provider->setProperty("Ath10kVifBsdStatus",
                           static_cast<UInt64>(static_cast<UInt32>(status)), 32);
     ifnet_release(ifp);
-    bsdName->release();
     return status == kIOReturnSuccess;
 }
 

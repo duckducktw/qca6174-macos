@@ -285,6 +285,11 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // surgery and no getLogPipes override, the family attaches its own
     // reporter exactly like it does for Apple's drivers.
     bool appleStart = reporterReady && super::start(provider);
+    // Keep the Apple-start verdict under its own key: Ath10kStartPhase is
+    // overwritten by whatever runs next, and "did Apple's start() publish an
+    // interface" decides whether the manual publication path is still needed.
+    provider->setProperty("Ath10kAppleStart",
+                          appleStart ? "ok" : (reporterReady ? "failed" : "skipped-no-reporter"));
     provider->setProperty("Ath10kStartPhase",
                           appleStart ? "apple-started"
                                      : (reporterReady ? "apple-start-failed" : "apple-start-skipped"));
@@ -304,9 +309,14 @@ bool Ath10kPCIDevice::start(IOService *provider)
 #endif
     provider->setProperty("Ath10kStartPhase", "controller-started");
 #if defined(ATH10K_VENTURA)
-    // The controller came up through its IONetworkController base, so the
-    // interface Apple would normally publish is ours to create and attach.
-    if (!_venturaInterface) {
+    // Exactly one publisher (HANDOFF §7.1). Apple's start() attaches and
+    // registers its own interface, so running the manual create/configure/
+    // attach/register pass on top of it only produced sibling interface nodes
+    // (six in one boot) and cost SystemConfiguration the Wi-Fi hardware port.
+    // Keep the manual pass only for the case where Apple's start() refused and
+    // nothing else would publish a unit at all.
+    provider->setProperty("Ath10kPublisher", appleStart ? "apple" : "manual");
+    if (!appleStart && !_venturaInterface) {
         IONetworkInterface *iface = createInterface();
         if (!iface) {
             provider->setProperty("Ath10kStartPhase", "interface-create-failed");
@@ -349,7 +359,6 @@ bool Ath10kPCIDevice::start(IOService *provider)
         provider->setProperty("Ath10kInterfaceType", "ieee80211-after-attach");
         iface->registerService();
         provider->setProperty("Ath10kStartPhase", "interface-published");
-#if defined(ATH10K_VENTURA)
         // Do not ask IONetworkStack for a unit. insertNetworkInterface() is a
         // local symbol, and calling it by its fixed vtable delta does not merely
         // fail — it corrupts the stack on 13.7. Measured symptom: en0 stops
@@ -357,9 +366,8 @@ bool Ath10kPCIDevice::start(IOService *provider)
         // floods the serial log, sshd never answers) while the guest keeps
         // running and the radio itself stays up. The BSD unit has to be built by
         // the driver, not handed to Apple's stack.
-        provider->setProperty("Ath10kStackPhase", "driver-owns-ifnet");
-#endif
     }
+    provider->setProperty("Ath10kStackPhase", "driver-owns-ifnet");
     // The BSD unit (enN) belongs to the IO80211VirtualInterface /
     // IO80211InfraInterface layer, not to the base interface, and only the 80211
     // stack creates it. Ask the controller for a station virtual interface

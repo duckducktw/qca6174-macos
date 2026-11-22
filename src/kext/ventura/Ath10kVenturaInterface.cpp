@@ -69,6 +69,12 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
     // interface. Discovery must therefore happen after the 802.11 stamp (see the
     // registerService() order below); stamping it here would make
     // initIfnetParams' own type check read 71 and refuse to build the ifnet.
+    // The unit reaches IONetworkStack on its own (an IONetworkStack child node
+    // appears under the interface), yet SystemConfiguration still builds no
+    // hardware port for it: the one property that differs from Apple's en0 is
+    // IOPrimaryInterface, which comes out as No here. Mark the interface
+    // primary before the service is registered and see whether SC takes it.
+    setProperty("IOPrimaryInterface", kOSBooleanTrue);
     _owner = owner;
     if (probe) probe->setProperty("Ath10kIfacePhase", "inited");
     return true;

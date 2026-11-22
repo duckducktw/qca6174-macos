@@ -1,8 +1,8 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-22（第二輪：找到 IO80211 ABI 根因 → 修好 → Apple 的 `start()` 首次跑完、vif 建起來、第一個 apple80211 請求送達；SC 分類仍卡）
+最後更新：2026-11-22（第三輪：§7.1 落地 → 證實 Apple 的 `start()` 會自己發布單元；並量到 **SystemConfiguration 根本看不到這個介面**（`SCNetworkInterfaceCopyAll()` 只有 serial1/en0），所以先前的「SC 分類成 Ethernet」其實是舊快取記錄）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v51**（`/tmp/vk51`）— kext 有載入、`en2` 存在、firmware runtime ready、SSH 正常、無 panic；**v48 仍是救援版**
+VM 現況：**v53**（`/tmp/vk53`；v52 在 `/tmp/vk52`）— kext 有載入、單元是 **en1**（因為 SC 記錄被清掉，號碼重配）、firmware runtime ready、SSH 正常、無 panic、Apple 的 `start()` 是唯一 publisher；**v48 仍是救援版**
 
 ---
 
@@ -22,7 +22,7 @@ VM 現況：**v51**（`/tmp/vk51`）— kext 有載入、`en2` 存在、firmware
 
 ---
 
-## 2. 目前權威狀態（v51）
+## 2. 目前權威狀態（v53；**SC 相關的舊結論已被 §6.7 推翻**，下表保留 v51 的量測供對照）
 
 **環境**：macOS **13.7.8 / 22H730**；`com.apple.iokit.IO80211Family 1200.13.0`（載入基址 `0xffffff8001f35000`，長度 `0x19bff9`，**live 範圍 `0x1f35000`–`0x20d0ff9`**）＋ **`com.apple.iokit.IO80211FamilyLegacy`（另一個 bundle，見 §6.5）**；`IONetworkingFamily 3.4`；kext `br.com.jonasw8.driver.ath10kmac 0.0.105`；OpenCore 1.0.5 DEBUG（`Target=67`、`ShowPicker=false`、`Timeout=0`）。
 
@@ -200,24 +200,65 @@ symtab 實查：`createVirtualInterface`、`attachVirtualInterface`、`IO80211Vi
 
 ---
 
+## 6.7 第三輪實測（v52/v53，2026-11-22）：SC 不是分類錯，是**完全看不到介面**
+
+**程式改動**
+1. §7.1 落實：手動 create→configure→attach→attachToDataLinkLayer→蓋 71→register 那段現在只在 `!appleStart` 時才會跑（單一 publisher）。新增 `Ath10kPublisher`（`apple`/`manual`）與 `Ath10kAppleStart`（`ok`/`failed`/`skipped-no-reporter`）斷點。
+2. `publishVenturaVifBsdUnit()` 改成**先拿 ifnet 再取名稱**：優先 `_venturaInterface->getIfnet()`（`IONetworkInterface::getIfnet()` 是 public virtual），其次才用 `IOInterfaceUnit`/`IOInterfaceNamePrefix` 組合名稱、最後才掃 `"BSD Name"`。新增 `Ath10kVifBsdSource`（`interface-ifnet`/`bsd-name`/`none`）與 `Ath10kVifBsdName`。
+3. 介面 `init()` 加 `setProperty("IOPrimaryInterface", true)` 實驗（**無效**，attach 階段被 Apple 覆寫回 No）。
+
+**實測（v52 = 只做 1+2，v53 = 再加 3）**
+
+| 觀察 | 值 | 意義 |
+|---|---|---|
+| `Ath10kAppleStart` | **`ok`** | Apple 的 `IO80211Controller::start()` 真的跑完（不是 fallback） |
+| `Ath10kPublisher` | `apple` | 手動發布路徑**沒跑**，`ifconfig` 仍有單元 → 是 Apple 的 start 發布的 |
+| `Ath10kStartPhase` | `controller-started` | 手動段不再蓋掉 |
+| `Ath10kVifPhase` | `vif-registered` | vif 仍建得起來 |
+| `Ath10kVifBsdSource` / `Phase` | `none` / `no-ifnet` | `_venturaInterface->getIfnet()` 回 **null**：`createInterface()` 交給我們的物件不是拿到 BSD 單元的那顆（Apple attach 會另建） |
+
+**SC 決定性量測（本輪最重要的發現）**
+```bash
+# 一隻 20 行的 SC 程式（本輪新增，見 §11 的 sclist.c）
+SCNetworkInterfaceCopyAll() -> 2
+[0] bsd=serial1 type=Modem
+[1] bsd=en0     type=Ethernet
+```
+- **`en2`/`en1` 根本不在 `SCNetworkInterfaceCopyAll()` 裡** → SystemConfiguration 從來沒看到這個介面，所以「SC 一直寫 6」其實是**舊快取記錄**（早期版本留下的），不是它對 71 的判讀。
+- 把 `NetworkInterfaces.plist` 的 en2 記錄＋`preferences.plist` 的服務刪掉後重開：SC **完全沒有重建記錄**，`listallhardwareports` 只剩 serial1/en0、`listnetworkserviceorder` 沒有它、`ipconfig getiflist` 也只有 `en0`（`ipconfig getsummary en1` = `interface doesn't exist`）。
+- 因為記錄被刪，單元從 en2 變 **en1**（單位號由 `IONetworkStack::getNextAvailableUnitNumber` 配，跟著 SC 記錄走）。en1 的節點：`IOInterfaceType=71`、`IOInterfaceState=3`、`IOBuiltin=Yes`、`IOPrimaryInterface=No`、`BSD Name=en1`，而且掛在我們的控制器底下（`…/QCA6174/en1`）——**一切看起來正常，SC 就是看不到**。
+- 手動把 en1 記錄塞回 `NetworkInterfaces.plist`（`SCNetworkInterfaceType=IEEE80211`、`IOInterfaceType=71`）：記錄**存活**（SC 沒覆寫），但仍**沒有 hardware port、沒有服務**。→ 記錄可以寫，服務推導要靠「活著的介面被 SC 認出來」。
+- `sudo ifconfig bridge0 create` 後 `bridge0` 也不在 `SCNetworkInterfaceCopyAll()` 裡（bridge 類本來就不是 hardware port），這條只證明 SC 的清單不是單純列 ifnet。
+
+**KC 反組譯：介面要怎麼才「被認出來」**
+- `IONetworkStack` 只有 **1 個 instance**（跟著第一個介面 en0 長出來），configd 對它開 `IONetworkStackUserClient`（ioreg 可見 `IOUserClientCreator = "pid 86, configd"`）。**configd/SC 的介面清單就是走這條**。
+- `IONetworkStack::interfacePublished(void*, IOService*, IONotifier*)` 是它的 IONotifier callback：把發佈的 service `safeMetaCast` 成 `IONetworkInterface`，讀介面物件 `+0xd8`（state）與 `+0xe0`（**noattach** 旗標）後呼叫（kprintf 格式 `interfacePublished(%p, state 0x%x, parent %d, noattach %d)`），接著走 `registerNetworkInterface` → `reserveInterfaceUnitNumber` → `attachNetworkInterfaceToBSD`。**`noattach` 為真時 stack 就不做 BSD attach**，那條路徑等於 self-managed datapath。
+- 另外：`IO80211Controller::createVirtualInterface` 的 live 實作**只接受 role == 7**（`cmp edx,7; jne fail`），內部 `gMetaClass`→`alloc`→`init(controller, addr, 7, …)`（vt+0xdd0）。也就是說我們現在這顆 vif 天生是 SoftAP/P2P 類，**不是**主介面，別把它當 Wi-Fi 主體。
+- live `IO80211VirtualInterface` 有完整鏈：`setUnitNumber(const char*)`（用 `IO80211VirtualInterfaceNamer` 配號，寫進 ivars）、`initBSDInterfaceParameters(ifnet_init_eparams*, sockaddr_dl**)`（只補旗標/角色檢查；**要求 `version==2`、`len==0x158`**，且 `getIfnet()==0`）、`prepareBSDInterface`、`configureIfnet()`（設 addrlen/hdrlen/flags/baudrate）、`attachToBpf()`（先送 `apple80211VirtualRequestIoctl(0xc03069c9,12,…)` 再 `IOSkywalkNetworkInterface::bpfAttach(0xc,0x48)`）。
+- **真正把 ifnet 塞進 vif 的是 `IOSkywalkNetworkInterface::prepareBSDInterface(ifnet, unit)`**（`ivars=[this+0xc0]; [ivars+8]=ifnet`，然後用 `[ivars]` 的 mtu 呼叫 `ifnet_set_mtu`）。`IO80211SkywalkInterface::prepareBSDInterface` 只是薄薄一層（先 `getIfnet()` 檢查必須為 null、`setProperty("IOInterfaceName", getBSDName())`、`ifnet_set_mtu(1500)`、`createIOReporters`、`ifnet_set_eflags(0x200000,0x200000)`），**不會自己 attach**。
+→ 所以 vif 路線必須自己生 ifnet（`ifnet_allocate`/`ifnet_attach`，public），再用 `setUnitNumber`＋`initBSDInterfaceParameters`＋`prepareBSDInterface`＋`configureIfnet`＋`attachToBpf` 收尾。
+
+**下一步（§7.2 改寫）**：vif 自己生 ifnet（type 從出生就是 `IFT_IEEE80211`），交給 `prepareBSDInterface`，然後看 `SCNetworkInterfaceCopyAll()` 是否出現該單元。判斷依據只要這一支程式，不用再猜 SC 的分類規則。
+
+---
+
+
 ## 7. 下一個接手的人：照這個順序
 
-### 7.1 ABI 已修好，先清掉重疊的發布路徑（優先）
-`super::start()` 現在會跑完，而且**它自己就建了介面**（`IO80211Interface` 節點曾出現 6 個、本輪 Wi-Fi 硬體埠還從 SC 清單消失）。所以 `Ath10kPCIDevice.cpp` 裡「`start()` 後半段手動 create→configure→attach→蓋 71→register」那整段要先拿掉，只留 vif 那塊，然後確認：
+### 7.1 重疊的發布路徑（**v52 已完成**）
+`super::start()` 現在會跑完（`Ath10kAppleStart=ok`），而且**它自己就發布了 BSD 單元**。所以 `Ath10kPCIDevice.cpp` 的手動 create→configure→attach→蓋 71→register 整段現在只在 `!appleStart` 時才跑，`Ath10kPublisher` 會寫 `apple`。待確認（下一次開機隨手看）：
 ```bash
-ioreg -r -c IO80211Interface | grep -c '+-o'          # 應該只剩 Apple 自己那一顆（+1 顆 vif）
-networksetup -listallhardwareports | grep -A2 -i wifi
-networksetup -listnetworkserviceorder | tail -5
+ioreg -r -c IO80211Interface | grep -c '+-o'          # 應該只有 Apple 那一顆（+1 顆 vif）
+networksetup -listallhardwareports | grep -A2 -i wifi # 目前仍然沒有
 ```
-目標：回到「1 顆介面 + 1 顆 vif、Wi-Fi 硬體埠存在」，再談分類。
+**注意**：§6.7 已證明 Wi-Fi 硬體埠消失不是「多顆介面」造成的，是 SC 根本看不到這個介面。
 
-### 7.2 然後才是把 ifnet 交給 80211 核心（程式已寫好，卡在取名稱）
-`publishVenturaVifBsdUnit()`（`Ath10kVentura.cpp`）已經會做 `prepareBSDInterface(ifnet, 0)` ＋ 四個命名屬性。目前卡在**拿不到 BSD 單元名稱**（`Ath10kVifBsdPhase = no-bsd-name`）：
-- `_venturaInterface` 上沒有 `BSD Name` / `IOInterfaceUnit`；`start()` 建的那顆物件不是擁有 en2 的那顆。
-- `IOService::serviceMatching("IO80211Interface")` **不會**回傳子類別實例；改匹配 `"Ath10kVenturaInterface"` 也還沒拿到（v51 實測）。
-- 未試：`ifnet_get_address_list()` 掃 `en0`–`en9` 比對 MAC（`94:e9:79:ed:af:b9`）找 ifnet；或先清掉 7.1 的重疊介面，剩下唯一一顆時名稱就沒有歧義。
+### 7.2 把 ifnet 交給 80211 核心（**改寫：必須自己生 ifnet**）
+`publishVenturaVifBsdUnit()` 現在會先用 `_venturaInterface->getIfnet()` 拿 ifnet，但實測是 **null**（Apple 的 attach 會另建介面物件，我們手上的不是拿到單元的那顆）。而 `prepareBSDInterface` 依 §6.7 反組譯**只會把傳進去的 ifnet 記進 vif 的 ivar、設 MTU/eflags、建 IOReporters，不會自己 attach**。所以：
+1. `ifnet_allocate(&ifnet_init_params, &ifp)`（public KPI；`ifp_type = IFT_IEEE80211` 從出生就對），`ifnet_set_lladdr`、`ifnet_attach(ifp, &sadl)`。
+2. `vif->setUnitNumber("en")` → `initBSDInterfaceParameters(&eparams, &sadl)`（**`eparams.version = 2`、`eparams.len = 0x158`**，否則回 `0xe00002c2`）→ `prepareBSDInterface(ifp, 0)` → `configureIfnet()` → `attachToBpf()`。
+3. 驗收只看 `SCNetworkInterfaceCopyAll()`（`sclist.c`）有沒有出現這個單元、然後 `networksetup -getairportpower` 是否不再 `Off (forced)`。
 
-順序：先 7.1 → 再看 `Ath10kVifBsdPhase` 走到 `prepared` → 看 SC 服務是否變 Wi-Fi、`Ath10kApple80211Requests` 是否開始增加。
 
 ### 7.3 再把 80211 動作接到真的 WMI
 `venturaScan()` 只清 index、`venturaScanResult()` 回 `NotFound`、`venturaAssociate()` 回 `kIOReturnUnsupported` —— **掃描/關聯核心邏輯完全沒接**。firmware 已 ready，WMI 掃描通道 `_wmiScan` 在 Sequoia 分支（`src/kext/native/`）有現成實作可搬。請求入口已從 `apple80211Request` 改成 live 的 `apple80211VirtualRequest`/`apple80211SkywalkRequest`（都導到 `venturaRecordRequest`），搬邏輯時改這裡。
@@ -252,6 +293,8 @@ VM 通了之後把 kext 部署回實體 ESP，在真機重驗（真機 ASPM 可�
 | **v51** | header 尾段改成 **live IO80211Family 順序**、requests 改成 `apple80211VirtualRequest`/`SkywalkRequest`、移除宣告未實作的 override、`alignVenturaVtable` 改純回報 | 第一次：`super::start()` 跑到 `createVirtualInterface`，panic 在 `apple80211VirtualRequestIoctl+0x26`（`getWorkQueue()` 回 null） |
 | **v51b** | 補 `createWorkQueue()`/`getWorkQueue()`（`IO80211WorkQueue::workQueue()`） | **不 panic、vif 建起來（role=SoftAP）、`Ath10kApple80211Requests=1`** |
 | **v51c** | 加 `publishVenturaVifBsdUnit()`（`prepareBSDInterface(ifnet,0)` + 命名屬性）與名稱查找 | `Ath10kVifBsdPhase=no-bsd-name`；介面節點變 6 顆、SC 的 Wi-Fi 硬體埠消失 → 手動發布路徑要拿掉（§7.1） |
+| **v52** | 單一 publisher（手動段只在 `!appleStart` 時跑）＋ `Ath10kPublisher`/`Ath10kAppleStart` ＋ vif 改走 `getIfnet()` 取 ifnet | `Ath10kAppleStart=ok`、`Ath10kPublisher=apple`、單元由 Apple 發布；`Ath10kVifBsdSource=none`（`getIfnet()` 回 null） |
+| **v53** | 介面 `init()` 加 `IOPrimaryInterface=true` | 無效（attach 時被覆寫回 No）。同輪量到 **SC 完全看不到介面**（§6.7） |
 
 ---
 
@@ -267,6 +310,7 @@ VM 通了之後把 kext 部署回實體 ESP，在真機重驗（真機 ASPM 可�
 | `src/kext/Ath10kNetwork.cpp` | `configureInterface()`、`createWorkLoop()`、`createOutputQueue()`、`getHardwareAddress()` |
 | `src/kext/native/*` | Sequoia（v2）對照實作：WMI 掃描/關聯、`getFaultReporterFromDriver()`、`IO80211InfraInterface` 用法 |
 | `tools/ifnet-type.c` | 在 guest 內編譯即印出 kernel 眼中的 `if_data.ifi_type`（判斷單元真型別，別信 ioreg property） |
+- `tools/sc-interfaces.c` | 在 guest 內編譯即印出 **`SCNetworkInterfaceCopyAll()` 真正看得到的介面**（名稱/型別/BSD name）。驗收 Wi-Fi 服務就靠這支：介面不在清單裡 = SC 根本沒註冊它，`IOInterfaceType` 再對也沒用（§6.7） |
 | `docs/hardware-verification.md` | 實機 stage0/stage3 陷阱與 hash 比對 |
 
 ---
