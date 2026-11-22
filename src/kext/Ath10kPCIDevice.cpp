@@ -29,6 +29,17 @@ extern "C" bool ath10kAttachVirtualInterface(IO80211Controller *,
 extern "C" IO80211VirtualInterface *ath10kCreateVirtualInterface(IO80211Controller *,
                                                                 ether_addr *, UInt32)
     __asm("__ZN17IO80211Controller22createVirtualInterfaceEP10ether_addrj");
+
+// Both IO80211Controller copies in the 13.7 kernel collection export
+// createVirtualInterface / attachVirtualInterface / gMetaClass, so a mangled-name
+// call may bind to the copy that is not the loaded IO80211Family: alloc through
+// that class returns null and the call fails with no IOLog at all (measured).
+// Dispatching through our own object's vptr was tried as the unambiguous route
+// and does not work either - the slots of the instance OpenCore rebuilt are not
+// the family's table, so vptr+0xda8/0xdb8 landed inside
+// detachVirtualInterface and panicked (general protection, frame
+// Ath10kPCIDevice::start). Treat the vif route as closed until the class copy
+// question is settled; see docs/HANDOFF.md.
 #endif
 
 // Standard PCI configuration-space offsets/capability IDs.
@@ -368,8 +379,10 @@ bool Ath10kPCIDevice::start(IOService *provider)
             memcpy(&vifAddress, &hwAddress, sizeof(vifAddress));
             vif = ath10kCreateVirtualInterface(this, &vifAddress, 7);
             provider->setProperty("Ath10kVifPhase", vif ? "vif-created" : "vif-create-failed");
-            IOService *vifService = reinterpret_cast<IOService *>(vif);
-            if (vifService) {
+            provider->setProperty("Ath10kVifPtr",
+                                  static_cast<UInt64>(reinterpret_cast<uintptr_t>(vif)), 64);
+            if (vif) {
+                IOService *vifService = reinterpret_cast<IOService *>(vif);
                 const bool attached = vifService->attach(this);
                 provider->setProperty("Ath10kVifPhase", attached ? "vif-attached" : "vif-attach-failed");
                 if (attached) {
