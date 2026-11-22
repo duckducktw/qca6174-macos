@@ -71,7 +71,6 @@ VM：macOS **13.7.8 / 22H730**，`com.apple.iokit.IO80211Family 1200.13.0`（載
 8. **把 `IOInterfaceType` 蓋在 start 內自建的那個介面上** → 蓋錯物件，en2 那筆還是 6（v39 實測）。
 
 ## 社群怎麼解的（AirportItlwm，本輪實查原始碼）
-
 Ventura 可用的版本是 **v2.2.0**（`AirportItlwm/` 目錄，master 另一個 `AirportItlwmV2.cpp` 是 Sonoma+ 的新路線）。它做的四件事剛好是我們判定「死了」的三件事：
 
 1. `AirportItlwm::start()` 第一行就是 `super::start(provider)`（= `IO80211Controller::start`），沒有繞。它的 `createWorkLoop()` 回 `IO80211WorkLoop::workLoop()`。
@@ -94,6 +93,16 @@ interface->prepareBSDInterface(getIfnet(), 0);   // ← 關鍵
 **`prepareBSDInterface(ifnet, 0)` 才是把 ifnet 交給 80211 核心的那一步。** 在 13.7 的 KC 裡它只存在於新世代類別：`IO80211SkywalkInterface`（live `0x2000ccc`）、`IO80211VirtualInterface`（`0x20173a6`）、`IO80211InfraInterface`（`0x203f9a0`）——**舊的 `IO80211Interface` 沒有這個 virtual**（symtab 實查）。
 
 這正好解釋我們所有症狀：我們用 v1 的 `IO80211Interface` 子類發布，BSD 單元建立得出來（`initIfnetParams` 走 Ethernet 那條），但**沒有任何東西把它登記進 80211 核心**，所以 SC 只能當成一般網路介面（服務分類 Ethernet）、airportd 完全不理、`Ath10kApple80211Requests` 永遠 0。換句話說：不是 SC 分類難搞，是我們用的發布類別在 13.7 已經沒有登記鉤子。
+
+### 照社群解法實作後的兩個實測結果（都失敗，別重試同樣寫法）
+
+1. **`new IO80211VirtualInterface`（AirportItlwm 就是這樣寫）→ 整個 kext 被靜默拒絕。**
+   `kmutil showloaded | grep ath10k` = 0、serial 完全沒有 ath10k 一行（連 probe 都沒跑）。undefined 符號對 KC 匯出表比對是齊的（`gMetaClass`/`init`/`configureIfnet`/`setUnitNumber`/`prepareBSDInterface` 都是 `N_SECT|N_EXT`），但 vtable/ctor 那組在我們的 `-nostdlib -static -kext` 連結下就是過不了 OpenCore 的注入檢查。同一個 commit 的其他改動（`include IO80211VirtualInterface.h`）單獨不影響，問題就在 `new`。
+2. **改用 metaclass alloc（`OSMetaClass::getMetaClassWithName` + `vifClass->alloc()`，只走 virtual）→ VM 卡在開機。**
+   serial 停在 OpenCore 驅動載入之後、**一行 kernel 訊息都沒有**，SSH banner 永遠不來、無 panic。判斷是早期初始化就把 kernel 卡死（alloc 出來的物件被 Apple 端拿去用，但缺少 vif 初始化時應有的 controller 狀態）。
+   兩個變體都已在 branch 上丟棄，VM 回到 v48（`/tmp/vk48`：kext 有載入、en2 在、radio ready、SSH 正常）。
+
+**再試之前要先解決的前置條件**：`IO80211WorkLoop::workLoop()` 與 `super::start(provider)` 是 AirportItlwm 的起手式，但我們先前量到兩者都會讓 kext 不被注入／panic。這代表**我們的 kext 與 KC 的符號/ABI 綁定本身還沒對齊**（很可能就是每次都被「silently skipped」的根源）。先把這個查清楚（例如用 `kmutil load -p` 手動載入取得真正的拒絕原因，或打開 OpenCore 的 kext 載入日誌），再做任何 vif/社群式改寫，否則每次都是在猜。
 
 ## 下一個接手的人：照這個順序做
 
