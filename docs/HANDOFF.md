@@ -692,6 +692,7 @@ Apple80211BindToInterfaceWithService: FAILED to bind to interface - -1/0xfffffff
   `IO80211SkywalkInterface::createEventPipe + 0x1b`，`[ivars+0x208]` 是 null——
   那個位置只有「向 Skywalk stack 註冊過的介面」才有東西，我們註冊不了。
   **不要在無法完成 Skywalk 註冊的物件上把 family client 交給 airportd。**
+  補證：掃描整份 live `IO80211Family.__TEXT`（capstone 逐指令，1.7 MB）**沒有任何** `mov [reg+0x208], …` 的寫入，所以那一格不是 family 自己填的，而是 Skywalk 註冊流程（或別的 kext 傳進來的物件）留下的——我們既然註冊不了，這條路就是關的。
 
 #### 6.15.3 正解：實作 `performCommand` 的 80211 ioctl
 
