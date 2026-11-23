@@ -39,6 +39,14 @@ IOReturn Ath10kUserClient::externalMethod(uint32_t selector,IOExternalMethodArgu
  return device->controlRequest(this,static_cast<const AthControl::Request *>(a->structureInput),static_cast<AthControl::Response *>(a->structureOutput));
 }
 IOReturn Ath10kPCIDevice::newUserClient(task_t task,void *security,UInt32 type,OSDictionary *properties,IOUserClient **out){
+ // airportd only knows IO80211Controller nodes (its XPC launch event is an
+ // "iokit.matching for IO80211Controller" one), so if Apple80211 wants a user
+ // client it has to come through here. Record every attempt, whatever the type:
+ // a silent counter after airportd ran means the "-3903 Wireless is not
+ // available" decision happens without ever knocking on this door.
+ {UInt64 seen=0;if(OSNumber*n=OSDynamicCast(OSNumber,getProperty("Ath10kCtrlNewUserClient")))seen=n->unsigned64BitValue();
+  setProperty("Ath10kCtrlNewUserClient",seen+1,32);setProperty("Ath10kCtrlNewUserClientType",(UInt64)type,32);
+  IOLog("Ath10kMac: controller newUserClient type=%u (#%llu)\n",(unsigned)type,(unsigned long long)(seen+1));}
  if(type!=AthControl::clientType)return IOEthernetController::newUserClient(task,security,type,properties,out);
  if(!athControlAllowed(task))return kIOReturnNotPrivileged;
  auto *client=new Ath10kUserClient;

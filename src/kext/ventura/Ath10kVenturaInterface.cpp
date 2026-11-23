@@ -47,6 +47,25 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
     if (probe) probe->setProperty("Ath10kIfacePhase",
                                   OSDynamicCast(IONetworkController, controller)
                                       ? "ethernet-init" : "controller-not-network");
+    // Same question as the controller side (Ath10kPCIDevice::start): which copy of
+    // IO80211Interface is this subclass chained to? Ventura has two, they export
+    // the same names, and the live one carries no init(IOService*) at all - so a
+    // mixed pair (live controller + legacy interface) would explain why the family
+    // never accepts the interface. Delta against IOPCIDevice is slide-invariant:
+    //   live   : IO80211Interface - IOPCIDevice = -0xE01FD0
+    //   legacy : IO80211Interface - IOPCIDevice = -0xC9E318
+    if (probe) {
+        const OSMetaClass *ifaceMeta = getMetaClass() ? getMetaClass()->getSuperClass() : nullptr;
+        const UInt64 ifaceAddr = reinterpret_cast<UInt64>(ifaceMeta);
+        const UInt64 pciAddr = reinterpret_cast<UInt64>(probe->getMetaClass());
+        probe->setProperty("Ath10kIfaceSuperMeta", ifaceAddr, 64);
+        probe->setProperty("Ath10kIfaceMetaDelta",
+                           static_cast<UInt64>(static_cast<SInt64>(ifaceAddr) -
+                                               static_cast<SInt64>(pciAddr)), 64);
+        IOLog("Ath10kMac: ifaceMeta=%llx pciMeta=%llx\n",
+              static_cast<unsigned long long>(ifaceAddr),
+              static_cast<unsigned long long>(pciAddr));
+    }
     // IO80211Interface::init() reads controller state (fault reporter, log
     // stream, monitor) that only IO80211Controller::start() creates, and this
     // branch deliberately bypasses that start() (it panics without an attached
@@ -172,6 +191,54 @@ IOReturn Ath10kVenturaInterface::attachToDataLinkLayer(IOOptionBits options, voi
         }
     }
     return result;
+}
+
+// airportd (via Apple80211) has to open a user client on this node; when that
+// open fails the interface is dropped and the caller reports "Wireless is not
+// available" (-3903) without ever sending a request. Counting the attempts
+// separates "airportd never asks" from "IO80211APIUserClient refuses us" - the
+// two have completely different fixes.
+void Ath10kVenturaInterface::noteUserClientAttempt(UInt32 type)
+{
+    IOService *probe = getProvider();
+    Ath10kPCIDevice *owner = _owner;
+    if (owner != nullptr && owner->getProvider() != nullptr)
+        probe = owner->getProvider();
+    if (probe != nullptr) {
+        UInt64 seen = 0;
+        if (OSNumber *n = OSDynamicCast(OSNumber, probe->getProperty("Ath10kNewUserClient")))
+            seen = n->unsigned64BitValue();
+        probe->setProperty("Ath10kNewUserClient", seen + 1, 32);
+        probe->setProperty("Ath10kNewUserClientType", static_cast<UInt64>(type), 32);
+        IOLog("Ath10kMac: newUserClient type=%u (#%llu)\n", (unsigned)type,
+              static_cast<unsigned long long>(seen + 1));
+    }
+}
+
+// Do not forward to IO80211Interface::newUserClient(): a qualified call to a
+// virtual dispatches back into this override (infinite recursion). The base
+// implementation is what we measured failing with kIOReturnUnsupported anyway
+// (IO80211APIUserClient::commonStart rejects the provider), so answer that
+// directly and keep the attempt on record.
+IOReturn Ath10kVenturaInterface::newUserClient(task_t owningTask, void *securityID,
+                                               UInt32 type, OSDictionary *properties,
+                                               IOUserClient **handler)
+{
+    (void)owningTask; (void)securityID; (void)properties;
+    if (handler != nullptr)
+        *handler = nullptr;
+    noteUserClientAttempt(type);
+    return kIOReturnUnsupported;
+}
+
+IOReturn Ath10kVenturaInterface::newUserClient(task_t owningTask, void *securityID,
+                                               UInt32 type, IOUserClient **handler)
+{
+    (void)owningTask; (void)securityID;
+    if (handler != nullptr)
+        *handler = nullptr;
+    noteUserClientAttempt(type | 0x80000000u);
+    return kIOReturnUnsupported;
 }
 
 UInt32 Ath10kVenturaInterface::inputPacket(mbuf_t packet, UInt32 length,

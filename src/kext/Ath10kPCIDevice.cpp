@@ -284,6 +284,29 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // AirportItlwm proves Apple's start() works on Ventura, so use it: no vtable
     // surgery and no getLogPipes override, the family attaches its own
     // reporter exactly like it does for Apple's drivers.
+    // Which copy of IO80211Controller did this object actually get? Ventura ships
+    // two (com.apple.iokit.IO80211Family and …IO80211FamilyLegacy) and they export
+    // the same mangled names, so the injection decides by symbol lookup, not by
+    // our header. Publish the resolved superclass metaclass next to a single-copy
+    // reference (IOPCIDevice, from IOPCIFamily) and print the difference: it is
+    // slide-invariant, and it identifies the owning bundle offline.
+    //   live   : IO80211Controller - IOPCIDevice = -0xE02028
+    //   legacy : IO80211Controller - IOPCIDevice = -0xC9E348
+    // (same trick one level down, for IO80211Interface, from the interface init).
+    {
+        const OSMetaClass *ctrlMeta = getMetaClass() ? getMetaClass()->getSuperClass() : nullptr;
+        const OSMetaClass *pciMeta = provider->getMetaClass();
+        const UInt64 ctrlAddr = reinterpret_cast<UInt64>(ctrlMeta);
+        const UInt64 pciAddr = reinterpret_cast<UInt64>(pciMeta);
+        const SInt64 delta = static_cast<SInt64>(ctrlAddr) - static_cast<SInt64>(pciAddr);
+        provider->setProperty("Ath10kCtrlSuperMeta", ctrlAddr, 64);
+        provider->setProperty("Ath10kPciMeta", pciAddr, 64);
+        provider->setProperty("Ath10kCtrlMetaDelta", static_cast<UInt64>(delta), 64);
+        IOLog("Ath10kMac: ctrlMeta=%llx pciMeta=%llx delta=%lld\n",
+              static_cast<unsigned long long>(ctrlAddr),
+              static_cast<unsigned long long>(pciAddr),
+              static_cast<long long>(delta));
+    }
     bool appleStart = reporterReady && super::start(provider);
     // Keep the Apple-start verdict under its own key: Ath10kStartPhase is
     // overwritten by whatever runs next, and "did Apple's start() publish an
