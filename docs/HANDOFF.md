@@ -2,7 +2,7 @@
 
 最後更新：2026-11-24（第十一輪：**請求通道打通**。airportd 走的是 **ifnet ioctl 備援**（`SIOCGA80211`/`SIOCSA80211` → `performCommand`），不是 family 的 user client；`Ath10kApple80211Requests` 從 1 跳到 318，`networksetup -getairportpower en1` 回 **`Wi-Fi Power (en1): On`**。詳見 §6.15。第十輪：airportd 認得 en1，門是 `IOInterfaceName`＋`IO80211InterfaceRole="Infrastructure"`（§6.14）。）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v115**（`/tmp/vk115`，Acer 上）— kext 載入、en1 `UP,RUNNING`、SC 認得 IEEE80211、`Wi-Fi` 硬體埠、airportd 已 bind（ioctl 通道）、power 查詢答 `On`、請求計數 318。掃描/關聯仍是 stub（§7.3），所以選單還看不到 AP。v110（舊可用版）/v113（ioctl 首版，copyin 誤判）/v94/v87 都留著
+VM 現況：**v115**（`/tmp/vk115`，Acer 上；§6.16 量到掃描/BSS 其實已經在跑，`Ath10kBSSCount=24`）— kext 載入、en1 `UP,RUNNING`、SC 認得 IEEE80211、`Wi-Fi` 硬體埠、airportd 已 bind（ioctl 通道）、power 查詢答 `On`、請求計數 318。掃描/關聯仍是 stub（§7.3），所以選單還看不到 AP。v110（舊可用版）/v113（ioctl 首版，copyin 誤判）/v94/v87 都留著
 
 ---
 
@@ -746,6 +746,27 @@ Ath10kNewUserClient                   -> 32（service 這條被我們主動拒�
    注意它沒有 `com.apple.wlan.authentication` entitlement，**失敗是正常的**：
    `IO80211APIUserClient::initWithTask` 第一件事就是 `copyClientEntitlement`。
 
+### 6.16 第十二輪（純量測，v115 不重編）：掃描的成果老早就在記憶體裡
+
+為了排下一階段（掃描 → 密碼 → 企業），先把 v115 這台的 WMI/BSS 計數全部拉出來看，
+結果發現**掃描不需要「攻破」，它已經在跑**：`Ath10kWMIScanAllChannelsObserved=Yes`、
+`channelInfoCount=76`、`Ath10kBSSAccepted=252`、`Ath10kBSSCount=24`（容量 64）。
+原因是 `serviceWMIScanChannels()` / `serviceWMIScan()` / `recordWMIBSS()` 都是 shared code，
+Ventura 版本來就有編進去，只是 `venturaScanResult()` 還是 stub，沒有人把 `_wmiBSS` 端給 airportd。
+
+四個判讀上的重點，避免下一輪重踩：
+
+1. **不要重寫 WMI 掃描**。`_wmiScan` 是 shared 狀態機（credit/DMA/CE3 ownership 都在裡面），
+   自己手刻 frame 會和 `_wmi.credits` 打架。
+2. **`SCAN_RESULT` 是游標式 GET**：airportd 一次要一筆，回非 0 就停（itlwm 用 5/12 當結束碼，
+   我們用 `kIOReturnNotFound`）。結果不是「陣列整包丟回去」。
+3. **`asr_ie_data` 的形態要看 OS 世代**：SDK 標頭是 `void*`，但 12+ 有 inline 版本；
+   先量 airportd 傳進來的 `req_len` 再決定，別照抄舊 itlwm。
+4. **PSK 缺的是 passphrase→PMK（PBKDF2-HMAC-SHA256, 4096 輪）**，樹裡沒有；
+   native 那條直接拿 `join.key` 當 PMK（只有 SAE 是真的算）。`Ath10kSHA256.hpp` 已有 HMAC-SHA256。
+
+詳細三步計畫寫在 §7.3。
+
 ## 7. 下一個接手的人：照這個順序
 
 ### 7.1 重疊的發布路徑（**v52 已完成**）
@@ -791,7 +812,100 @@ ioctl 備援（§6.15）。`Ath10kApple80211Requests` 現在會長、`getairport
 3. **驗收**：`tools/sc-interfaces.c` 必須列出這個單元；接著 `networksetup -listallhardwareports` 應出現 Wi-Fi、`networksetup -getairportpower en1` 不再是 `Off (forced)`。若單元出來了但 SC 仍看不到，下一步查 `IONetworkMbufDMADrivers`（§6.8 唯一「en0 有、我們沒有」的差異）。
 
 
-### 7.3 再把 80211 動作接到真的 WMI
+### 7.3 掃描 → 密碼驗證 → 企業驗證（下一階段的三步）
+
+#### 7.3.0 先看清楚：掃描其實**已經在跑**
+
+v115 的 ioreg（不是推論，是實測）：
+
+| 觀察點 | 值 | 意義 |
+|---|---|---|
+| `Ath10kWMIScanChannelsTransportSucceeded` | `Yes` | `SCAN_CHAN_LIST` 已送出並被 firmware 收下 |
+| `Ath10kWMIScanAttempted` / `AllChannelsObserved` | `Yes` / `Yes` | 掃描真的跑過，76 個 channel-info 事件 |
+| `Ath10kBSSAccepted` / `Ath10kBSSCount` | **252 / 24** | `_wmiBSS` 裡現在就有 24 個 AP（容量 64） |
+| `Ath10kBSSBeacons` | 299 | beacon 有進來（mgmt 事件路徑正常） |
+| `Ath10kBSSMalformed` / `LastReject` | 47 / `ds-parameter` | 有 47 個 frame 被 IE 檢查擋掉，先不動 |
+
+也就是說：**WMI 掃描、BSS 解析、channel 清單全部是 shared code 既有功能**
+（`serviceWMIScanChannels()` / `serviceWMIScan()` 在 `Ath10kPCIDevice.cpp`，
+`recordWMIBSS()` 在 `Ath10kBSS.hpp`），Ventura 版本來就有編進去。缺的只是把
+`venturaScan()` / `venturaScanResult()` 這兩個 stub 接上去。
+
+#### 7.3.1 第一步：讓 airportd 看得到掃描結果（S1）
+
+要改的只有 `src/kext/ventura/Ath10kVentura.cpp` 兩個函式，外加一個 kick：
+
+1. `venturaScan(const apple80211_scan_data *)`：
+   - `_wmiBSS` 清空（`count=0`，其他計數保留）
+   - 重新 arm `_wmiScan`：`attempted=false; completed=false; terminal=false; cancelRequested=false; started=false; generation++`（掃描命令由 `serviceWMIScan()` 自己送，不要在這裡手刻 WMI frame）
+   - 回 `kIOReturnSuccess`；`SCAN_REQ_MULTIPLE`（`apple80211_scan_multiple_data`）先忽略 SSID 清單、走全通道掃描
+2. `venturaScanResult(apple80211_scan_result *result)`：**游標式**，一次回一筆，這是 airportd 的協議
+   （itlwm 的 `getSCAN_RESULT()` 就是這樣做）：
+   - `_venturaScanIndex` 當游標；`>= _wmiBSS.count` → 回 `kIOReturnNotFound`（airportd 收到非 0 就停止）
+   - 逐欄填：`version=APPLE80211_VERSION`、`asr_bssid`、`asr_ssid_len`/`asr_ssid`、
+     `asr_channel`（`rxChannel` → 頻率／channel 轉換）、`asr_rssi`/`asr_noise`/`asr_snr`、
+     `asr_beacon_int`、`asr_cap`（`capabilities`）、rate 表（`rates[]`，上限 `APPLE80211_MAX_RATES`）、
+     `asr_age`（0 = 新鮮結果）
+   - **RSN IE**：`asr_ie_len` 填 `_wmiBSS.entries[i].rsnLength`；`asr_ie_data` 在 SDK 標頭是 `void*`，
+     但 12+ 的 family 可能是「inline 緊接在結構後面」，**先量一次 airportd 傳進來的 `req_len`**
+     （本輪 ioctl 已可記錄）再決定用指標還是 inline memcpy，不要照抄舊 itlwm 寫法
+3. `SCANCACHE_CLEAR` 已經有實作（清 `_venturaScanIndex`），順手讓它也清 `_wmiBSS.count`。
+
+**驗收**：`Ath10kApple80211Requests` 持續增加且 `Ath10kLastApple80211Request = 11`
+（`APPLE80211_IOC_SCAN_RESULT`）＝airportd 正在拉結果；再加一個自己的計數
+`Ath10kScanServed`（回成功的筆數）應該停在 `_wmiBSS.count`。UI 面：登入後 Wi-Fi 選單 / 系統設定的
+網路清單應該開始列出 SSID。
+
+#### 7.3.2 第二步：密碼驗證（WPA2-PSK，S2）
+
+程式骨架**已經在 shared code**：`Ath10kNetwork.cpp` 的 `_connection` 狀態機
+（`Scan → Start → Barrier → Peer → Auth → Assoc → …`）、`Ath10kSupplicant`（4-way handshake、
+CCMP、rekey）、`buildStationManagement()`、`buildConnectionWMI()`、`outputPacket()`、
+`deliverNetworkRX()` 全都有，native 版只是多一層 WCL opcode 轉接。
+
+要做的：
+
+1. `venturaAssociate(const apple80211_assoc_data *ad)`：解 `ad_ssid`/`ad_bssid`、
+   `ad_auth_upper`（PSK=2、PSK_SHA256=6）、`ad_key`（`apple80211_key`，**內容是 passphrase 不是 PMK**）
+2. **PBKDF2-HMAC-SHA256(4096, passphrase, ssid) → 32-byte PMK**：樹裡**目前沒有**這段
+   （native 直接把 `join.key` 當 PMK 丟進 `supplicant.begin()`，只有 SAE 那條是真的算出來的）。
+   `src/shared/Ath10kSHA256.hpp` 已有 HMAC-SHA256，補一個 4096 輪的 PBKDF2 迴圈即可；
+   注意 `ad_key.key_length` 是 8–63（passphrase）還是 64（hex PSK）要分開處理
+3. 把 BSS（`_wmiBSS` 裡符合 SSID/BSSID 那筆）綁進 `_connection`，設 `secure=true`、
+   `securityAKM=2`，然後 `stage=LinkStage::Scan` 讓共享狀態機接手（它自己會做 vdev start / peer create /
+   EAPOL 4-way / 金鑰安裝 / port authorize）
+4. 回報：`APPLE80211_IOC_ASSOCIATE` 回 `kIOReturnSuccess` 後，airportd 會輪詢
+   `ASSOCIATE_RESULT`（21）、`ASSOCIATION_STATUS`（22）、`STATE`（13）—— 這三個要改成反映
+   `_connection.stage`，目前是寫死的 0
+5. RX/TX：`_networkInterface` 必須指向**已發布**的那顆介面（`[controller+0x200]`），
+   EAPOL 才會走 `inputPacket()` → `IO80211Interface` 的 supplicant 路徑；這條現在是 null-safe 的
+   stub，要確認 RX 真的送得進 ifnet
+
+**驗收**：`Ath10kSupplicantState` 前進、`_connection.portAuthorized` 變 true、
+`ifconfig en1` 拿到 DHCP 位址、`networksetup -getairportnetwork en1` 回 SSID。
+風險：這步開始真的要收發資料幀，任何 ring/DMA 問題都會以 panic 或靜默丟包出現，
+先用空密碼的**開放網路**（`selectOpenBSS` 已有）驗證 TX/RX 通，再開 PSK。
+
+#### 7.3.3 第三步：企業驗證（WPA2/WPA3-Enterprise，S3）
+
+企業驗證不是自己跑 EAP：macOS 的 IO80211 supplicant（`IO80211Interface` 的 EAPOL 入口）
+會處理 EAP-TLS/PEAP/TTLS，驅動只要**不要擋**：
+
+1. RSN IE 協商允許 802.1X AKM（suite 1 / 3 / 5），`supportsPSKAKM()` 那种硬性 PSK 檢查要放寬
+2. `ASSOCIATE` 時不要要求 PMK（`secure=true` 但跳過 `supplicant.begin()`），
+   改成 `portAuthorized=false` 等 supplicant 完成
+3. EAPOL 全數往上送（`inputPacket` 已經把 `ETHERTYPE_PAE` 交給 `IO80211Interface`），
+   port 授權後才放行一般資料幀（`_connection.portAuthorized` 這格 shared code 已有）
+
+**驗收**：802.1X 測試 AP（hostapd + EAP-TLS 最省事）能完成 EAP 交換、`portAuthorized` 變 true。
+
+#### 7.3.4 順序與理由
+
+先 S1 再 S2 再 S3，理由是每一階都只多一個變數：S1 只碰「把既有資料端出去」，
+S2 才第一次碰 TX/RX 資料面（開放網路先驗），S3 只放寬 RSN/AKM 政策。
+反過來做（先 PSK）會在「掃描結果根本看不到」的情况下同時 debug 握手與掃描，成本最高。
+
+### 7.3-old 再把 80211 動作接到真的 WMI（已被上節取代，僅留記錄）
 `venturaScan()` 只清 index、`venturaScanResult()` 回 `NotFound`、`venturaAssociate()` 回 `kIOReturnUnsupported` —— **掃描/關聯核心邏輯完全沒接**。firmware 已 ready，WMI 掃描通道 `_wmiScan` 在 Sequoia 分支（`src/kext/native/`）有現成實作可搬。請求入口已從 `apple80211Request` 改成 live 的 `apple80211VirtualRequest`/`apple80211SkywalkRequest`（都導到 `venturaRecordRequest`），搬邏輯時改這裡。
 
 ### 7.4 最後才是真機驗證
