@@ -37,7 +37,6 @@ public:
     virtual IOReturn inputPacket(IO80211NetworkPacket *,packet_info_tag *,ether_header *,bool *) APPLE_KEXT_OVERRIDE;
     virtual SInt64 pendingPackets(unsigned char) APPLE_KEXT_OVERRIDE;
     virtual SInt64 packetSpace(unsigned char) APPLE_KEXT_OVERRIDE;
-    virtual bool isDebounceOnGoing(void) APPLE_KEXT_OVERRIDE;
     virtual bool setLinkState(IO80211LinkState,UInt,bool debounceTimeout = 30,UInt code = 0) APPLE_KEXT_OVERRIDE;
     virtual IO80211LinkState linkState(void) APPLE_KEXT_OVERRIDE;
     virtual void setScanningState(UInt,bool,apple80211_scan_data *,int) APPLE_KEXT_OVERRIDE;

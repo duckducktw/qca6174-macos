@@ -529,6 +529,40 @@ ivars[0x198] = iface                                      ; getInfraInterface() 
 3. 先只做到這裡就開機量測：`ioreg -c IO80211InfraInterface` 有沒有實例、`Apple80211GetIfListCopy` 是否還 -3903、`ioreg -c IO80211APIUserClient` 是否出現。**這一步就能判斷「skywalk 介面存在」是不是 wrapper 的唯一門檻**，不必先解決 BSD 單元。
 4. 之後才是 datapath：Skywalk 註冊（`registerNetworkInterfaceWithLogicalLink`，需要 logical link 與 packet buffer pool）＋自己 `ifnet_allocate` 之後交給 `prepareBSDInterface(ifp, 0)`；v1 `IO80211Interface` 那條線只留作 SC 分類的後備。
 
+### 6.13 第九輪（v88–v94）：把 Skywalk 物件掛上去 —— `attachInterface` 終於回 ok，但 airportd 還是 -3903
+
+#### 6.13.1 Skywalk header 要先跟 live KC 對齊（不然整個 kext 進不去）
+
+`vendor/itlwm-v1/Airport/IO80211SkywalkInterface.h` 是 Sonoma 期的順序，跟 13.7 live 的 `__ZTV23IO80211SkywalkInterface`（0xffffff80020dc138，660 slot／119 個自有）不一致：多了 `isCommandProhibited`、`forwardInfraRelayPackets`、`isDebounceOnGoing`、`setInfraSpecificFrameStats`、`cachePeer`、`getEventPipeSize`，少了 `getBSSID`。以 `~/.hermes/cache/scratch/vtcmp.py <vtable dump> <header> <class>` 比對後改成 live 順序（`IO80211InfraInterface.h` 的 `isDebounceOnGoing` override 也要一起拿掉）。**只要順序不符，OpenCore 直接不注入，序列埠一個字都不會有**（`kmutil showloaded | grep -c ath10k` = 0 是唯一線索）。
+
+#### 6.13.2 自己寫 `IO80211InfraInterface` 子類不可行
+
+`OSDefineMetaClassAndStructors(Ath10kInfraInterface, IO80211InfraInterface)` 可以編譯（父類沒有純虛擬），但注入後 kext 不載入。**改走 Apple 自己的 vif**：`IO80211Controller::createVirtualInterface(ether_addr*, 7)` 在 start() 早就建了一個（`Ath10kVifPhase=vif-registered`），把它交給 `IO80211Controller::attachInterface(OSObject*, IOService*)` 就好。
+
+#### 6.13.3 v94：attach 成功（本輪真正的新狀態）
+
+```cpp
+extern "C" bool ath10kAttachSkywalkInterface(IO80211Controller *self, OSObject *iface, IOService *service)
+    __asm("__ZN17IO80211Controller15attachInterfaceEP8OSObjectP9IOService");
+// role 1 直接寫：attachInterface 只讀 [ivars+0x50]，ivars = [iface+0x110]
+void **ivarsSlot = (void **)((char *)vif + 0x110);
+if (*ivarsSlot) *(UInt32 *)((char *)*ivarsSlot + 0x50) = 1;
+ath10kAttachSkywalkInterface(this, vif, this);
+```
+
+實測（v94）：`Ath10kInfraAttach = "ok"`、`Ath10kInfraPhase = "attached"`、`Ath10kInfraIf` 有值、`Ath10kVifPhase = "vif-registered"`、`Ath10kMediumPhase = "ieee80211"`、en1 在。**所以 `safeMetaCast(iface, IO80211SkywalkInterface)` ＋ role==1 這兩道門已經過了，`getInfraInterface()` 不再是 null。**
+
+但 airportd 仍然：內層 `_getIfListCopy … count[1]`、外層 `Apple80211GetIfListCopy: exit -3903/0xfffff0c1, ifCount[0]`，而且**對我們任何節點都沒有 `newUserClient`**（`Ath10kCtrlNewUserClient` 完全沒被建立 = 從沒呼叫），request 數仍 1。log 裡除了這幾行沒有任何其他 airportd 訊息 → 卡點在使用者空間的 wrapper，且是**靜默**的檢查。
+
+#### 6.13.4 建置踩到的兩個坑
+
+1. **stale object**：把檔案從 `Makefile` 的 `VENTURA_OBJECT` 拿掉後，舊的 `Ath10kInfraInterface.o` 還是被連進去（`nm | grep -c Ath10kInfraInterface` = 23）。改動物件清單後**一定要 `rm -rf build/ventura`**，並用 `nm` 驗證符號真的消失。
+2. **undefined symbol 對照要看乾淨的 build**：incremental build 會多出一堆 `IO80211Interface::*`／`_task_reference`／`_thread_call_*`，看起來像「新增參考就掛」，其實是物件組成變了。v94 與 v92 的 `nm -u` 逐行相同（715 行、零差異）才代表 symbol 集合沒變。
+
+#### 6.13.5 下一步：把 wrapper 的靜默過濾拆開
+
+`-3903` 發生在使用者空間（`/usr/libexec/airportd` 連 `/System/Library/PrivateFrameworks/IO80211.framework`，那是 stub，實作在 dyld shared cache），而且**不經過任何 IOKit 呼叫**（沒有 user client、沒有 request）。所以下一步是把 `Apple80211GetIfListCopy` 從 shared cache 抽出來反組譯，看內層成功之後它還檢查什麼（可能是 `Apple80211Open` 的 mach service、或某個 interface 屬性）。在這之前，不要再猜 kernel 側的門 —— kernel 側兩道 cast 已經都過了。
+
 ---
 
 ## 7. 下一個接手的人：照這個順序

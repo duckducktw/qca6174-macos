@@ -379,6 +379,13 @@ bool Ath10kPCIDevice::start(IOService *provider)
             provider->setProperty("Ath10kCtrlInfraInstalled", "after-apple-start");
         }
     }
+    // Airportd's per-interface step casts the provider to IO80211SkywalkInterface
+    // (measured: both IO80211APIUserClient::commonStart and the controller's
+    // attachInterface(OSObject*, IOService*)), and the v1 IO80211Interface cannot
+    // satisfy that in either Ventura bundle. Give the controller a Skywalk-class
+    // interface too, exactly the way AirportItlwm's Sonoma build does, and record
+    // what the attach says. This does not replace the v1 interface: that one owns
+    // the BSD unit.
     if (!appleStart && !_venturaInterface) {
         IONetworkInterface *iface = createInterface();
         if (!iface) {
@@ -494,6 +501,10 @@ bool Ath10kPCIDevice::start(IOService *provider)
             provider->setProperty("Ath10kVifPhase", "no-hw-address");
         }
         (void)vifOk;
+        // Apple's start() built the vif; hand it back as the infra interface so
+        // airportd's skywalk cast has something to succeed on.
+        if (appleStart && _venturaSkywalkIf == nullptr)
+            _venturaSkywalkIf = attachPlatformVif();
     }
 #endif
 

@@ -102,6 +102,11 @@ private:
     SInt32 venturaCountryCode(void *data, bool isSet);
     void venturaPublishState(UInt32 state);
     IO80211Interface *_venturaInterface = nullptr;
+    // Skywalk-side object handed to the controller (see attachPlatformVif).
+    // Airportd's per-interface step and IO80211APIUserClient::commonStart both
+    // cast to IO80211SkywalkInterface, which the v1 interface can never satisfy.
+    IOService *_venturaSkywalkIf = nullptr;
+    IOService *attachPlatformVif();
     // The vif is created inside Apple's start(), but its BSD handoff cannot run
     // there: the controller's registry children at that moment are only the
     // corecapture pipes and the vif, the interface node that carries "BSD Name"

@@ -95,6 +95,9 @@ $(BUILD_DIR)/Ath10kVentura.o: src/kext/ventura/Ath10kVentura.cpp $(wildcard src/
 $(BUILD_DIR)/Ath10kVenturaInterface.o: src/kext/ventura/Ath10kVenturaInterface.cpp $(wildcard src/kext/ventura/*) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/Ath10kInfraInterface.o: src/kext/ventura/Ath10kInfraInterface.cpp $(wildcard src/kext/ventura/*) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/Ath10kNative.o: src/kext/native/Ath10kNative.cpp $(wildcard src/kext/native/*) $(wildcard src/kext/*.hpp) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 

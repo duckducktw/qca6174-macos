@@ -1084,4 +1084,39 @@ SInt32 Ath10kPCIDevice::venturaCountryCode(void *data, bool isSet)
     return kIOReturnSuccess;
 }
 
+// Hand the controller's own virtual interface back to it as the infra
+// interface. Airportd and IO80211APIUserClient both cast their provider to
+// IO80211SkywalkInterface, which the v1 interface can never satisfy; a subclass
+// of our own is rejected by OpenCore at injection time.
+//
+// The vif itself is already created by the start() path (station role 7), so this
+// adds exactly one undefined symbol - the controller's attachInterface overload.
+// The role that overload checks ([ivars+0x50], ivars = [iface+0x110]) is written
+// directly: setInterfaceRole/getInterfaceRole are exported several times in the
+// KC and referencing them is not needed for this.
+extern "C" bool ath10kAttachSkywalkInterface(IO80211Controller *self, OSObject *iface,
+                                             IOService *service)
+    __asm("__ZN17IO80211Controller15attachInterfaceEP8OSObjectP9IOService");
+
+IOService *Ath10kPCIDevice::attachPlatformVif()
+{
+    IOService *probe = getProvider();
+    IO80211VirtualInterface *vif = _venturaVif;
+    if (vif == nullptr) {
+        if (probe) probe->setProperty("Ath10kInfraPhase", "no-vif");
+        return nullptr;
+    }
+    void **ivarsSlot = reinterpret_cast<void **>(reinterpret_cast<char *>(vif) + 0x110);
+    if (*ivarsSlot != nullptr)
+        *reinterpret_cast<UInt32 *>(reinterpret_cast<char *>(*ivarsSlot) + 0x50) = 1;
+    const bool attached = ath10kAttachSkywalkInterface(this, vif, this);
+    if (probe) {
+        probe->setProperty("Ath10kInfraAttach", attached ? "ok" : "failed");
+        probe->setProperty("Ath10kInfraPhase", attached ? "attached" : "attach-failed");
+        probe->setProperty("Ath10kInfraIf",
+                           static_cast<UInt64>(reinterpret_cast<uintptr_t>(vif)), 64);
+    }
+    IOLog("Ath10kMac: infra attach vif %p -> %d\n", vif, (int)attached);
+    return vif;
+}
 #endif

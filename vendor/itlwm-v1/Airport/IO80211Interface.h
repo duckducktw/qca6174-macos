@@ -53,6 +53,8 @@ struct apple80211_interface_availability;
 struct apple80211_pmk_cache_data;
 struct apple80211_ap_cmp_data;
 
+#ifndef ATH10K_TXPACKETREQUEST_DEFINED
+#define ATH10K_TXPACKETREQUEST_DEFINED
 struct TxPacketRequest {
     uint16_t    unk1;       // 0
     uint16_t    t;       // 2
@@ -68,6 +70,7 @@ struct TxPacketRequest {
 };
 
 static_assert(sizeof(struct TxPacketRequest) == 0x60, "TxPacketRequest size error");
+#endif /* ATH10K_TXPACKETREQUEST_DEFINED */
 
 struct AWSRequest;
 struct packet_info_tx;

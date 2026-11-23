@@ -23,6 +23,12 @@
 #include "IO80211Controller.h"
 #include "IO80211WorkQueue.h"
 #include "IO80211Interface.h"
+// Skywalk side: the Infra header has no include of its own base, so the order here
+// is load-bearing.
+#include "apple_private_spi.h"   // packet_info_tag / ifnet_init_eparams
+#include "IO80211SkywalkInterface.h"
+#include "IO80211VirtualInterface.h"
+#include "IO80211InfraInterface.h"
 #include "apple80211_var.h"
 #include "apple80211_ioctl.h"
 #include "CCPipe.h"

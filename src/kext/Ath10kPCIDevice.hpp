@@ -3,6 +3,7 @@
 #if defined(ATH10K_VENTURA)
 #include "ventura/Ath10kVenturaABI.hpp"
 #include "ventura/Ath10kVenturaInterface.hpp"
+#include "ventura/Ath10kInfraInterface.hpp"
 #define ATH10K_CONTROLLER_BASE IO80211Controller
 #elif defined(ATH10K_NATIVE)
 #include "native/Ath10kNativeInterface.hpp"

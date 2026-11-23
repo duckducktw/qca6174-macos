@@ -39,6 +39,11 @@ struct userPrintCtx;
 struct apple80211_lqm_summary;
 struct apple80211_infra_specific_stats;
 
+// Also defined (identically) in IO80211Interface.h; both headers end up in the
+// same translation unit for a driver that publishes a v1 interface and a Skywalk
+// one, so keep a single definition.
+#ifndef ATH10K_TXPACKETREQUEST_DEFINED
+#define ATH10K_TXPACKETREQUEST_DEFINED
 struct TxPacketRequest {
     uint16_t    unk1;       // 0
     uint16_t    t;       // 2
@@ -54,6 +59,7 @@ struct TxPacketRequest {
 };
 
 static_assert(sizeof(struct TxPacketRequest) == 0x60, "TxPacketRequest size error");
+#endif /* ATH10K_TXPACKETREQUEST_DEFINED */
 
 class IO80211SkywalkInterface : public IOSkywalkEthernetInterface {
     OSDeclareAbstractStructors(IO80211SkywalkInterface)
@@ -92,12 +98,10 @@ public:
     virtual void logTxCompletionPacket(IO80211NetworkPacket *,PacketSkywalkScratch *,unsigned char *,apple80211_wme_ac,int,UInt,bool);
     virtual IOReturn recordCompletionPackets(TxCompletionEnqueueStats *,TxCompletionEnqueueStats *);
     virtual IOReturn inputPacket(IO80211NetworkPacket *,packet_info_tag *,ether_header *,bool *);
-    virtual IOReturn forwardInfraRelayPackets(IO80211NetworkPacket*, ether_header*);
     virtual void logSkywalkTxReqPacket(IO80211NetworkPacket *,PacketSkywalkScratch *,unsigned char *,apple80211_wme_ac,bool);
     virtual SInt64 pendingPackets(unsigned char);
     virtual SInt64 packetSpace(unsigned char);
     virtual bool isChipInterfaceReady(void);
-    virtual bool isDebounceOnGoing(void);
     virtual bool setLinkState(IO80211LinkState,UInt,bool debounceTimeout = 30,UInt code = 0);
     virtual IO80211LinkState linkState(void);
     virtual void setScanningState(UInt,bool,apple80211_scan_data *,int);
@@ -118,9 +122,6 @@ public:
     virtual void setInterfaceChipCounters(apple80211_stat_report *,apple80211_chip_counters_tx *,apple80211_chip_error_counters_tx *,apple80211_chip_counters_rx *);
     virtual void setInterfaceMIBdot11(apple80211_stat_report *,apple80211_ManagementInformationBasedot11_counters *);
     virtual void setFrameStats(apple80211_stat_report *,apple80211_frame_counters *);
-#if __IO80211_TARGET >= __MAC_14_4
-    virtual void setInfraSpecificFrameStats(apple80211_stat_report *,apple80211_infra_specific_stats *);
-#endif
     virtual SInt64 getWmeTxCounters(unsigned long long *);
     virtual void setEnabledBySystem(bool);
     virtual bool enabledBySystem(void);
@@ -134,20 +135,19 @@ public:
     virtual UInt64 findExistingFlowQueue(IO80211FlowQueueHash);
     virtual void removePacketQueue(IO80211FlowQueueHash const*);
     virtual void flushPacketQueues(void);
-    virtual void cachePeer(ether_addr *,UInt *);
     virtual bool shouldLog(unsigned long long);
     virtual void vlogDebug(unsigned long long,char const*,va_list);
     virtual void vlogDebugBPF(unsigned long long,char const*,va_list);
     virtual UInt64 createLinkQualityMonitor(IO80211Peer *,IOService *);
     virtual void releaseLinkQualityMonitor(IO80211Peer *);
     virtual void *getP2PSkywalkPeerMgr(void);
-    virtual bool isCommandProhibited(int);
     virtual void setNotificationProperty(OSSymbol const*,OSObject const*);
     virtual void *getWorkerMatchingDict(OSString *);
     virtual bool init(IOService *);
     virtual bool isInterfaceEnabled(void);
     virtual ether_addr *getSelfMacAddr(void);
     virtual void setSelfMacAddr(ether_addr *);
+    virtual void *getBSSID(void);
     virtual void *getPacketPool(OSString *);
     virtual void *getLogger(void);
     virtual IOReturn handleSIOCSIFADDR(void);
@@ -172,7 +172,6 @@ public:
     virtual void disableDatapath(void);
     virtual int getNumTxQueues(void);
     virtual void *getLQMSummary(apple80211_lqm_summary *);
-    virtual int getEventPipeSize(void);
     virtual UInt64 createEventPipe(IO80211APIUserClient *);
     virtual void destroyEventPipe(IO80211APIUserClient *);
     virtual void postMessageIOUC(char const*,UInt,void *,unsigned long);
