@@ -1,8 +1,8 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-22（第六輪：SC 分類的真兇（`IOInterfaceType=71`）已解，Wi-Fi 硬體埠與服務成立；本輪補上 controller `+0x200` 介面指標、`IO80211Interface::init` 改走正規、刪掉「重試太早」與「IO80211 plane」兩個錯誤方向。剩下 airportd：infra 請求入口（`apple80211_ioctl(IO80211Interface*, …)`）還沒接）
+最後更新：2026-11-23（第八輪：量到注入 kext **只會綁到 live IO80211Family**（OpenCore 僅按宣告依賴解析符號），legacy 那條「Apple 自己用的路」對我們關閉；airportd 的 -3903 也不是在我們的節點上開 user client 造成的。唯一還沒封的路是把介面做成真正的 Skywalk（`IO80211InfraInterface` 子類）——§6.12.8）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v75**（`/tmp/vk75`）— kext 載入、en1、SC 認得 IEEE80211、`IO80211Interface::init` 正規、controller +0x200 已補；airportd 仍不認。v74/v64/v62/v52/vk48 都在
+VM 現況：**v87**（`/tmp/vk87`，Acer 上）— kext 載入、en1、SC 認得 IEEE80211、media 0x80 已發、controller +0x200 已補、新增 metaclass 綁定與 `newUserClient` 計數斷點；airportd 仍 `-3903`。v85/v84/v75/v64/v48 都留著
 
 ---
 
@@ -450,6 +450,86 @@ apple80211d ... Apple80211GetIfListCopy: exit -3903/0xfffff0c1, ifCount[0]
 - 下一步（真正的工程）：在 Ventura 上建一個 `IO80211InfraInterface` 子類（`OSDefineMetaClassAndStructors` 走 Apple 的 `IO80211InfraInterface::gMetaClass` 與 ctor，兩者在 live 都有：`0xffffff80020ee2a0`／`0xffffff800203f06c`），初始化序是 `IO80211InfraInterface::init()` → `IO80211SkywalkInterface::init(IOService*)`（Ventura 只有單參數版）→ `setInterfaceRole(1)`（`setInterfaceRole` 就是寫 `[ivars+0x50]`，正好是 `attachInterface(OSObject*,IOService*)` 檢查 role==1 的那格）→ `setSelfMacAddr()`，然後讓它自己向 skywalk stack 註冊、自己產生 BSD 單元；v1 `IO80211Interface` 那條線只留作 legacy 後備。
 
 
+
+### 6.12 第八輪（v85–v87）：綁定的是哪一份 IO80211？——live，而且 **legacy 那條路對注入 kext 是關的**
+
+#### 6.12.1 量測方法（可重用，一次開機就知道答案）
+
+Ventura 的 KC 同時有兩份完整 IO80211（`IO80211Family` 與 `IO80211FamilyLegacy`），mangled 名字完全一樣。新增斷點把「解析到的超類別 metaclass」與一個**只有單一份**的參考點（`IOPCIDevice`，來自 IOPCIFamily）相減：
+
+- `Ath10kCtrlMetaDelta`（`Ath10kPCIDevice::start()`，`super::start()` 之前）
+- `Ath10kIfaceMetaDelta`（`Ath10kVenturaInterface::init()`）
+
+位址差是 KASLR-slide 不變量，離線用 KC symtab 算好對照值即可：
+
+| | 期望 delta（對 IOPCIDevice） |
+|---|---|
+| `IO80211Controller` live | `-0xE02028` |
+| `IO80211Controller` legacy | `-0xC9E348` |
+| `IO80211Interface` live | `-0xE01FD0` |
+| `IO80211Interface` legacy | `-0xC9E318` |
+
+**v85 實測：controller = live、interface = live。**（兩者一致，不是混合。）
+
+#### 6.12.2 為什麼不是 legacy：OpenCore 只按宣告的依賴解析符號
+
+`OcAppleKernelLib/Link.c`：`InternalOcGetSymbolName()` **只搜 `Kext->Dependencies[]`**，順序是「kernel 先、再照 `OSBundleLibraries` 的 plist 順序」，沒有全域掃描。我們的 Info.plist 根本沒宣告任何 IO80211 依賴 → 一律由 dependency[0]=kernel 的符號表命中，而那份是 **live**。宣告 `com.apple.iokit.IO80211FamilyLegacy` 也沒用，kernel 排第一。→ **legacy 綁定對注入 kext 不可得，這條路封閉**（不必再試）。
+
+#### 6.12.3 Apple 自己在 13.7 用的是 legacy —— 但那是 prelinked kext 的特權
+
+`AirPortBrcmNIC.kext` 是 `IO80211FamilyLegacy.kext/Contents/PlugIns/` 裡的 plugin，`OSBundleLibraries = com.apple.iokit.IO80211FamilyLegacy 1200.12.2b1`。實查 KC：
+
+- `AirPort_BrcmNIC::superClass` → **legacy** `IO80211Controller`（`0x22519e8`）
+- `AirPort_BrcmNIC_Interface::superClass` → **legacy** `IO80211Interface`（`0x2251a18`）
+- 它覆寫 `apple80211_ioctl(IO80211Interface*, IO80211VirtualInterface*, __ifnet*, m, void*)` 與 `apple80211Request(ji P16IO80211Interface Pv)`——**5 參數 infra 入口存在於 legacy 表**。
+
+它在 KC 裡是 Apple 用 kmutil 依賴排序 prelink 的，所以拿得到 legacy；注入 kext 拿不到（6.12.2）。**結論：13.7 的「真機原生路徑」我們用不了，只能走 live（Skywalk 期）**。
+
+#### 6.12.4 兩份介面類別的 inheritance 實查（解釋為什麼 v1 永遠過不了 skywalk cast）
+
+| class | superClass |
+|---|---|
+| `IO80211Interface`（live 與 legacy 都一樣） | `IOEthernetInterface` |
+| `IO80211SkywalkInterface`（兩份） | `IOSkywalkEthernetInterface` |
+| `IO80211InfraInterface` | `IO80211SkywalkInterface`（各自綁自己那份） |
+
+live 的 `IO80211Interface` 只有 137 個符號、**沒有 `init(IONetworkController*)`／`start()`**；legacy 那份 826 個、實作齊全。我們的介面 `init` 之所以 `ok`，是因為那個 mangled 符號**只有 legacy 一份**（`0x21894ea`）——也就是說我們現在是「live 的 metaclass + legacy 的 init 實作」，這是 hybrid，遲早要面對。
+
+#### 6.12.5 airportd 到底卡在哪：**不是在我們的節點上開 user client**
+
+v86/v87 在介面與控制器都加了 `newUserClient` 計數器（`Ath10kNewUserClient` / `Ath10kCtrlNewUserClient`），並用使用者端程式驗證 harness 有效（自己 `IOServiceOpen` 控制器節點會讓計數 +1，type=1 → 0xe00002c7）。
+
+- 觸發 `networksetup -getairportpower en1` 之後：**控制器計數不變（4 → 4）**、介面計數仍不存在、`Ath10kApple80211Requests` 仍 1。
+- `ioreg -c IO80211APIUserClient` 實例數 0；對介面節點 `IOServiceOpen` 回 `0xe00002c2`（BadArgument），**而且我們的介面 `newUserClient` override 沒被呼叫**（回傳碼不是我們寫的 0xe00002c7）→ 這個 override 在介面節點上是死碼，介面端的計數結論無效，下一輪要先查它為什麼沒接上。
+- airportd 的 log 兩段都印：內層 `_getIfListCopy … count[1]`（我們的 en1 過了 media 關卡），外層 `Apple80211GetIfListCopy: exit -3903/0xfffff0c1, ifCount[0]`。→ **濾掉的動作發生在外層 wrapper，而且完全沒有對我們的任何節點開 user client。**
+
+#### 6.12.6 反組譯：attachInterface 與 user client 的硬條件（live）
+
+`IO80211Controller::attachInterface(OSObject*, IOService*)`（live `0x1fed7b8`）：
+
+```
+safeMetaCast(iface, IO80211SkywalkInterface::gMetaClass)  ; null -> logDebug "invalid skywalk interface", return false
+[this+0x120] -> ivars ; if (ivars[0x198] != 0) done
+rcx = [iface+0x110] ; if (*(int*)(rcx+0x50) != 1) done   ; role 必須 1
+ivars[0x198] = iface                                      ; getInfraInterface() 的來源
+```
+
+`IO80211APIUserClient::commonStart(provider)`（live `0x202445a`）第一行同樣是 `safeMetaCast(provider, IO80211SkywalkInterface::gMetaClass)`，失敗就 return false。
+
+→ 兩道門都要「物件本身是 Skywalk 介面」，而 v1 `IO80211Interface`（不管 live/legacy）繼承 `IOEthernetInterface`，**永遠不可能通過**。這條是硬的，不是時序或屬性問題。
+
+#### 6.12.7 OpenCore 支援「子類化 KC 裡的類別」
+
+`OcAppleKernelLib/Vtables.c`：對注入 kext 的 `__ZTV<Child>`，它會去找 **super class 的 vtable（已 patch 的那份）**，逐 slot 把子類沒覆寫的條目指向父類的實作（`ParentEntry->Name == NULL` 才略過）。→ 建 `Ath10kInfraInterface : IO80211InfraInterface` 在機制上是可行的，不需要每個 Apple 虛擬都匯出。
+
+#### 6.12.8 下一輪（唯一還沒被封的路）
+
+1. 建 `Ath10kInfraInterface : IO80211InfraInterface`（用 Apple 的 `gMetaClass`/ctor，`OSDefineMetaClassAndStructors`），初始化序照 §6.11：`IO80211InfraInterface::init()` → `IO80211SkywalkInterface::init(IOService*)` → `setInterfaceRole(1)`（就是寫 `[ivars+0x50]=1`）→ `setSelfMacAddr()`。
+2. 用 `IO80211Controller::attachInterface(OSObject*, IOService*)` 掛上去（**Apple `start()` 之後**、`ivars+0x198` 還是 null 時），斷點看回傳 true 且 `getInfraInterface()` 非 null。
+3. 先只做到這裡就開機量測：`ioreg -c IO80211InfraInterface` 有沒有實例、`Apple80211GetIfListCopy` 是否還 -3903、`ioreg -c IO80211APIUserClient` 是否出現。**這一步就能判斷「skywalk 介面存在」是不是 wrapper 的唯一門檻**，不必先解決 BSD 單元。
+4. 之後才是 datapath：Skywalk 註冊（`registerNetworkInterfaceWithLogicalLink`，需要 logical link 與 packet buffer pool）＋自己 `ifnet_allocate` 之後交給 `prepareBSDInterface(ifp, 0)`；v1 `IO80211Interface` 那條線只留作 SC 分類的後備。
+
+---
 
 ## 7. 下一個接手的人：照這個順序
 
