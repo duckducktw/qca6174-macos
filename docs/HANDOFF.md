@@ -413,6 +413,36 @@ IO80211Controller::apple80211_ioctl(IO80211VirtualInterface*, ifnet_t, u_int, vo
 ---
 
 
+### 6.11 第七輪（v76–v81）：airportd 的關卡是 **IFM_IEEE80211 medium**，不是 infra ioctl
+
+§6.10.5 的假設（缺 infra 請求入口）**已被反組譯否證**：live `__ZTV17IO80211Controller`（`0xffffff80020d86f8`）只有兩個 `apple80211_ioctl`（slot 405 Virtual / 406 Skywalk），5 參數的 infra 版本只存在於 legacy 那份（`0x2186bce`）。
+
+**真正的關卡從 airportd 自己的 log 讀出來**：
+
+```
+_getIfListCopy/ 7687: getifaddrs nInterfaces[ 12], count[  0]
+apple80211d ... Apple80211GetIfListCopy: exit -3903/0xfffff0c1, ifCount[0]
+```
+
+比對正常機器（UniversalControl gist）可看到接受時會印 `Added 'IFM_IEEE80211' supported interface` → `_getIfListCopy` 會對每個介面問 `SIOCGIFMEDIA`，**只收媒體含 `IFM_IEEE80211`（0x80）的介面**。空手時 `supported[0]=0x20`（IFM_ETHER autoselect），所以機場 d 一律丟掉，與 `IOInterfaceType`、`ifi_type`、`+0x200` 都無關。
+
+**修法（v80 起有效）**：
+
+1. `publishMediumDictionary()` 發 `IONetworkMedium::medium(kIOMediumIEEE80211Auto /*0x80*/, 54000000)` + `setCurrentMedium`/`setSelectedMedium`。
+2. **一定要在 `super::start()` 之後**：`publishMediumDictionary` 會鎖 `[this+0xc8]`，那把鎖在 `IONetworkController::start` 才配置，先呼叫就是 panic（實測 `createVenturaMediumTables+0x7d → _IOLockLock+0x3`，RDI=0）。
+3. **但只在 start 之後發也不夠**：介面的 ifmedia 清單在 attach 期間就建好，所以要在 `configureInterface()` 裡、`IOEthernetController::configureInterface()` **前後各發一次**（v80 實測 `Ath10kMediumPreBase/PostBase = 00000080|cur=00000080`，`ifconfig en1` 的 media 隨之改變）。
+4. `ifi_type` 留 71（airportd 端），但 `IOInterfaceType` property 留 6（SC 端）——兩個判準不同，別一起改。
+
+**v81 量測**：`_getIfListCopy: exit 0/0x00000000, ifCount[1]`（媒體關卡已過），但外層 `Apple80211GetIfListCopy` 仍 `-3903/ifCount[0]`，`networksetup -getairportpower en1` 仍 `Wireless is not available`，`ioreg` 沒有任何 `IO80211APIUserClient`。
+
+**剩下的牆（下一輪主題）**：外層 wrapper 會對找到的介面開 user client，而 live `IO80211APIUserClient::commonStart` 第一件事就是 `safeMetaCast(provider, IO80211SkywalkInterface)`；我們的 `Ath10kVenturaInterface : IO80211Interface`（v1）永遠過不了。同一個 cast 也是 `IO80211Controller::attachInterface(OSObject*,IOService*)` 收介面的條件（`"invalid skywalk interface"`，寫進 `[[this+0x120]+0x198]`，也就是 `getInfraInterface()` 的來源）。→ 要走的路是把 `src/kext/native/Ath10kNativeInterface`（Sequoia：`IO80211InfraProtocol` + `IO80211SkywalkInterface::init(controller, mac)`）**下放到 Ventura 的 `IO80211InfraInterface`**（`vendor/itlwm-v1/Airport/IO80211InfraInterface.h`，`IO80211InfraInterface : IO80211SkywalkInterface`）。
+
+**這一輪重建的環境工具（Acer `~/qca-tools/`，本機同名副本）**：`dm_map.sh`（重建 `/dev/mapper/ventura-ro`：gpt-head.img＋`/dev/nvme0n1p2`＋gpt-tail.img）、`vfio_bind.sh`、`build_v.sh`、`pull_v.sh NN`、`esp_fix.sh [bundle]`、`boot_nokext.sh`（kext 會 panic 時先停用再編譯）、`press_enter.sh`（OpenCore 卡選單時送 `sendkey ret`）、`shot.sh`、`oc_enable.py`（ShowPicker=True/Timeout=3，`ShowPicker=False` 在沒有預設開機項目時仍會卡選單）、`oc_toggle.py`、`media-probe.c`。
+
+**其他實測**：`IOEthernetController` 沒有 `createMediumTables` 這個虛擬（只有各家驅動自己的同名函式）；`IONetworkController::publishMediumDictionary` 在 `0xffffff8002c5f924`；`IONetworkStack` 會把介面節點的 `IOUserClientClass` 蓋成 `IONetworkStackUserClient`（en0 也一樣，所以那條屬性不是 airportd 的入口）。
+
+
+
 ## 7. 下一個接手的人：照這個順序
 
 ### 7.1 重疊的發布路徑（**v52 已完成**）
