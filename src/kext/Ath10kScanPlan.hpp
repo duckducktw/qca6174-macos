@@ -10,6 +10,9 @@ static constexpr WMIScanChannel kWMIScanPlan[]={
 static constexpr UInt32 kWMIScanChannelCount=sizeof(kWMIScanPlan)/sizeof(kWMIScanPlan[0]);
 static_assert(kWMIScanChannelCount<64,"scan masks use 64 bits");
 static constexpr UInt32 kWMIScanDwellMs=500, kWMIScanFirmwareMs=30000, kWMIScanHostMs=35000;
+// Ventura's airportd abandons a scan request after ~20 s, so the interactive
+// sweep uses one beacon interval per channel instead of the diagnostic 500 ms.
+static constexpr UInt32 kWMIScanAirportdDwellMs=110;
 // Conservative host descriptor ceiling, not a regulatory database or TX authorization.
 static constexpr UInt8 kWMIScanPowerHalfDbm=20;
 inline bool wmiScanChannelAllowed(UInt32 channel){

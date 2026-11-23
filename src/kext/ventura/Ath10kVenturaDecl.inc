@@ -93,6 +93,15 @@ private:
     IOReturn venturaAssociate(const apple80211_assoc_data *request);
     void venturaDisassociate(bool deauth);
     IOReturn venturaScanResult(apple80211_scan_result *result);
+    // Served by venturaScanResult(). The 13.7 SDK header advertises a pointer
+    // for asr_ie_data, but macOS 12+ made it a 1024-byte inline array packed
+    // straight after asr_ie_len; airportd's req_len is the only honest signal
+    // for which shape to write, so performCommand records it here.
+    UInt32 _venturaIoctlLength = 0;
+    UInt32 _venturaScanRequests = 0;
+    UInt32 _venturaScanRearms = 0;
+    UInt32 _venturaScanServed = 0;
+    UInt32 _venturaScanEnds = 0;
     SInt32 venturaChannel(void *data, bool isSet);
     SInt32 venturaDispatchRequest(unsigned int requestType, int requestNumber,
                                   IO80211Interface *iface, void *data);
@@ -120,6 +129,18 @@ private:
     UInt32 _vifPublishAttempts = 0;
     static void vifPublishCall(thread_call_param_t, thread_call_param_t);
     void runVifPublish();
+    // airportd collects scan results only after the scan-finished signal; the v1
+    // interface has no postMessage on the live family, so this polls the shared
+    // scan state from a delayed call and reports what the event route did.
+    thread_call_t _scanNotifyCall = nullptr;
+    UInt32 _scanNotifyAttempts = 0;
+    UInt32 _scanNotifyGeneration = 0;
+    static void scanNotifyCall(thread_call_param_t, thread_call_param_t);
+    void runScanNotify();
+    // [iframeIvars+0x208]: the event pipe Skywalk registration would install. Read
+    // (never written) here so "events cannot be delivered" is a measurement.
+    void *_venturaEventPipe = nullptr;
+    bool _venturaScanNotifySent = false;
     bool _venturaPowerOn = false;
     UInt32 _venturaState = APPLE80211_S_INIT;
     UInt8 _venturaScanIndex = 0;
@@ -130,5 +151,15 @@ private:
     UInt32 _venturaLastRequest = 0xffffffffu;
     bool _venturaLastRequestIsSet = false;
     SInt32 _venturaLastRequestStatus = 0;
+    // Rolling window of the last requests, so a client that stops asking after a
+    // particular getter can be told apart from one that was never talking to us.
+    static constexpr UInt32 kVenTraceSlots = 16;
+    struct VenturaTraceEntry {
+        UInt32 type = 0;
+        UInt32 status = 0;
+        bool isSet = false;
+    } _venturaTrace[kVenTraceSlots]{};
+    UInt32 _venturaTraceNext = 0;
+    UInt32 _venturaTraceCount = 0;
 
 public:

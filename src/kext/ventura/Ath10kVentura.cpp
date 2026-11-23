@@ -31,6 +31,19 @@ extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifne
 static IO80211Interface *gVenturaPublishedInterface = nullptr;
 static UInt32 gVenturaCreateCalls = 0;
 
+// apple80211_scan_result as airportd sees it on 13.x: packed, with asr_ie_data
+// inline. The 13.7 SDK header we build against still describes the pointer-era
+// layout, so the offsets are asserted rather than trusted: version 0x00,
+// asr_channel 0x04, asr_rates 0x24, asr_ssid 0x61, asr_age 0x84, asr_ie_len
+// 0x8a, then 1024 bytes of IE data at 0x8c (no asr_unk3 field after 12.0).
+#define ATH10K_SCAN_IE_OFFSET 0x8cu
+static_assert(__builtin_offsetof(apple80211_scan_result, asr_ie_len) == 0x8a,
+              "apple80211_scan_result: asr_ie_len moved");
+static_assert(__builtin_offsetof(apple80211_scan_result, asr_ssid) == 0x61,
+              "apple80211_scan_result: asr_ssid moved");
+static_assert(__builtin_offsetof(apple80211_scan_result, asr_rates) == 0x24,
+              "apple80211_scan_result: asr_rates moved");
+
 IONetworkInterface *Ath10kPCIDevice::createInterface()
 {
     Ath10kVenturaInterface *interface = new Ath10kVenturaInterface;
@@ -842,7 +855,28 @@ SInt32 Ath10kPCIDevice::venturaRecordRequest(UInt requestType, int requestNumber
     _venturaLastRequestIsSet = requestType == 1;
     const SInt32 status = venturaDispatchRequest(requestType, requestNumber, nullptr, data);
     _venturaLastRequestStatus = status;
+    // Keep the last few (verb, type, status) triples: "the client stopped asking
+    // after request N" is only diagnosable from the sequence, not from the last
+    // single request. airportd's scans begin with a batch of small getters, and a
+    // refused one there aborts the scan without ever sending SCAN_REQ.
+    _venturaTrace[_venturaTraceNext].isSet = requestType == 1;
+    _venturaTrace[_venturaTraceNext].type = static_cast<UInt32>(requestNumber);
+    _venturaTrace[_venturaTraceNext].status = static_cast<UInt32>(status);
+    _venturaTraceNext = (_venturaTraceNext + 1) % kVenTraceSlots;
+    if (_venturaTraceCount < kVenTraceSlots)
+        ++_venturaTraceCount;
     if (IOService *provider = getProvider()) {
+        char trace[kVenTraceSlots * 24];
+        trace[0] = 0;
+        const UInt32 first = (_venturaTraceCount == kVenTraceSlots) ? _venturaTraceNext : 0;
+        for (UInt32 i = 0; i < _venturaTraceCount; ++i) {
+            const UInt32 slot = (first + i) % kVenTraceSlots;
+            char item[24];
+            snprintf(item, sizeof(item), "%s%u=%x ", _venturaTrace[slot].isSet ? "s" : "g",
+                     _venturaTrace[slot].type, _venturaTrace[slot].status);
+            strlcat(trace, item, sizeof(trace));
+        }
+        provider->setProperty("Ath10kRequestTrace", trace);
         provider->setProperty("Ath10kApple80211Requests",
                               static_cast<UInt64>(_venturaRequestCount), 32);
         provider->setProperty("Ath10kLastApple80211Request",
@@ -950,6 +984,17 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
     case APPLE80211_IOC_SCANCACHE_CLEAR:
         _venturaScanIndex = 0;
         return kIOReturnSuccess;
+    case APPLE80211_IOC_VIRTUAL_IF_ROLE:
+    case APPLE80211_IOC_VIRTUAL_IF_PARENT:
+        // The live family answers these from its own vif bookkeeping, and the ioctl
+        // channel never reaches that code: performCommand lands straight in this
+        // dispatcher. Measured consequence of refusing them: CoreWLAN asks
+        // SUPPORTED_CHANNELS, BSSID, POWER and then VIRTUAL_IF_ROLE, gets
+        // kIOReturnUnsupported and gives up with an empty list without ever
+        // sending SCAN_REQ. Role 0 is the primary station interface (P2P/AWDL/
+        // SoftAP are 1..5), and this interface has no virtual parent, so the
+        // zero-filled buffer is the correct answer for both.
+        return kIOReturnSuccess;
     case APPLE80211_IOC_ASSOCIATE:
         return venturaAssociate(static_cast<apple80211_assoc_data *>(data));
     case APPLE80211_IOC_DISASSOCIATE:
@@ -1003,10 +1048,78 @@ IOReturn Ath10kPCIDevice::venturaPower(bool on)
     return kIOReturnSuccess;
 }
 
-IOReturn Ath10kPCIDevice::venturaScan(const apple80211_scan_data *)
+IOReturn Ath10kPCIDevice::venturaScan(const apple80211_scan_data *request)
 {
+    (void)request;
     _venturaScanIndex = 0;
+    ++_venturaScanRequests;
+    // serviceWMIScan() is a one-shot: it returns as soon as it completes, so
+    // without re-arming, airportd would be served the beacon set captured at
+    // boot forever. Re-arm the shared state machine here (never hand-build a
+    // WMI frame: the credit/DMA ownership lives in there) and keep the cache:
+    // the previous BSS list stays servable while the fresh sweep runs.
+    bool rearmed = false;
+    if (_wmiScan.completed && !_wmiScan.txOwned && !_dmaQuarantine && _wmiLive.active) {
+        _wmiScan.attempted = false;
+        _wmiScan.submitted = false;
+        _wmiScan.txOwned = false;
+        _wmiScan.txConsumed = false;
+        _wmiScan.creditReturned = false;
+        _wmiScan.started = false;
+        _wmiScan.terminal = false;
+        _wmiScan.failed = false;
+        _wmiScan.completed = false;
+        _wmiScan.cancelRequested = false;
+        _wmiScan.stopSubmitted = false;
+        _wmiScan.stopConsumed = false;
+        _wmiScan.eventCount = 0;
+        _wmiScan.lastType = 0;
+        _wmiScan.reason = 0;
+        _wmiScan.frequency = 0;
+        _wmiScan.mgmtCount = 0;
+        _wmiScan.mgmtBytes = 0;
+        _wmiScan.visitedMask = 0;
+        _wmiScan.channelInfoCount = 0;
+        _wmiScan.channelInfoErrors = 0;
+        _wmiScan.channelInfoMask = 0;
+        _wmiScan.elapsedMs = 0;
+        _wmiScan.status = "rearmed-for-airportd";
+        ++_wmiScan.generation;
+        _wmiScan.id = 0xa000u | ((0x36u + _wmiScan.generation) & 0xfffu);
+        ++_venturaScanRearms;
+        rearmed = true;
+    }
+    if (IOService *probe = getProvider()) {
+        probe->setProperty("Ath10kScanRequests", static_cast<UInt64>(_venturaScanRequests), 32);
+        probe->setProperty("Ath10kScanRearms", static_cast<UInt64>(_venturaScanRearms), 32);
+        probe->setProperty("Ath10kScanScanId", static_cast<UInt64>(_wmiScan.id), 32);
+        probe->setProperty("Ath10kScanArmed", rearmed);
+    }
+    if (rearmed) {
+        // Watch for the sweep to finish, then try to tell airportd (see runScanNotify).
+        if (_scanNotifyCall == nullptr) {
+            _scanNotifyCall = thread_call_allocate_with_options(
+                scanNotifyCall, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+        }
+        if (_scanNotifyCall != nullptr) {
+            _scanNotifyAttempts = 0;
+            _scanNotifyGeneration = _wmiScan.generation;
+            uint64_t deadline = 0;
+            clock_interval_to_deadline(1, kSecondScale, &deadline);
+            thread_call_enter_delayed(_scanNotifyCall, deadline);
+        }
+    }
     return kIOReturnSuccess;
+}
+
+// 80211 channel -> apple80211 flags. Everything we scan is a 20 MHz channel on
+// a plan of passive/active entries; airportd only uses the band bit to sort the
+// list, and the width bits to draw the badge.
+static UInt32 venturaScanChannelFlags(UInt32 channel)
+{
+    UInt32 flags = APPLE80211_C_FLAG_ACTIVE | APPLE80211_C_FLAG_20MHZ;
+    flags |= (channel <= 14) ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ;
+    return flags;
 }
 
 IOReturn Ath10kPCIDevice::venturaScanResult(apple80211_scan_result *result)
@@ -1015,7 +1128,73 @@ IOReturn Ath10kPCIDevice::venturaScanResult(apple80211_scan_result *result)
         return kIOReturnBadArgument;
     memset(result, 0, sizeof(*result));
     result->version = APPLE80211_VERSION;
-    return kIOReturnNotFound;
+
+    // Cursor protocol: one BSS per call, end signalled with a non-zero return.
+    // airportd stops reading at the first failure, so handing it the whole
+    // array in a single call leaves every entry after the first unread.
+    while (_venturaScanIndex < _wmiBSS.count &&
+           _wmiBSS.entries[_venturaScanIndex].ssidLength == 0)
+        ++_venturaScanIndex;
+    if (_venturaScanIndex >= _wmiBSS.count) {
+        ++_venturaScanEnds;
+        if (IOService *probe = getProvider()) {
+            probe->setProperty("Ath10kScanServed", static_cast<UInt64>(_venturaScanServed), 32);
+            probe->setProperty("Ath10kScanEnds", static_cast<UInt64>(_venturaScanEnds), 32);
+            probe->setProperty("Ath10kScanCached", static_cast<UInt64>(_wmiBSS.count), 32);
+        }
+        return kIOReturnNotFound;
+    }
+
+    const Ath10k::WMIBSS &entry = _wmiBSS.entries[_venturaScanIndex++];
+    const UInt32 channel = entry.advertisedChannel != 0 ? entry.advertisedChannel
+                                                        : entry.rxChannel;
+    result->asr_channel.version = APPLE80211_VERSION;
+    result->asr_channel.channel = channel;
+    result->asr_channel.flags = venturaScanChannelFlags(channel);
+    // The management event only carries SNR, so the noise floor has to come from
+    // the firmware stats request; until that lands, use a typical QCA floor so
+    // the UI does not show a signal of 0 dBm (which sorts every AP as strongest).
+    const SInt16 noise = (_connection.fwStats.noiseValid &&
+                          _connection.fwStats.noiseDbm > -128)
+                             ? static_cast<SInt16>(_connection.fwStats.noiseDbm)
+                             : static_cast<SInt16>(-95);
+    const SInt16 snr = static_cast<SInt16>(entry.snr > 127 ? 127 : entry.snr);
+    result->asr_noise = noise;
+    result->asr_snr = snr;
+    result->asr_rssi = static_cast<SInt16>(noise + snr);
+    result->asr_beacon_int = static_cast<SInt16>(entry.beaconInterval);
+    result->asr_cap = static_cast<SInt16>(entry.capabilities);
+    memcpy(result->asr_bssid, entry.bssid, sizeof(result->asr_bssid));
+    result->asr_ssid_len = entry.ssidLength;
+    memcpy(result->asr_ssid, entry.ssid, entry.ssidLength);
+    // asr_rates are 500 kbps units; the beacon carries the 0x80 "basic" flag.
+    UInt8 rates = 0;
+    for (UInt32 i = 0; i < entry.rateCount && rates < APPLE80211_MAX_RATES; ++i)
+        result->asr_rates[rates++] = entry.rates[i] & 0x7fu;
+    result->asr_nrates = rates;
+    result->asr_age = 0; // served live, not from a persisted cache
+
+    // The RSN element goes into asr_ie_data. Which shape that member has depends
+    // on the caller's ABI, not on our header: macOS 12+ replaced the pointer with
+    // a 1024-byte inline array packed immediately after asr_ie_len, and only the
+    // family itself knows which one airportd compiled against. req_len is the
+    // only honest signal, so nothing is written beyond what the caller asked for.
+    const UInt32 ieLen = entry.rsnPresent ? entry.rsnLength : 0;
+    if (ieLen != 0 && _venturaIoctlLength >= ATH10K_SCAN_IE_OFFSET + ieLen) {
+        memcpy(reinterpret_cast<UInt8 *>(result) + ATH10K_SCAN_IE_OFFSET,
+               entry.rsn, entry.rsnLength);
+        result->asr_ie_len = static_cast<SInt16>(ieLen);
+    }
+
+    ++_venturaScanServed;
+    if (IOService *probe = getProvider()) {
+        probe->setProperty("Ath10kScanServed", static_cast<UInt64>(_venturaScanServed), 32);
+        probe->setProperty("Ath10kScanEnds", static_cast<UInt64>(_venturaScanEnds), 32);
+        probe->setProperty("Ath10kScanCached", static_cast<UInt64>(_wmiBSS.count), 32);
+        probe->setProperty("Ath10kScanIeLen", static_cast<UInt64>(ieLen), 32);
+        probe->setProperty("Ath10kScanReqLen", static_cast<UInt64>(_venturaIoctlLength), 32);
+    }
+    return kIOReturnSuccess;
 }
 
 IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *)
@@ -1064,7 +1243,24 @@ SInt32 Ath10kPCIDevice::venturaSupportedChannels(void *data)
 {
     apple80211_sup_channel_data *channels = static_cast<apple80211_sup_channel_data *>(data);
     channels->version = APPLE80211_VERSION;
-    channels->num_channels = 0;
+    // Report the channels the scan plan actually sweeps. An empty list is not
+    // neutral: measured with num_channels=0, CoreWLAN asks POWER/BSSID/ROLE and
+    // then returns an empty network list without ever sending SCAN_REQ, so the UI
+    // never sees an access point at all.
+    UInt32 count = 0;
+    for (UInt32 i = 0; i < Ath10k::kWMIScanChannelCount && count < APPLE80211_MAX_CHANNELS;
+         ++i) {
+        const UInt32 channel = Ath10k::kWMIScanPlan[i].channel;
+        if (!Ath10k::wmiScanChannelAllowed(channel))
+            continue;
+        channels->supported_channels[count].version = APPLE80211_VERSION;
+        channels->supported_channels[count].channel = channel;
+        channels->supported_channels[count].flags = venturaScanChannelFlags(channel);
+        ++count;
+    }
+    channels->num_channels = count;
+    if (IOService *probe = getProvider())
+        probe->setProperty("Ath10kSupportedChannels", static_cast<UInt64>(count), 32);
     return kIOReturnSuccess;
 }
 
@@ -1126,7 +1322,16 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
     // the v1 interface node in Ath10kVenturaInterface::attachToDataLinkLayer(),
     // which is where the BSD name first exists.
     const bool attached = ath10kAttachSkywalkInterface(this, vif, this);
+    // The event pipe lives behind the interface's ivar block at +0x208. Nothing in
+    // the live family writes that slot (measured over the whole __TEXT), so a null
+    // here means airportd can never be signalled — worth recording as a number.
+    if (*ivarsSlot != nullptr) {
+        _venturaEventPipe = *reinterpret_cast<void **>(
+            reinterpret_cast<char *>(*ivarsSlot) + 0x208);
+    }
     if (probe) {
+        probe->setProperty("Ath10kVifEventPipe",
+                           static_cast<UInt64>(reinterpret_cast<uintptr_t>(_venturaEventPipe)), 64);
         probe->setProperty("Ath10kInfraAttach", attached ? "ok" : "failed");
         probe->setProperty("Ath10kInfraPhase", attached ? "attached" : "attach-failed");
         probe->setProperty("Ath10kInfraIf",
@@ -1134,6 +1339,50 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
     }
     IOLog("Ath10kMac: infra attach vif %p -> %d\n", vif, (int)attached);
     return vif;
+}
+
+// airportd only collects scan results after the driver says the scan finished, and
+// the live v1 interface has no postMessage of its own (that symbol exists only in
+// the legacy bundle). The controller's gated postMessage is the remaining route;
+// it ends in the interface's event pipe, so the pipe pointer is checked first and
+// the outcome is published rather than assumed.
+extern "C" void ath10kControllerPostMessage(IO80211Controller *self, UInt type, void *data,
+                                            UInt len, void *extra)
+    __asm("__ZN17IO80211Controller11postMessageEjPvmjS0_");
+
+void Ath10kPCIDevice::scanNotifyCall(thread_call_param_t param0, thread_call_param_t)
+{
+    auto *self = static_cast<Ath10kPCIDevice *>(param0);
+    if (self != nullptr)
+        self->runScanNotify();
+}
+
+void Ath10kPCIDevice::runScanNotify()
+{
+    IOService *probe = getProvider();
+    if (probe == nullptr)
+        return;
+    // Only the scan that was armed when this was scheduled matters.
+    if (_wmiScan.generation != _scanNotifyGeneration)
+        return;
+    if (!_wmiScan.completed) {
+        if (++_scanNotifyAttempts <= 20 && _scanNotifyCall != nullptr) {
+            uint64_t deadline = 0;
+            clock_interval_to_deadline(1, kSecondScale, &deadline);
+            thread_call_enter_delayed(_scanNotifyCall, deadline);
+        }
+        return;
+    }
+    probe->setProperty("Ath10kScanCompletedMs", static_cast<UInt64>(_wmiScan.elapsedMs), 64);
+    if (_venturaEventPipe == nullptr) {
+        // No event pipe: Skywalk registration is what installs it, so airportd is
+        // left polling nothing and abandons the scan with -3905.
+        probe->setProperty("Ath10kScanEvent", "no-event-pipe");
+        return;
+    }
+    ath10kControllerPostMessage(this, APPLE80211_M_SCAN_DONE, nullptr, 0, nullptr);
+    _venturaScanNotifySent = true;
+    probe->setProperty("Ath10kScanEvent", "posted-scan-done");
 }
 
 // The filter keeps an interface only when IORegistryEntryCreateCFProperty(entry,

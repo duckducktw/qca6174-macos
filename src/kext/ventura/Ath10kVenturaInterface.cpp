@@ -364,8 +364,14 @@ SInt32 Ath10kVenturaInterface::performCommand(IONetworkController *controller, u
         return EINVAL;
     struct apple80211req req;
     memcpy(&req, arg1, sizeof(req));
-    if (probe != nullptr)
+    if (probe != nullptr) {
         probe->setProperty("Ath10kIoctlType", static_cast<UInt64>(static_cast<UInt32>(req.req_type)), 32);
+        probe->setProperty("Ath10kIoctlReqLen", static_cast<UInt64>(static_cast<UInt32>(req.req_len)), 32);
+    }
+    // Getter replies have ABI-dependent shapes (asr_ie_data is an inline array
+    // from 12.0 on, a pointer before that), and req_len is the only honest
+    // signal for which one airportd compiled against. Record it before dispatch.
+    _owner->_venturaIoctlLength = req.req_len;
 
     // Payload buffer. req_len is authoritative for the caller's buffer, but a
     // getter may be asked for less than the structure it fills, so allocate a

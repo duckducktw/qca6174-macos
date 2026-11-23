@@ -3129,6 +3129,13 @@ const char *Ath10kPCIDevice::serviceWMIScan(UInt64 nowMs)
 #else
             Ath10k::kWMIScanDwellMs
 #endif
+#ifdef ATH10K_VENTURA
+            // airportd gives a scan request ~20 s. The boot-time diagnostic sweep
+            // uses 500 ms per channel, which over this 38-channel plan is longer
+            // than that budget and was measured to end in its -3905 timeout, so
+            // the Ventura path dwells for 110 ms (just over one beacon interval).
+            ,Ath10k::kWMIScanAirportdDwellMs
+#endif
             )) return state.status;
         const UInt32 frameBytes=8+Ath10k::htcReadLE16(static_cast<const UInt8 *>(_wmiTxBuffer.virtualAddress())+2);
         state.txSlot=snap.srcWriteIndex;state.txNext=Ath10k::ceRingNext(state.txSlot,entries);
