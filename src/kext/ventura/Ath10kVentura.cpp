@@ -659,6 +659,27 @@ void Ath10kPCIDevice::runVifPublish()
     IOService *provider = getProvider();
     if (provider == nullptr)
         return;
+    // Stamp the 80211 user client class on the interface we published, every time
+    // this retry runs: airportd opens a user client on that node and
+    // IOService::newUserClient picks the class from IOUserClientClass, which
+    // IONetworkStack overwrites with its own client when it attaches the unit to
+    // BSD - i.e. after our init() ran. This runs seconds later, so it is the
+    // earliest point where the stamp can survive. (Do not extend the retry count
+    // for this: publishVenturaVifBsdUnit() panics inside Skywalk's
+    // prepareBSDInterface once the vif has been handed an ifnet.)
+    if (_venturaInterface != nullptr) {
+        OSString *beforeClient =
+            OSDynamicCast(OSString, _venturaInterface->getProperty("IOUserClientClass"));
+        provider->setProperty("Ath10kUserClientBefore",
+                              beforeClient != nullptr ? beforeClient->getCStringNoCopy() : "null");
+        _venturaInterface->setProperty("IOUserClientClass", "IO80211APIUserClient");
+        OSString *afterClient =
+            OSDynamicCast(OSString, _venturaInterface->getProperty("IOUserClientClass"));
+        provider->setProperty("Ath10kUserClientAfter",
+                              afterClient != nullptr ? afterClient->getCStringNoCopy() : "null");
+        provider->setProperty("Ath10kUserClientAttempt",
+                              static_cast<UInt64>(_vifPublishAttempts), 32);
+    }
     if (_venturaVif == nullptr) {
         provider->setProperty("Ath10kVifPublishRetry", "no-vif");
         return;
@@ -711,6 +732,25 @@ void Ath10kPCIDevice::runVifPublish()
     // object was in hand. Do NOT re-scan the registry from here: the
     // getMatchingServices() pass wedged the kernel ("registry root held busy,
     // kernelmanagerd has not checked in") three seconds into start().
+    // Stamp the 80211 user client class on the interface we published: airportd
+    // opens a user client on that node and IOService::newUserClient picks the
+    // class from IOUserClientClass, which IONetworkStack overwrites with its own
+    // client when it attaches the unit to BSD - i.e. after our init() ran. This
+    // retry runs seconds later, so it is the earliest point where the stamp can
+    // survive. Both the value found and the value written are recorded.
+    if (_venturaInterface != nullptr) {
+        OSString *beforeClient =
+            OSDynamicCast(OSString, _venturaInterface->getProperty("IOUserClientClass"));
+        provider->setProperty("Ath10kUserClientBefore",
+                              beforeClient != nullptr ? beforeClient->getCStringNoCopy() : "null");
+        _venturaInterface->setProperty("IOUserClientClass", "IO80211APIUserClient");
+        OSString *afterClient =
+            OSDynamicCast(OSString, _venturaInterface->getProperty("IOUserClientClass"));
+        provider->setProperty("Ath10kUserClientAfter",
+                              afterClient != nullptr ? afterClient->getCStringNoCopy() : "null");
+        provider->setProperty("Ath10kUserClientAttempt",
+                              static_cast<UInt64>(_vifPublishAttempts), 32);
+    }
     // Record what the registry looks like from here three seconds in: during
     // start() the controller's children are only the corecapture pipes and the
     // vif, and the same walk still found no "BSD Name" child.
@@ -749,7 +789,7 @@ void Ath10kPCIDevice::runVifPublish()
     // run by the time of the ioreg read). Re-arm instead of giving up, so the
     // controller ivar lands as soon as the interface exists.
     const bool installed = *reinterpret_cast<void **>(reinterpret_cast<char *>(this) + 0x200) != nullptr;
-    if (!installed && ++_vifPublishAttempts <= 8 && _vifPublishCall != nullptr) {
+    if (_vifPublishCall != nullptr && !installed && ++_vifPublishAttempts <= 8) {
         uint64_t deadline = 0;
         clock_interval_to_deadline(5, kSecondScale, &deadline);
         thread_call_enter_delayed(_vifPublishCall, deadline);

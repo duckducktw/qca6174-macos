@@ -441,6 +441,14 @@ apple80211d ... Apple80211GetIfListCopy: exit -3903/0xfffff0c1, ifCount[0]
 
 **其他實測**：`IOEthernetController` 沒有 `createMediumTables` 這個虛擬（只有各家驅動自己的同名函式）；`IONetworkController::publishMediumDictionary` 在 `0xffffff8002c5f924`；`IONetworkStack` 會把介面節點的 `IOUserClientClass` 蓋成 `IONetworkStackUserClient`（en0 也一樣，所以那條屬性不是 airportd 的入口）。
 
+**追加（v82–v84）：user client 這關換屬性也過不去**
+
+- 在延遲重試裡把介面節點的 `IOUserClientClass` 改回 `IO80211APIUserClient`（`Ath10kUserClientBefore/After` 都錄到、`ioreg` 也確認節點上是 `IO80211APIUserClient`），**airportd 仍然 `Apple80211GetIfListCopy: exit -3903, ifCount[0]`，`class IO80211APIUserClient` 實例數 0**。
+- 所以問題不在「節點有沒有廣告 user client」，而在 **class 本身**：live `IO80211APIUserClient::commonStart` 第一件事就是 `safeMetaCast(provider, IO80211SkywalkInterface)`，我們的 v1 介面過不了，`IOServiceOpen` 直接失敗，外層 wrapper 就把介面濾掉。
+- **`IO80211InfraInterface` 不是 `IONetworkInterface`**：`__ZTV21IO80211InfraInterface`（`0xffffff80020e4700`）裡 0 個 `IONetworkInterface` slot，整條是 `IOSkywalkEthernetInterface → IOSkywalkNetworkInterface → IOSkywalkInterface`。所以**不能**直接讓 `createInterface()` 回傳它——13.7 上 Skywalk 介面的 BSD 單元是走 skywalk 自己的 `prepareBSDInterface(ifnet, unit)`／`registerNetworkInterface`，不是 `attachInterface(IONetworkInterface **, bool)`。
+- 這也解釋了為什麼 `publishVenturaVifBsdUnit()` 會 panic：把 ifnet 交給沒向 skywalk stack 註冊過的 vif，`IOSkywalkNetworkInterface::prepareBSDInterface+0x1a` 直接炸（v83 的 backtrace：`publishVenturaVifBsdUnit+0x685 → IO80211VirtualInterface::prepareBSDInterface → IO80211SkywalkInterface::prepareBSDInterface → IOSkywalkEthernetInterface::prepareBSDInterface → IOSkywalkNetworkInterface::prepareBSDInterface`）。**不要為了別的診斷把重試次數拉長**，那只會多炸幾次。
+- 下一步（真正的工程）：在 Ventura 上建一個 `IO80211InfraInterface` 子類（`OSDefineMetaClassAndStructors` 走 Apple 的 `IO80211InfraInterface::gMetaClass` 與 ctor，兩者在 live 都有：`0xffffff80020ee2a0`／`0xffffff800203f06c`），初始化序是 `IO80211InfraInterface::init()` → `IO80211SkywalkInterface::init(IOService*)`（Ventura 只有單參數版）→ `setInterfaceRole(1)`（`setInterfaceRole` 就是寫 `[ivars+0x50]`，正好是 `attachInterface(OSObject*,IOService*)` 檢查 role==1 的那格）→ `setSelfMacAddr()`，然後讓它自己向 skywalk stack 註冊、自己產生 BSD 單元；v1 `IO80211Interface` 那條線只留作 legacy 後備。
+
 
 
 ## 7. 下一個接手的人：照這個順序
