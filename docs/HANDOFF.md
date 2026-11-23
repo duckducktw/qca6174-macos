@@ -1,8 +1,8 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-23（第十輪：airportd 終於認得 en1（`Wi-Fi Power (en1): Off`），門是 `IOInterfaceName`＋`IO80211InterfaceRole="Infrastructure"`；剩下的卡點是 family 自己的 user client 協議（請求還沒進到驅動）—— 詳見 §6.14。原第八輪：量到注入 kext **只會綁到 live IO80211Family**（OpenCore 僅按宣告依賴解析符號），legacy 那條「Apple 自己用的路」對我們關閉；airportd 的 -3903 也不是在我們的節點上開 user client 造成的。唯一還沒封的路是把介面做成真正的 Skywalk（`IO80211InfraInterface` 子類）——§6.12.8）
+最後更新：2026-11-24（第十一輪：**請求通道打通**。airportd 走的是 **ifnet ioctl 備援**（`SIOCGA80211`/`SIOCSA80211` → `performCommand`），不是 family 的 user client；`Ath10kApple80211Requests` 從 1 跳到 318，`networksetup -getairportpower en1` 回 **`Wi-Fi Power (en1): On`**。詳見 §6.15。第十輪：airportd 認得 en1，門是 `IOInterfaceName`＋`IO80211InterfaceRole="Infrastructure"`（§6.14）。）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v110**（`/tmp/vk110`，Acer 上；v108/v94/v87 可對照）— kext 載入、en1、SC 認得 IEEE80211、media 0x80 已發、controller +0x200 已補、新增 metaclass 綁定與 `newUserClient` 計數斷點；airportd 仍 `-3903`。v85/v84/v75/v64/v48 都留著
+VM 現況：**v115**（`/tmp/vk115`，Acer 上）— kext 載入、en1 `UP,RUNNING`、SC 認得 IEEE80211、`Wi-Fi` 硬體埠、airportd 已 bind（ioctl 通道）、power 查詢答 `On`、請求計數 318。掃描/關聯仍是 stub（§7.3），所以選單還看不到 AP。v110（舊可用版）/v113（ioctl 首版，copyin 誤判）/v94/v87 都留著
 
 ---
 
@@ -14,8 +14,8 @@ VM 現況：**v110**（`/tmp/vk110`，Acer 上；v108/v94/v87 可對照）— ke
 |---|---|---|
 | **A** | `Ath10kIfacePhase = "inited"`、`Ath10kStartPhase = "controller-started"` | ✅ 已達成（Apple 的 `start()` 是唯一 publisher） |
 | **B** | `ioreg -r -c IO80211Interface` ≥1 筆且有 `BSD Name`；`networksetup -listallhardwareports` 出現 Wi-Fi | ✅ 已達成（v64 起 `SCNetworkInterfaceCopyAll()` 第 3 筆 = `en1 type=IEEE80211`，Wi-Fi 硬體埠成立；一旦替它建了服務，`listallhardwareports` 會把它當「已設定」而不列，屬正常） |
-| **C** | 「系統設定 → Wi-Fi」可見、開關可操作（截圖為證） | 🟡 一半（埠有了、服務有了；但 airportd 說 `Wireless is not available`，因為 controller 的 +0x200 介面指標是 null，airportd 找不到裝置，見 §6.9） |
-| **D** | 可掃描到 AP 並以 WPA2 連線取得 IP | ❌ 未達成（scan/associate 仍是 stub，§7.3；且 airportd 還沒接上） |
+| **C** | 「系統設定 → Wi-Fi」可見、開關可操作 | 🟢 幾乎（v115：airportd 已 bind、`networksetup -getairportpower en1` 回 `Wi-Fi Power (en1): On`、en1 `UP,RUNNING`、`Wi-Fi` 硬體埠在；登入畫面的選單列已出現 Wi-Fi 圖示。還缺「系統設定裡親眼看到開關」的截圖：VM 沒有 VNC 客戶端、auto-login 沒生效，見 §6.15.6） |
+| **D** | 可掃描到 AP 並以 WPA2 連線取得 IP | ❌ 未達成（請求通道已通、airportd 已在問；但 scan/associate 仍是 stub，§7.3） |
 | **E** | 全程不改系統設定以外的東西、不需終端機、無獨立 app；最後部署回實體 ESP 並真機重驗 | ❌ 未開始（§7.4） |
 
 **一句話總結現況**：無線電在跑、Apple 的 `start()` 發布了 `en1`，而**第五輪找到了「SC 看不到介面」的真兇**：不是 SC 的分類規則、不是 80211 core 的註冊，而是介面節點上 `IOInterfaceType=71` 這個**屬性**——`SCNetworkInterface.c` 只接受 `IFT_ETHER(6)`/`IFT_IEEE1394(13)`，其他值直接 `"unknown interface type"` 把介面丟掉。改回 6 之後 SC 立刻列 `en1 type=IEEE80211`（因為它改看 controller 是否符合 `IO80211Controller`），Wi-Fi 硬體埠與服務都成立。**最後一哩是 airportd**：它透過 `IO80211Controller` 的 +0x200 ivar（`getNetworkInterface()`/`getInfraInterface()` 都只是讀這個 pointer）找裝置，而該 ivar 實測是 null。
@@ -662,6 +662,89 @@ airportd 只認得 family 自己的 user client 協議，而我們能提供的�
 
 ---
 
+### 6.15 第十一輪（v111–v115）：airportd 的請求通道是 **ifnet ioctl**，不是 user client
+
+第十輪留下的三條路線（§6.14.4）在這一輪全部量過，結論是前三條都不需要——airportd 自己有一條
+**ioctl 備援**，而它才是 v1 介面驅動該走的路。
+
+#### 6.15.1 決定性證據：airportd 的 log 就寫著它在試 ioctl
+
+把 `IOInterfaceName` 只放 vif（讓名字 match 命中 Skywalk 物件）之後，`IOServiceOpen` 依然失敗，
+但 airportd 的 log 這次給出完整鏈條：
+
+```
+Apple80211BindToInterfaceWithService: ... IOServiceOpen failed with 0xe00002c2
+Apple80211BindToInterfaceWithIOCTL: WARNING: Falling back to IOCTL path, ifname['en1'] err -1/0xffffffff
+Apple80211BindToInterfaceWithService: FAILED to bind to interface - -1/0xffffffff
+```
+
+`-1` 不是「沒有備援」，是「備援被呼叫了、而介面沒有實作 `SIOCSA80211`」。先前 §6.14.4 第 3 條
+「量測顯示沒有 fallback」的判讀是錯的：那只發生在 **我們自己的 user client 有回應** 的時候。
+
+#### 6.15.2 為什麼 service 這條路即使通了也不能用
+
+* 名字放 vif → `IOServiceOpen` 被 `IO80211VirtualInterface::newUserClient` 以
+  `newUserClient: ERROR: invalid interfaceRole: 1 provided to newUserClient` 拒絕（它只收 6/7；
+  而 `attachInterface` 只收 role 1，兩者互斥）。
+* 從我們的介面節點把 open **轉給** `IO80211SkywalkInterface::newUserClient`（受器給 vif）
+  可以成功（`newUserClient type=0 -> family client 0x0`，family 的 client 真的被建出來），
+  但 airportd 一訂閱事件就 **panic**：
+  `IO80211SkywalkInterface::createEventPipe + 0x1b`，`[ivars+0x208]` 是 null——
+  那個位置只有「向 Skywalk stack 註冊過的介面」才有東西，我們註冊不了。
+  **不要在無法完成 Skywalk 註冊的物件上把 family client 交給 airportd。**
+
+#### 6.15.3 正解：實作 `performCommand` 的 80211 ioctl
+
+`IONetworkInterface::if_ioctl` → `performCommand(controller, cmd, arg0=ifnet, arg1=data)`，
+live 的 `IO80211Interface` **沒有** `performCommand`（只有 legacy 有），所以
+`SIOCGA80211/SIOCSA80211` 一路掉到 `IOEthernetInterface::performCommand` → ENOTTY。
+自己覆寫 `performCommand`，把請求轉給既有的 `venturaRecordRequest()` 就通了。
+
+實作要點（`src/kext/ventura/Ath10kVenturaInterface.cpp`）：
+
+1. `arg1` 是 **kernel 記憶體**，不是 user pointer。BSD 的 `ioctl()` 對 `_IOW/_IOWR` 指令會先把
+   `IOCPARM_LEN(cmd)`（本輪實測 = 40）的請求結構複製進來，驅動直接 `memcpy` 讀即可；
+   這裡用 `copyin` 會回 EFAULT，**請求永遠到不了 dispatcher**（v113 的 174 次呼叫全部卡在這）。
+2. 真正在 user space 的是 `req.req_data`（payload 指標），get 要 `copyout`、set 要 `copyin`。
+3. 指令碼兩組都要收：`0xc02869c9`/`0x802869c8`（size 40，pre-10.15 編碼）與
+   `0xc03069c9`/`0x803069c8`（size 48）。13.7 的 airportd 實測用 **40 那組**。
+4. 非 80211 指令要轉給 `IOEthernetInterface::performCommand`（KC 裡是 `N_SECT|N_EXT`，
+   可以用 mangled 名稱直接呼叫；不要用 `super::`，那會虛擬派回自己）。
+
+#### 6.15.4 v115 實測（本專案第一次有「請求」）
+
+```
+networksetup -getairportpower en1     -> Wi-Fi Power (en1): On          (以前 Off / Wireless is not available)
+Ath10kApple80211Requests              -> 318                            (前十輪一直是 1)
+Ath10kIoctlCalls                      -> 317
+Ath10kIoctlType / Verb / Status       -> 19 (APPLE80211_IOC_POWER) / get / 0
+ifconfig en1                          -> UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST
+networksetup -listallhardwareports    -> Hardware Port: Wi-Fi / Device: en1
+Ath10kNewUserClient                   -> 32（service 這條被我們主動拒絕，airportd 就轉 ioctl）
+```
+
+#### 6.15.5 又一個「live 沒有這個 virtual」
+
+`venturaPublishState()` 原本呼叫 `_venturaInterface->setLinkState(...)`。live 的
+`IO80211Interface` **沒有** `setLinkState`（只有 legacy 有），呼叫落到隔壁 slot，CPU 直接跳進
+未映射位址：panic 的 `RIP == CR2 == 0xffffff8052c00000`，frame 顯示
+`venturaDispatchRequest + 0x1b6`（其實是 `venturaPower()` 的返回位址）。
+規則：**每個要呼叫的 Apple virtual，都先在 live KC 確認它存在**；不確定就只寫屬性。
+
+#### 6.15.6 還沒做／下一步
+
+1. **掃描與關聯**（§7.3）：請求通道有了，`APPLE80211_IOC_SCAN_REQ` 現在會進到
+   `venturaScan()`（回 0 筆），所以選單還是空的。把 `src/kext/native/` 的 `_wmiScan`
+   搬過來即可。
+2. **系統設定的截圖**：VM 沒有 VNC 客戶端；auto-login 由 SSH 寫
+   `/Library/Preferences/com.apple.loginwindow` 沒生效（`defaults read` 說不存在），
+   主控台仍是 `loginwindow`（`stat -f%Su /dev/console` = root、`launchctl print gui/501` 失敗）。
+   下一輪若要 GUI 證據，先解決這步（或直接在真機驗）。
+3. `tools/io-match.c`（本輪新增）：重播 airportd 的 `IOServiceGetMatchingService` 字典，
+   印出命中的節點類別與 `IO80211InterfaceRole`/`IOUserClientClass`，再自己 `IOServiceOpen`。
+   注意它沒有 `com.apple.wlan.authentication` entitlement，**失敗是正常的**：
+   `IO80211APIUserClient::initWithTask` 第一件事就是 `copyClientEntitlement`。
+
 ## 7. 下一個接手的人：照這個順序
 
 ### 7.1 重疊的發布路徑（**v52 已完成**）
@@ -672,7 +755,15 @@ networksetup -listallhardwareports | grep -A2 -i wifi # 目前仍然沒有
 ```
 **注意**：§6.7 已證明 Wi-Fi 硬體埠消失不是「多顆介面」造成的，是 SC 根本看不到這個介面。
 
-### 7.2 接上 airportd 的 infra 請求入口（**下一輪從這裡開始**）
+### 7.2 請求入口（**v115 已完成**，走 ifnet ioctl）
+
+airportd 不是靠 family 的 user client，而是 `SIOCGA80211/SIOCSA80211` → `performCommand` 這條
+ioctl 備援（§6.15）。`Ath10kApple80211Requests` 現在會長、`getairportpower` 回 `On`。
+下一輪直接從 §7.3 的掃描/關聯開始，不要再碰 user client 或 Skywalk。
+
+以下為當時的假設，僅留記錄（已被 §6.15 取代）：
+
+### 7.2-old 接上 airportd 的 infra 請求入口
 
 §6.9/§6.10 已經完成：介面在 SC 裡是 Wi-Fi 硬體埠、`IO80211Interface::init` 走正規、controller 的 `+0x200` 介面指標補上（`Ath10kCtrlInfraInstalled = retry`）。airportd 仍回 `Wireless is not available`，最強假設是**請求入口沒接**：
 
@@ -743,6 +834,11 @@ VM 通了之後把 kext 部署回實體 ESP，在真機重驗（真機 ASPM 可�
 | **v69–v70** | 改在 Apple 的 `start()` 之後寫 ivar；同時用 file-static 保存介面指標 | `Ath10kCtrlInfraSeen = No`：連 file-static 都讀不到 → 介面指標來源待釐清（`_venturaInterface` 在 +0x668）。VM 穩定、SC 仍認得 en1=IEEE80211 |
 | **v71–v72** | 加 `Ath10kInstanceCreate/Start/Retry`、`Ath10kStaticCallsSeen` 斷點 | 三個 instance 指標**相同**、`CreateIfaceCalls=1`、但重試讀 static 是 **0** → 純時序問題（Apple 的 attach 比 3 秒晚） |
 | **v73–v74** | 重試改成每 5 秒 re-arm（最多 8 次）；介面 `attachToDataLinkLayer()` 成功後也補 ivar | `Ath10kCtrlInfraSeen=Yes`、`Ath10kCtrlInfraInstalled=retry`（第 2 次重試）、`Ath10kDataLinkEntered=Yes`/status 0。airportd 仍不認 |
+| **v111** | `IOInterfaceName` 只放 vif（讓名字 match 命中 Skywalk 物件）+ `IOUserClientClass` | airportd 打到 vif → `IOServiceOpen 0xe00002c2`；kernel log 出現 `newUserClient: ERROR: invalid interfaceRole: 1`（vif 的 newUserClient 只收 role 6/7） |
+| **v112** | 名字放回介面節點，`newUserClient` 轉給 `IO80211SkywalkInterface::newUserClient`（受器 = vif） | 轉呼叫成功（family 的 client 真的開起來），但 airportd 訂閱事件時 **panic** 在 `IO80211SkywalkInterface::createEventPipe + 0x1b`（`[ivars+0x208]` null） |
+| **v113** | 拒絕 service 這條（`newUserClient` 回 unsupported），加 `performCommand` 接 `SIOCGA/SIOCSA80211`，payload 用 `copyin` | airportd 打我們 174 次 ioctl，但請求結構被當成 user pointer → `copyin` EFAULT，dispatcher 一次都沒進去（`Ath10kApple80211Requests` 仍 1） |
+| **v114** | ioctl 請求結構改成直接讀 kernel 記憶體（`memcpy(arg1)`） | 請求真的進 dispatcher（第一次！），但 `venturaPower()` 內呼叫 live 不存在的 `setLinkState` → panic（`RIP == CR2 == 0xffffff8052c00000`，frame 在 `venturaDispatchRequest + 0x1b6`） |
+| **v115** | 拿掉 `setLinkState`，狀態只寫屬性 | **里程碑**：`getairportpower` = `Wi-Fi Power (en1): On`、`Ath10kApple80211Requests = 318`、`IoctlType = 19 (POWER)`、en1 `UP,RUNNING`、Wi-Fi 硬體埠在（§6.15.4） |
 | **v75** | `init()` 改走正規 `__ZN16IO80211Interface4initEP19IONetworkController`（失敗才 fallback） | `Ath10kIfInit80211=ok`；en1 與 SC 的 IEEE80211 分類都還在；airportd 仍 `Wireless is not available`。同輪排除 IO80211 plane 與 airportd 快取兩個假設（§6.10.4） |
 
 ---
@@ -759,6 +855,7 @@ VM 通了之後把 kext 部署回實體 ESP，在真機重驗（真機 ASPM 可�
 | `src/kext/Ath10kNetwork.cpp` | `configureInterface()`、`createWorkLoop()`、`createOutputQueue()`、`getHardwareAddress()` |
 | `src/kext/native/*` | Sequoia（v2）對照實作：WMI 掃描/關聯、`getFaultReporterFromDriver()`、`IO80211InfraInterface` 用法 |
 | `tools/ifnet-type.c` | 在 guest 內編譯即印出 kernel 眼中的 `if_data.ifi_type`（判斷單元真型別，別信 ioreg property） |
+| `tools/io-match.c` | 在 guest 內編譯即重播 airportd 的 `IOServiceGetMatchingService({IOPropertyMatch={IOInterfaceName}})`：印出命中節點的類別、`IO80211InterfaceRole`、`IOUserClientClass`，並自己 `IOServiceOpen(type 0)`。它沒有 `com.apple.wlan.authentication` entitlement，失敗是預期行為（§6.15.6） |
 | `tools/sc-interfaces.c` | 在 guest 內編譯即印出 **`SCNetworkInterfaceCopyAll()` 真正看得到的介面**（名稱/型別/BSD name）。驗收 Wi-Fi 服務就靠這支：介面不在清單裡 = SC 根本沒註冊它，`IOInterfaceType` 再對也沒用（§6.7） |
 | `docs/hardware-verification.md` | 實機 stage0/stage3 陷阱與 hash 比對 |
 

@@ -819,12 +819,16 @@ SInt32 Ath10kPCIDevice::enableFeature(IO80211FeatureCode code, void *)
 void Ath10kPCIDevice::venturaPublishState(UInt32 state)
 {
     _venturaState = state;
-    if (_venturaInterface == nullptr)
-        return;
-    _venturaInterface->setLinkState(state == APPLE80211_S_RUN
-                                        ? kIO80211NetworkLinkUp
-                                        : kIO80211NetworkLinkDown,
-                                    0);
+    if (IOService *provider = getProvider())
+        provider->setProperty("Ath10kRadioState", static_cast<UInt64>(state), 32);
+    // Deliberately no setLinkState() here. On the live 13.7 IO80211Interface that
+    // virtual does not exist (only the legacy bundle has it), so the call
+    // dispatches into an unrelated slot of the live vtable and the CPU ends up
+    // executing an unmapped address: measured as a kernel trap with
+    // RIP == CR2 == 0xffffff8052c00000 and the frame in
+    // venturaDispatchRequest + 0x1b6, i.e. the return address right after the
+    // call to venturaPower(). Link state is reported through the property until
+    // the datapath stage wires the real one.
 }
 
 // Every apple80211 request from airportd funnels through here so the boot
@@ -1115,41 +1119,12 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
     // the role ivar alone does not publish it, because that is what
     // IO80211SkywalkInterface::setInterfaceRole(1) does behind the ivar store.
     vif->setProperty("IO80211InterfaceRole", "Infrastructure");
-    // The interface airportd keeps is the one it finds by name:
-    // IOServiceGetMatchingService({IOPropertyMatch = {IOInterfaceName = <bsd>}}).
-    // Publish the name on the Skywalk vif, not on the v1 interface node: then the
-    // matched service is a Skywalk object, the family's own IO80211APIUserClient
-    // accepts it (its commonStart casts the provider to IO80211SkywalkInterface)
-    // and the whole apple80211 request protocol stays inside the family instead of
-    // having to be reimplemented.
-    {
-        char unitName[32] = {0};
-        ifnet_t ifp = _venturaVifIfnet;
-        IO80211Interface *published = venturaPublishedInterface();
-        if (ifp == nullptr && published != nullptr)
-            ifp = published->getIfnet();
-        if (ifp != nullptr) {
-            snprintf(unitName, sizeof unitName, "%s%u", ifnet_name(ifp),
-                     static_cast<unsigned>(ifnet_unit(ifp)));
-            vif->setProperty("IOInterfaceName", unitName);
-            if (probe) probe->setProperty("Ath10kVifInterfaceName", unitName);
-        } else if (published != nullptr) {
-            // No ifnet here yet: fall back to the BSD name the interface node
-            // already carries, so the vif still gets a usable IOInterfaceName.
-            if (OSString *bsd = OSDynamicCast(OSString, published->getProperty("BSD Name"))) {
-                const char *c = bsd->getCStringNoCopy();
-                if (c != nullptr) {
-                    snprintf(unitName, sizeof unitName, "%s", c);
-                    if (unitName[0] != 0) {
-                        vif->setProperty("IOInterfaceName", unitName);
-                        if (probe) probe->setProperty("Ath10kVifInterfaceName", unitName);
-                    }
-                }
-            }
-        }
-        if (probe && unitName[0] == 0)
-            probe->setProperty("Ath10kVifInterfaceName", "unresolved");
-    }
+    // The name must NOT be published here: airportd matches services by
+    // IOInterfaceName, and a name on the vif makes it open the family's user
+    // client straight on Apple's virtual interface, whose newUserClient rejects
+    // roles other than 6/7 ("invalid interfaceRole: 1"). The name is stamped on
+    // the v1 interface node in Ath10kVenturaInterface::attachToDataLinkLayer(),
+    // which is where the BSD name first exists.
     const bool attached = ath10kAttachSkywalkInterface(this, vif, this);
     if (probe) {
         probe->setProperty("Ath10kInfraAttach", attached ? "ok" : "failed");

@@ -32,6 +32,14 @@ public:
                            IOUserClient **handler) override;
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
                            IOUserClient **handler) override;
+    // airportd's interface binding: it first tries the IO80211APIUserClient path
+    // and, when that fails, falls back to the classic ifnet ioctl channel
+    // ("Apple80211BindToInterfaceWithIOCTL ... Falling back to IOCTL path"),
+    // which reaches the driver here. Handling SIOCGA80211/SIOCSA80211 is what a
+    // pre-Skywalk interface driver is supposed to do, and it needs no user
+    // client, no Skywalk registration and no event pipe.
+    SInt32 performCommand(IONetworkController *controller, unsigned long cmd,
+                          void *arg0, void *arg1) override;
 
 private:
     Ath10kPCIDevice *_owner = nullptr;

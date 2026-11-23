@@ -13,6 +13,8 @@
 #include "Ath10kVenturaUserClient.hpp"
 
 #include <IOKit/IOCommandGate.h>
+#include <libkern/copyio.h>
+#include <sys/errno.h>
 
 // Apple's own IOEthernetInterface::init(IONetworkController*), addressed by its
 // mangled name. A normal qualified C++ call compiles to a virtual dispatch and
@@ -202,21 +204,32 @@ IOReturn Ath10kVenturaInterface::attachToDataLinkLayer(IOOptionBits options, voi
             if (ifp != nullptr) {
                 snprintf(unitName, sizeof(unitName), "%s%u", ifnet_name(ifp),
                          static_cast<unsigned>(ifnet_unit(ifp)));
-                // Airportd finds the interface it keeps with
+                // airportd matches an interface by name —
                 // IOServiceGetMatchingService({IOPropertyMatch =
-                // {IOInterfaceName = <bsd name>}}), so the name has to be here:
-                // measured, this is what turns "Wireless is not available" into
-                // "Wi-Fi Power (en1): Off".
+                // {IOInterfaceName = "<bsd name>"}}) — and opens a user client on
+                // the node that answered. The name therefore belongs *here*: this
+                // is the only node whose newUserClient this driver controls, and
+                // that override is what hands the open to the family's own
+                // IO80211APIUserClient (see newUserClient(), which passes the
+                // Skywalk vif as the provider). Publishing the name on the vif
+                // instead made airportd open the client straight on Apple's
+                // virtual interface, whose newUserClient rejects anything but
+                // role 6/7 — measured in the kernel log as
+                //   newUserClient: ERROR: invalid interfaceRole: 1 ...
+                // and on the wire as IOServiceOpen 0xe00002c2.
                 setProperty("IOInterfaceName", unitName);
-                // Same name on the Skywalk vif: airportd finds an interface with
-                // IOServiceGetMatchingService({IOPropertyMatch={IOInterfaceName}},
-                // and matching the vif is what lets it open the family's own
-                // IO80211APIUserClient (whose commonStart casts the provider to
-                // IO80211SkywalkInterface). Only here is the BSD name known -
-                // earlier (attachPlatformVif) there is no ifnet yet, measured as
-                // Ath10kVifInterfaceName="unresolved".
-                if (_owner != nullptr && _owner->_venturaVif != nullptr)
-                    _owner->_venturaVif->setProperty("IOInterfaceName", unitName);
+                if (IOService *owner = getProvider())
+                    owner->setProperty("Ath10kVifStamp", "interface-node");
+                // The vif keeps the role/name matchable but must not advertise the
+                // name, or the name match can land on it instead.
+                if (_owner != nullptr && _owner->_venturaVif != nullptr) {
+                    IO80211VirtualInterface *vif = _owner->_venturaVif;
+                    vif->setProperty("IO80211InterfaceRole", "Infrastructure");
+                    if (OSObject *stale = vif->getProperty("IOInterfaceName")) {
+                        (void)stale;
+                        vif->removeProperty("IOInterfaceName");
+                    }
+                }
             }
             if (IOService *owner = getProvider())
                 owner->setProperty("Ath10kInterfaceName", unitName);
@@ -258,37 +271,130 @@ void Ath10kVenturaInterface::noteUserClientAttempt(UInt32 type)
     }
 }
 
-// Do not forward to IO80211Interface::newUserClient(): a qualified call to a
-// virtual dispatches back into this override (infinite recursion). The base
-// implementation is what we measured failing with kIOReturnUnsupported anyway
-// (IO80211APIUserClient::commonStart rejects the provider), so answer that
-// directly and keep the attempt on record.
+// The family's virtual-interface newUserClient refuses any interface role other
+// than 6/7: IO80211VirtualInterface::newUserClient reads the role dword at
+// [ivars+0x50] and logs
+//   "newUserClient: ERROR: invalid interfaceRole: %d provided to newUserClient"
+// for anything else, returning kIOReturnBadArgument. Delegating the open to
+// IO80211SkywalkInterface::newUserClient with the vif as receiver does get past
+// that check (measured: the family's IO80211APIUserClient is created), but the
+// client then asks the vif for its event pipe and
+//   IO80211SkywalkInterface::createEventPipe + 0x1b
+// dereferences a null ivar at [ivars+0x208] — that slot is only populated for an
+// interface the Skywalk stack registered, so the whole VM panics as soon as
+// airportd subscribes. Do not hand airportd a family client on a vif we cannot
+// fully register.
+//
+// Answer "unsupported" instead: airportd then falls back to the classic ifnet
+// ioctl channel, which is the path a pre-Skywalk interface driver is meant to
+// serve (see performCommand below).
 IOReturn Ath10kVenturaInterface::newUserClient(task_t owningTask, void *securityID,
                                                UInt32 type, OSDictionary *properties,
                                                IOUserClient **handler)
 {
-    (void)properties;
+    (void)owningTask; (void)securityID; (void)type; (void)properties;
     if (handler != nullptr)
         *handler = nullptr;
     noteUserClientAttempt(type);
-    // Apple80211 drives the driver through this client. The family's own
-    // IO80211APIUserClient refuses us (it skywalk-casts the provider), so hand out
-    // our own and record the selectors that arrive.
-    Ath10kVenturaUserClient *client = new Ath10kVenturaUserClient;
-    if (client == nullptr)
-        return kIOReturnNoMemory;
-    if (!client->initWithTask(owningTask, securityID, type, nullptr)) {
-        client->release();
-        return kIOReturnBadArgument;
+    return kIOReturnUnsupported;
+}
+
+// airportd's bind chain, recovered from its own log:
+//   Apple80211BindToInterfaceWithService: ... IOServiceOpen failed with 0xe00002c2
+//   Apple80211BindToInterfaceWithIOCTL: ... Falling back to IOCTL path,
+//                                          ifname['en1'] err -1/0xffffffff
+// The second line is airportd offering the classic ifnet ioctl channel, which
+// fails today because nothing answers SIOCGA80211/SIOCSA80211 (the live
+// IO80211Interface has no performCommand of its own, so the Ethernet
+// implementation sees the command, does not know it, and returns ENOTTY).
+// That channel is the one a v1 interface driver is supposed to serve: it needs
+// no IO80211APIUserClient, no Skywalk registration and no event pipe, and it is
+// how pre-Skywalk drivers are driven on 13.x. Requests arrive as
+//   struct apple80211req { req_if_name[16]; req_type; req_val; req_len; req_data }
+// where req_data is a caller (user-space) pointer to the payload of req_len
+// bytes: gets write it back, sets read it in.
+//
+// IOEthernetInterface::performCommand is exported by IONetworkingFamily (EXT),
+// so the commands that are not ours still reach the base implementation.
+extern "C" SInt32 ath10kEthernetPerformCommand(IOEthernetInterface *self,
+                                               IONetworkController *controller,
+                                               unsigned long cmd, void *arg0, void *arg1)
+    __asm("__ZN19IOEthernetInterface14performCommandEP19IONetworkControllermPvS2_");
+
+// IO80211Interface.h carries both encodings of the two ioctl codes (_IOW/_IOWR
+// over struct apple80211req for pre- and post-10.15 layouts); compare against
+// both so the branch this build saw does not matter.
+static const unsigned long kSiocsA80211New = 2150656456UL;
+static const unsigned long kSiocgA80211New = 3224398281UL;
+static const unsigned long kSiocsA80211Old = 2150132168UL;
+static const unsigned long kSiocgA80211Old = 3223873993UL;
+
+SInt32 Ath10kVenturaInterface::performCommand(IONetworkController *controller, unsigned long cmd,
+                                              void *arg0, void *arg1)
+{
+    const bool isSet = (cmd == kSiocsA80211New || cmd == kSiocsA80211Old);
+    const bool isGet = (cmd == kSiocgA80211New || cmd == kSiocgA80211Old);
+    if (!isSet && !isGet)
+        return ath10kEthernetPerformCommand(this, controller, cmd, arg0, arg1);
+
+    IOService *probe = (_owner != nullptr) ? _owner->getProvider() : getProvider();
+    if (probe != nullptr) {
+        UInt64 calls = 0;
+        if (OSNumber *n = OSDynamicCast(OSNumber, probe->getProperty("Ath10kIoctlCalls")))
+            calls = n->unsigned64BitValue();
+        probe->setProperty("Ath10kIoctlCalls", calls + 1, 32);
+        probe->setProperty("Ath10kIoctlCmd", static_cast<UInt64>(cmd), 32);
+        probe->setProperty("Ath10kIoctlVerb", isSet ? "set" : "get");
     }
-    if (!client->attach(this) || !client->start(this)) {
-        client->detach(this);
-        client->release();
-        return kIOReturnError;
+    IOLog("Ath10kMac: performCommand cmd=0x%lx %s\n", cmd, isSet ? "set" : "get");
+
+    if (_owner == nullptr)
+        return EIO;
+
+    // arg1 is *kernel* memory, not a user pointer: BSD's ioctl() copies the
+    // 40-byte request structure in for IOC_IN/OIOWR commands (IOCPARM_LEN of the
+    // command code) and copies it back out afterwards, so a copyin here fails
+    // with EFAULT and nothing ever reaches the dispatcher — which is exactly
+    // what 174 airportd calls did before this. The payload is different: it
+    // lives behind req.req_data, a user-space pointer the driver copies itself.
+    if (arg1 == nullptr)
+        return EINVAL;
+    const unsigned long parmLen = (cmd >> 16) & 0x1fff;
+    if (parmLen < sizeof(struct apple80211req))
+        return EINVAL;
+    struct apple80211req req;
+    memcpy(&req, arg1, sizeof(req));
+    if (probe != nullptr)
+        probe->setProperty("Ath10kIoctlType", static_cast<UInt64>(static_cast<UInt32>(req.req_type)), 32);
+
+    // Payload buffer. req_len is authoritative for the caller's buffer, but a
+    // getter may be asked for less than the structure it fills, so allocate a
+    // floor and only copy req_len bytes back out.
+    UInt32 len = req.req_len;
+    UInt32 allocLen = (len < 2048) ? 2048 : len;
+    if (allocLen > 65536)
+        allocLen = 65536;
+    void *buf = IOMalloc(allocLen);
+    if (buf == nullptr)
+        return ENOMEM;
+    memset(buf, 0, allocLen);
+    if (isSet && len != 0 && req.req_data != nullptr) {
+        if (copyin(reinterpret_cast<user_addr_t>(req.req_data), buf, len) != 0) {
+            IOFree(buf, allocLen);
+            return EFAULT;
+        }
     }
-    if (handler != nullptr)
-        *handler = client;
-    return kIOReturnSuccess;
+
+    const SInt32 status = _owner->venturaRecordRequest(isSet ? 1 : 0, req.req_type, buf);
+    if (probe != nullptr)
+        probe->setProperty("Ath10kIoctlStatus",
+                           static_cast<UInt64>(static_cast<UInt32>(status)), 32);
+
+    if (isGet && status == kIOReturnSuccess && len != 0 && req.req_data != nullptr)
+        copyout(buf, reinterpret_cast<user_addr_t>(req.req_data), len);
+
+    IOFree(buf, allocLen);
+    return (status == kIOReturnSuccess) ? 0 : EIO;
 }
 
 IOReturn Ath10kVenturaInterface::newUserClient(task_t owningTask, void *securityID,
