@@ -10,6 +10,7 @@
 
 #include "Ath10kVenturaInterface.hpp"
 #include "../Ath10kPCIDevice.hpp"
+#include "Ath10kVenturaUserClient.hpp"
 
 #include <IOKit/IOCommandGate.h>
 
@@ -83,6 +84,13 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
         setInterfaceType(0x6 /* IFT_ETHER: what SystemConfiguration accepts */);
         setProperty("IOPrimaryInterface", kOSBooleanTrue);
         _owner = owner;
+        // airportd keeps an interface only while this role reads
+        // "Infrastructure": Apple80211's per-interface filter looks the property
+        // up and compares it against that constant string (recovered from the
+        // framework's CFString constants). Set it on the interface object itself,
+        // because the node airportd enumerates is the one created here, not the
+        // vif the controller keeps.
+        setProperty("IO80211InterfaceRole", "Infrastructure");
         if (probe) probe->setProperty("Ath10kIfacePhase", "inited");
         return true;
     }
@@ -126,6 +134,8 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
     setProperty("IOUserClientClass", "IO80211APIUserClient");
     if (probe) probe->setProperty("Ath10kUserClientClass", "IO80211APIUserClient");
     _owner = owner;
+    // Same role stamp on the fallback path (see above).
+    setProperty("IO80211InterfaceRole", "Infrastructure");
     if (probe) probe->setProperty("Ath10kIfacePhase", "inited");
     return true;
 }
@@ -178,6 +188,39 @@ IOReturn Ath10kVenturaInterface::attachToDataLinkLayer(IOOptionBits options, voi
                            static_cast<UInt64>(static_cast<UInt32>(result)), 32);
     if (result == kIOReturnSuccess) {
         setProperty("IOInterfaceType", static_cast<UInt64>(0x6), 32);
+        // Apple80211 finds the service for an interface with
+        // IOServiceGetMatchingService(kIOMainPortDefault, {IOPropertyMatch =
+        // {IOInterfaceName = "<bsd name>"}}) and then reads IO80211InterfaceRole
+        // off it, requiring the CFString "Infrastructure" (both strings and the
+        // IOServiceGetMatchingService call were recovered from the framework's
+        // code). Without IOInterfaceName the match fails, the interface is
+        // dropped by the wrapper and airportd reports -3903.
+        {
+            // Build "<name><unit>" exactly like the ifnet registration does.
+            char unitName[32] = {0};
+            ifnet_t ifp = getIfnet();
+            if (ifp != nullptr) {
+                snprintf(unitName, sizeof(unitName), "%s%u", ifnet_name(ifp),
+                         static_cast<unsigned>(ifnet_unit(ifp)));
+                // Airportd finds the interface it keeps with
+                // IOServiceGetMatchingService({IOPropertyMatch =
+                // {IOInterfaceName = <bsd name>}}), so the name has to be here:
+                // measured, this is what turns "Wireless is not available" into
+                // "Wi-Fi Power (en1): Off".
+                setProperty("IOInterfaceName", unitName);
+                // Same name on the Skywalk vif: airportd finds an interface with
+                // IOServiceGetMatchingService({IOPropertyMatch={IOInterfaceName}},
+                // and matching the vif is what lets it open the family's own
+                // IO80211APIUserClient (whose commonStart casts the provider to
+                // IO80211SkywalkInterface). Only here is the BSD name known -
+                // earlier (attachPlatformVif) there is no ifnet yet, measured as
+                // Ath10kVifInterfaceName="unresolved".
+                if (_owner != nullptr && _owner->_venturaVif != nullptr)
+                    _owner->_venturaVif->setProperty("IOInterfaceName", unitName);
+            }
+            if (IOService *owner = getProvider())
+                owner->setProperty("Ath10kInterfaceName", unitName);
+        }
         IONetworkController *controller = getController();
         if (controller != nullptr) {
             void **slot = reinterpret_cast<void **>(reinterpret_cast<char *>(controller) + 0x200);
@@ -224,11 +267,28 @@ IOReturn Ath10kVenturaInterface::newUserClient(task_t owningTask, void *security
                                                UInt32 type, OSDictionary *properties,
                                                IOUserClient **handler)
 {
-    (void)owningTask; (void)securityID; (void)properties;
+    (void)properties;
     if (handler != nullptr)
         *handler = nullptr;
     noteUserClientAttempt(type);
-    return kIOReturnUnsupported;
+    // Apple80211 drives the driver through this client. The family's own
+    // IO80211APIUserClient refuses us (it skywalk-casts the provider), so hand out
+    // our own and record the selectors that arrive.
+    Ath10kVenturaUserClient *client = new Ath10kVenturaUserClient;
+    if (client == nullptr)
+        return kIOReturnNoMemory;
+    if (!client->initWithTask(owningTask, securityID, type, nullptr)) {
+        client->release();
+        return kIOReturnBadArgument;
+    }
+    if (!client->attach(this) || !client->start(this)) {
+        client->detach(this);
+        client->release();
+        return kIOReturnError;
+    }
+    if (handler != nullptr)
+        *handler = client;
+    return kIOReturnSuccess;
 }
 
 IOReturn Ath10kVenturaInterface::newUserClient(task_t owningTask, void *securityID,

@@ -67,7 +67,7 @@ LDFLAGS = $(ARCH) -static -nostdlib -Xlinker -kext \
 ifeq ($(VENTURA),1)
 CXXFLAGS += -DATH10K_VENTURA=1 -UATH10K_NATIVE -I$(PROJ_ROOT)/vendor/itlwm-v1 -I$(PROJ_ROOT)/vendor/itlwm-v1/Airport
 MINOS := -mmacosx-version-min=13.0
-VENTURA_OBJECT := $(BUILD_DIR)/Ath10kVentura.o $(BUILD_DIR)/Ath10kVenturaInterface.o
+VENTURA_OBJECT := $(BUILD_DIR)/Ath10kVentura.o $(BUILD_DIR)/Ath10kVenturaInterface.o $(BUILD_DIR)/Ath10kVenturaUserClient.o
 endif
 
 ifeq ($(NATIVE),1)
@@ -96,6 +96,9 @@ $(BUILD_DIR)/Ath10kVenturaInterface.o: src/kext/ventura/Ath10kVenturaInterface.c
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/Ath10kInfraInterface.o: src/kext/ventura/Ath10kInfraInterface.cpp $(wildcard src/kext/ventura/*) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/Ath10kVenturaUserClient.o: src/kext/ventura/Ath10kVenturaUserClient.cpp $(wildcard src/kext/ventura/*) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/Ath10kNative.o: src/kext/native/Ath10kNative.cpp $(wildcard src/kext/native/*) $(wildcard src/kext/*.hpp) | $(BUILD_DIR)

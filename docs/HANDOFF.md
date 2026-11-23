@@ -1,8 +1,8 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-23（第八輪：量到注入 kext **只會綁到 live IO80211Family**（OpenCore 僅按宣告依賴解析符號），legacy 那條「Apple 自己用的路」對我們關閉；airportd 的 -3903 也不是在我們的節點上開 user client 造成的。唯一還沒封的路是把介面做成真正的 Skywalk（`IO80211InfraInterface` 子類）——§6.12.8）
+最後更新：2026-11-23（第十輪：airportd 終於認得 en1（`Wi-Fi Power (en1): Off`），門是 `IOInterfaceName`＋`IO80211InterfaceRole="Infrastructure"`；剩下的卡點是 family 自己的 user client 協議（請求還沒進到驅動）—— 詳見 §6.14。原第八輪：量到注入 kext **只會綁到 live IO80211Family**（OpenCore 僅按宣告依賴解析符號），legacy 那條「Apple 自己用的路」對我們關閉；airportd 的 -3903 也不是在我們的節點上開 user client 造成的。唯一還沒封的路是把介面做成真正的 Skywalk（`IO80211InfraInterface` 子類）——§6.12.8）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v87**（`/tmp/vk87`，Acer 上）— kext 載入、en1、SC 認得 IEEE80211、media 0x80 已發、controller +0x200 已補、新增 metaclass 綁定與 `newUserClient` 計數斷點；airportd 仍 `-3903`。v85/v84/v75/v64/v48 都留著
+VM 現況：**v110**（`/tmp/vk110`，Acer 上；v108/v94/v87 可對照）— kext 載入、en1、SC 認得 IEEE80211、media 0x80 已發、controller +0x200 已補、新增 metaclass 綁定與 `newUserClient` 計數斷點；airportd 仍 `-3903`。v85/v84/v75/v64/v48 都留著
 
 ---
 
@@ -562,6 +562,103 @@ ath10kAttachSkywalkInterface(this, vif, this);
 #### 6.13.5 下一步：把 wrapper 的靜默過濾拆開
 
 `-3903` 發生在使用者空間（`/usr/libexec/airportd` 連 `/System/Library/PrivateFrameworks/IO80211.framework`，那是 stub，實作在 dyld shared cache），而且**不經過任何 IOKit 呼叫**（沒有 user client、沒有 request）。所以下一步是把 `Apple80211GetIfListCopy` 從 shared cache 抽出來反組譯，看內層成功之後它還檢查什麼（可能是 `Apple80211Open` 的 mach service、或某個 interface 屬性）。在這之前，不要再猜 kernel 側的門 —— kernel 側兩道 cast 已經都過了。
+
+### 6.14 第十輪（v95–v110）：airportd 終於認得 en1 —— 卡的門是 `IOInterfaceName` ＋ `IO80211InterfaceRole`
+
+#### 6.14.1 airportd 的使用者空間過濾鏈（完整解出，不是猜的）
+
+方法：frameworks 在磁碟上是 stub，真正的程式在 dyld shared cache
+（`/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h`）。
+`dyld_info` / `otool` 讀不了，`dtruss` 被 DTrace 限制擋住；改用
+`dlopen`＋`dlsym`／`_dyld_get_image_header` 把程式碼從記憶體 dump 出來（`dumpaddr.c`、
+`dumpsym.c`），再用 capstone 反組譯（`/tmp/cs/bin/python3`）。踩到的坑：`lea rsi,[rip+disp]`
+的 disp 在指令結尾前 4 bytes（`48 8d 35` 之後），少算一格會 SIGSEGV；跨行程算位址會被
+ASLR 打亂，一律在同一行程內算。
+
+解出的鏈條（`Apple80211` → `IO80211.framework`）：
+
+```
+for each interface name from getifaddrs (ifi_type 71):
+    svc = IOServiceGetMatchingService(kIOMainPortDefault,
+              { IOPropertyMatch = { IOInterfaceName = "<bsd name>" } })
+    if (!svc) drop
+    v = IORegistryEntryCreateCFProperty(svc, "IO80211InterfaceRole", alloc, 0)
+    if (!v || CFGetTypeID(v) != CFStringGetTypeID()) drop
+    if (CFStringCompare(v, "Infrastructure", 0) != 0) drop
+```
+
+字串來源是 Apple80211 的 constant CFString：`IOInterfaceName`(15)、`IOPropertyMatch`(15)、
+`IO80211InterfaceRole`(20)、`Infrastructure`(14)。stub 解析結果：`CFStringCompare` /
+`IOObjectRelease` / `CFRelease` / `IORegistryEntryCreateCFProperty` / `CFGetTypeID` /
+`CFStringGetTypeID` / `IOServiceGetMatchingService`。
+
+**必要條件（實測）**：
+- `IOInterfaceName = "en1"` 必須在**v1 介面節點**（`Ath10kVenturaInterface`）上。掛到 vif、
+  或兩個都掛，airportd 都還是不認（v107 整個 match 不到 → 回到 "Wireless is not available"；
+  v110 兩邊都掛 → 還是走我們自己的 client）。
+- `IO80211InterfaceRole = "Infrastructure"` 也必須在該節點，值是 CFString。
+
+滿足後：`networksetup -getairportpower en1` 從 **"Wireless is not available"** 變成
+**"Wi-Fi Power (en1): Off"**，`Ath10kNewUserClient` 從 0 變成數百次 —— airportd 開始在
+en1 節點上開 user client（type 0）。這是第十輪最重要的狀態變化。
+
+#### 6.14.2 已實作：`Ath10kVenturaUserClient`
+
+`src/kext/ventura/Ath10kVenturaUserClient.{hpp,cpp}`：`IOUserClient` 子類，只接受 type 0，
+在 `externalMethod` 記錄 `Ath10kUCSel<n>` / `Ath10kUCalls` / `Ath10kUCLastSelector` /
+`Ath10kUCLastScalarIn|StructIn|StructOut` / `Ath10kUCIn0|1|3`，並由
+`Ath10kVenturaInterface::newUserClient` 產生。空殼版（回 `kIOReturnUnsupported`）會讓
+airportd 重試數百次。
+
+#### 6.14.3 `IO80211APIUserClient` 的分派表（反組譯得到）
+
+`sMethods` 在 `0xffffff80020e1600`，每筆 `IOExternalMethodDispatch` 24 bytes：
+
+| selector | 函式 | 重點 |
+|---|---|---|
+| 0 | `extRunDriverCommand` | 直接跳 `_runDriverCommandHelper`；要求 `scalarInputCount == 0`，且 `structureInputDescriptor` 的長度在 **0x3c30–0x4000**（`apple80211req` 那塊） |
+| 3 | `extQueryUseIOUCWhenPossible` | 回 bool |
+| 6 | `extSubscribeEvent` | 事件訂閱 |
+
+**airportd 送到我們 client 的 selector 0 全部沒有輸入結構**（`Ath10kUCIn0` 從未出現），
+輸出大小依序是 256 → 13 → 24 bytes。所以那不是真正的命令路徑：`Ath10kApple80211Requests`
+一直到 v110 都還是 1，代表請求從沒進到 `venturaRecordRequest()`。
+
+#### 6.14.4 目前卡點與三條可行路線
+
+airportd 只認得 family 自己的 user client 協議，而我們能提供的是自製 client。三條路：
+
+1. **讓 match 命中 skywalk 物件**（本輪嘗試失敗）：把 `IOInterfaceName` 放到 vif，讓
+   `IO80211APIUserClient::commonStart` 的 `safeMetaCast(provider, IO80211SkywalkInterface)`
+   過關。失敗原因是 `IOServiceGetMatchingService` 命中 v1 節點（或 vif 取名時 ifnet 還不存在，
+   v109 實測 `Ath10kVifInterfaceName="unresolved"`；v110 改成在 `attachToDataLinkLayer`
+   時才寫，兩個節點都有名字，結果 airportd 還是走我們的 client）。
+   → 還沒試的變體：把 `IOInterfaceName` **只**留在 vif 且確認真的寫進去（v107 失敗是因為沒寫進去）。
+2. **自己實作 `_runDriverCommandHelper` 的等價協定**：解析 0x3c30 大小的請求結構
+   （`apple80211req`：requestType / requestNumber / data），轉呼叫既有的
+   `Ath10kPCIDevice::venturaRecordRequest()`，再把結果填回 structure output。
+   需要先量到真正的輸入（目前還沒看到）。
+3. **走 BSD ioctl**：在介面上實作 `SIOCSA80211`／`SIOCGA80211` 的 ifnet ioctl，讓 airportd
+   走無 user client 的路徑。前提是確認 airportd 有這條 fallback（selector 1 回 false 時它
+   直接停住，量測顯示沒有 fallback）。
+
+#### 6.14.5 現在的 VM 狀態
+
+- v110 已部署（`/tmp/vk110`）：en1 存在、`Wi-Fi Power (en1): Off`、`Ath10kUCSel0≈80`、
+  `Ath10kUCalls≈90`、`Ath10kApple80211Requests = 1`、`IO80211APIUserClient` 實例 0。
+- 可用對照組：v108（只有介面節點有名字，同樣被接受）、v94（infra attach ok，但當時還沒解出
+  名字／角色兩道門）、v87（最早能載入的版本）。
+
+#### 6.14.6 這輪的工程教訓
+
+- **改 `VENTURA_OBJECT` 或換 class 後一定要 `rm -rf build/ventura`**：舊 `.o` 會被連進去，
+  症狀是「明明拿掉了還是注入失敗」。用 `nm | grep -c <class>` 驗證。
+- **`nm -u` 比對只能在兩個乾淨 build 之間做**，incremental build 會多出一堆
+  `IO80211Interface::*`／`_thread_call_*`，看起來像新增參考導致失敗。
+- **使用者空間不能改我們的節點屬性**（`IORegistryEntrySetCFProperty` 回 `0xe00002c7`），
+  每個屬性實驗都要重編＋開機。
+- 取 BSD 名只能在 `attachToDataLinkLayer()` 之後（`ifnet_name()`／`ifnet_unit()`）；在那之前
+  `Ath10kVifInterfaceName` 會是 `unresolved`。
 
 ---
 

@@ -358,6 +358,12 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // Keep the manual pass only for the case where Apple's start() refused and
     // nothing else would publish a unit at all.
     provider->setProperty("Ath10kPublisher", appleStart ? "apple" : "manual");
+    // The userspace filter that decides whether airportd keeps an interface does
+    // IORegistryEntryCreateCFProperty(entry, "IO80211InterfaceRole", ...) and
+    // CFStringCompare against "Infrastructure" (both stubs resolved by hand).
+    // Stamp it on the controller as well as on the interface and the vif: it is
+    // not yet known which node the entry argument refers to.
+    setProperty("IO80211InterfaceRole", "Infrastructure");
     // airportd reaches the device through this controller ivar:
     // IO80211Controller::attachInterface(IONetworkInterface **, bool) parks the
     // interface at +0x200, and getNetworkInterface()/getInfraInterface() just
@@ -373,6 +379,12 @@ bool Ath10kPCIDevice::start(IOService *provider)
                               static_cast<UInt64>(reinterpret_cast<uintptr_t>(this)), 64);
         IO80211Interface *published = venturaPublishedInterface();
         provider->setProperty("Ath10kCtrlInfraSeen", published != nullptr);
+        // airportd's per-interface filter reads this property off the interface it
+        // enumerated and only keeps nodes whose role is "Infrastructure"
+        // (recovered from Apple80211's constant CFStrings; the same value
+        // IO80211SkywalkInterface::setInterfaceRole(1) publishes).
+        if (published != nullptr)
+            published->setProperty("IO80211InterfaceRole", "Infrastructure");
         if (published != nullptr) {
             published->retain();
             *reinterpret_cast<void **>(reinterpret_cast<char *>(this) + 0x200) = published;
@@ -505,6 +517,10 @@ bool Ath10kPCIDevice::start(IOService *provider)
         // airportd's skywalk cast has something to succeed on.
         if (appleStart && _venturaSkywalkIf == nullptr)
             _venturaSkywalkIf = attachPlatformVif();
+        // Same role stamp on every node below the controller (see
+        // stampInterfaceRole): airportd reads it off an entry we cannot name yet.
+        provider->setProperty("Ath10kRoleStamped",
+                              static_cast<UInt64>(stampInterfaceRole(this, 0)), 32);
     }
 #endif
 

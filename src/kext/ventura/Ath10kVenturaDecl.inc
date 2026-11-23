@@ -107,6 +107,9 @@ private:
     // cast to IO80211SkywalkInterface, which the v1 interface can never satisfy.
     IOService *_venturaSkywalkIf = nullptr;
     IOService *attachPlatformVif();
+    // Airportd's per-interface filter reads "IO80211InterfaceRole" off an entry
+    // that has not been identified yet, so stamp the whole subtree once.
+    static UInt32 stampInterfaceRole(IOService *root, int depth);
     // The vif is created inside Apple's start(), but its BSD handoff cannot run
     // there: the controller's registry children at that moment are only the
     // corecapture pipes and the vif, the interface node that carries "BSD Name"

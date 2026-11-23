@@ -1109,6 +1109,47 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
     void **ivarsSlot = reinterpret_cast<void **>(reinterpret_cast<char *>(vif) + 0x110);
     if (*ivarsSlot != nullptr)
         *reinterpret_cast<UInt32 *>(reinterpret_cast<char *>(*ivarsSlot) + 0x50) = 1;
+    // The userspace filter that decides whether airportd keeps an interface reads
+    // the IORegistry property "IO80211InterfaceRole" and requires the string
+    // "Infrastructure" (recovered from Apple80211's constant CFStrings). Writing
+    // the role ivar alone does not publish it, because that is what
+    // IO80211SkywalkInterface::setInterfaceRole(1) does behind the ivar store.
+    vif->setProperty("IO80211InterfaceRole", "Infrastructure");
+    // The interface airportd keeps is the one it finds by name:
+    // IOServiceGetMatchingService({IOPropertyMatch = {IOInterfaceName = <bsd>}}).
+    // Publish the name on the Skywalk vif, not on the v1 interface node: then the
+    // matched service is a Skywalk object, the family's own IO80211APIUserClient
+    // accepts it (its commonStart casts the provider to IO80211SkywalkInterface)
+    // and the whole apple80211 request protocol stays inside the family instead of
+    // having to be reimplemented.
+    {
+        char unitName[32] = {0};
+        ifnet_t ifp = _venturaVifIfnet;
+        IO80211Interface *published = venturaPublishedInterface();
+        if (ifp == nullptr && published != nullptr)
+            ifp = published->getIfnet();
+        if (ifp != nullptr) {
+            snprintf(unitName, sizeof unitName, "%s%u", ifnet_name(ifp),
+                     static_cast<unsigned>(ifnet_unit(ifp)));
+            vif->setProperty("IOInterfaceName", unitName);
+            if (probe) probe->setProperty("Ath10kVifInterfaceName", unitName);
+        } else if (published != nullptr) {
+            // No ifnet here yet: fall back to the BSD name the interface node
+            // already carries, so the vif still gets a usable IOInterfaceName.
+            if (OSString *bsd = OSDynamicCast(OSString, published->getProperty("BSD Name"))) {
+                const char *c = bsd->getCStringNoCopy();
+                if (c != nullptr) {
+                    snprintf(unitName, sizeof unitName, "%s", c);
+                    if (unitName[0] != 0) {
+                        vif->setProperty("IOInterfaceName", unitName);
+                        if (probe) probe->setProperty("Ath10kVifInterfaceName", unitName);
+                    }
+                }
+            }
+        }
+        if (probe && unitName[0] == 0)
+            probe->setProperty("Ath10kVifInterfaceName", "unresolved");
+    }
     const bool attached = ath10kAttachSkywalkInterface(this, vif, this);
     if (probe) {
         probe->setProperty("Ath10kInfraAttach", attached ? "ok" : "failed");
@@ -1119,4 +1160,27 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
     IOLog("Ath10kMac: infra attach vif %p -> %d\n", vif, (int)attached);
     return vif;
 }
+
+// The filter keeps an interface only when IORegistryEntryCreateCFProperty(entry,
+// "IO80211InterfaceRole") is a CFString equal to "Infrastructure". Which entry it
+// is passed is still unknown (Apple80211 asks IO80211 for a port and that helper
+// walks its own registry), so stamp every node in the controller's subtree.
+UInt32 Ath10kPCIDevice::stampInterfaceRole(IOService *root, int depth)
+{
+    if (root == nullptr || depth > 3)
+        return 0;
+    UInt32 n = 0;
+    root->setProperty("IO80211InterfaceRole", "Infrastructure");
+    ++n;
+    if (OSIterator *it = root->getChildIterator(gIOServicePlane)) {
+        OSObject *obj = nullptr;
+        while ((obj = it->getNextObject()) != nullptr) {
+            if (IOService *child = OSDynamicCast(IOService, obj))
+                n += stampInterfaceRole(child, depth + 1);
+        }
+        it->release();
+    }
+    return n;
+}
+
 #endif

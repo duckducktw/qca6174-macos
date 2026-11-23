@@ -36,6 +36,7 @@ public:
 private:
     Ath10kPCIDevice *_owner = nullptr;
     void noteUserClientAttempt(UInt32 type);
+    IOUserClient *makeUserClient(UInt32 type);
 };
 
 #endif
