@@ -15,8 +15,9 @@ extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifne
 
 #include "Ath10kVenturaInterface.hpp"
 #include "../Ath10kPCIDevice.hpp"
-
 #include <IOKit/IOCommandGate.h>
+#include <libkern/c++/OSCollectionIterator.h>
+#include <sys/_types/_size_t.h>
 #include <net/if_media.h>
 
 // ---------------------------------------------------------------------------
@@ -136,6 +137,73 @@ void *Ath10kPCIDevice::getFaultReporterFromDriver()
 // dispatches. This routine only reports where the object's vptr points and
 // whether the four slots carry our code, so a header regression shows up as a
 // breadcrumb instead of as a panic inside framework code.
+
+bool Ath10kPCIDevice::venturaMediumDictionaryKeys(char *out, size_t outLen)
+{
+    if (out == nullptr || outLen == 0)
+        return false;
+    out[0] = '\0';
+    OSDictionary *dict = copyMediumDictionary();
+    if (dict == nullptr) {
+        strlcpy(out, "none", outLen);
+        return false;
+    }
+    OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
+    if (it != nullptr) {
+        size_t used = 0;
+        while (const OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
+            const char *name = key->getCStringNoCopy();
+            if (name == nullptr) continue;
+            size_t len = strlen(name);
+            if (used + len + 2 >= outLen) break;
+            if (used) out[used++] = ',';
+            memcpy(out + used, name, len);
+            used += len;
+            out[used] = '\0';
+        }
+        it->release();
+    }
+    dict->release();
+    const IONetworkMedium *current = getCurrentMedium();
+    if (current != nullptr && outLen > 20) {
+        char tail[32];
+        snprintf(tail, sizeof(tail), "|cur=%08x", (unsigned)current->getType());
+        strlcat(out, tail, outLen);
+    }
+    return true;
+}
+
+bool Ath10kPCIDevice::createVenturaMediumTables(const IONetworkMedium **primary, bool forcePublish)
+{
+    if (_venturaMedium != nullptr && !forcePublish) {
+        if (primary != nullptr) *primary = _venturaMedium;
+        return true;
+    }
+    // Apple80211GetIfListCopy() reads SIOCGIFMEDIA and only accepts an answer
+    // that advertises the 802.11 medium, which IONetworkController derives from
+    // this dictionary. The default IOEthernetController medium is
+    // "autoselect (IFM_ETHER)" and airportd then reports no Wi-Fi interface at
+    // all, whatever the ifnet type or IOInterfaceType property says.
+    OSDictionary *mediumDict = OSDictionary::withCapacity(1);
+    if (mediumDict == nullptr)
+        return false;
+    IONetworkMedium *medium = IONetworkMedium::medium(kIOMediumIEEE80211Auto, 54000000);
+    if (medium == nullptr) {
+        mediumDict->release();
+        return false;
+    }
+    IONetworkMedium::addMedium(mediumDict, medium);
+    const bool published = publishMediumDictionary(mediumDict);
+    mediumDict->release();
+    if (!published) {
+        medium->release();
+        return false;
+    }
+    medium->retain();
+    _venturaMedium = medium;
+    if (primary != nullptr) *primary = _venturaMedium;
+    return true;
+}
 
 bool Ath10kPCIDevice::alignVenturaVtable()
 {

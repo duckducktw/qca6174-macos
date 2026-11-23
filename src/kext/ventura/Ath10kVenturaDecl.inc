@@ -57,6 +57,14 @@ private:
     void *getFaultReporterFromDriver() override;
     SInt32 venturaRecordRequest(UInt requestType, int requestNumber, void *data);
     bool alignVenturaVtable();
+    bool createVenturaMediumTables(const IONetworkMedium **primary, bool forcePublish = false);
+    // Dumps the controller's published medium keys plus the current medium type,
+    // so "our publish returned true but SIOCGIFMEDIA still says IFM_ETHER" can be
+    // traced to the publish being replaced instead of guessed at.
+    bool venturaMediumDictionaryKeys(char *out, size_t outLen);
+    // Retained so setCurrentMedium/setSelectedMedium keep a live object for the
+    // interface's whole life.
+    const IONetworkMedium *_venturaMedium = nullptr;
     bool prepareVenturaLogs();
     void releaseVenturaLogs();
     CCPipe *_venturaPipes[3]{};

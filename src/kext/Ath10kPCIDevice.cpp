@@ -309,6 +309,25 @@ bool Ath10kPCIDevice::start(IOService *provider)
 #endif
     provider->setProperty("Ath10kStartPhase", "controller-started");
 #if defined(ATH10K_VENTURA)
+    // airportd's own enumeration is Apple80211GetIfListCopy(): it asks each
+    // interface for SIOCGIFMEDIA, accepts only answers that advertise
+    // IFM_IEEE80211 (its log line is "Added 'IFM_IEEE80211' supported
+    // interface"), and otherwise reports "getifaddrs nInterfaces[N], count[0]"
+    // plus "Wireless is not available". That answer comes from the controller's
+    // medium dictionary; with none, the controller keeps the Ethernet autoselect
+    // medium, so the unit exists, SystemConfiguration calls it Wi-Fi, and
+    // airportd still refuses to open it.
+    // Must run *after* super::start(): publishMediumDictionary() takes the
+    // controller's medium lock, which only exists once start() has run - calling
+    // it earlier panics in IOLockLock with a null lock (measured: 0x7d into this
+    // helper, RDI=0).
+    {
+        const IONetworkMedium *primaryMedium = nullptr;
+        bool mediaOk = createVenturaMediumTables(&primaryMedium);
+        if (mediaOk && primaryMedium != nullptr)
+            mediaOk = setCurrentMedium(primaryMedium) && setSelectedMedium(primaryMedium);
+        provider->setProperty("Ath10kMediumPhase", mediaOk ? "ieee80211" : "failed");
+    }
     // Exactly one publisher (HANDOFF §7.1). Apple's start() attaches and
     // registers its own interface, so running the manual create/configure/
     // attach/register pass on top of it only produced sibling interface nodes

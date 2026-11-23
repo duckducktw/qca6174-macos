@@ -8,7 +8,40 @@ const OSString *Ath10kPCIDevice::newModelString() const {
     return OSString::withCString("Ath10k WLAN Adapter");
 }
 bool Ath10kPCIDevice::configureInterface(IONetworkInterface *interface) {
+#ifdef ATH10K_VENTURA
+    // Publish the IFM_IEEE80211 medium around the base call: the interface's
+    // ifmedia list (the SIOCGIFMEDIA answer Apple80211 filters on) is built from
+    // the controller's medium dictionary, and something between start() and
+    // attach leaves it as Ethernet autoselect (0x20). Publish before *and*
+    // after the base implementation, and record the dictionary keys at each
+    // point so the replacement is visible in ioreg instead of inferred.
+    char mediumKeys[96];
+    {
+        const IONetworkMedium *primaryMedium = nullptr;
+        const bool mediaOk = createVenturaMediumTables(&primaryMedium, true) &&
+            (primaryMedium == nullptr ||
+             (setCurrentMedium(primaryMedium) && setSelectedMedium(primaryMedium)));
+        venturaMediumDictionaryKeys(mediumKeys, sizeof(mediumKeys));
+        if (IOService *probe = getProvider()) {
+            probe->setProperty("Ath10kMediumConfigPhase", mediaOk ? "ieee80211" : "failed");
+            probe->setProperty("Ath10kMediumPreBase", mediumKeys);
+        }
+    }
+#endif
     if(!IOEthernetController::configureInterface(interface))return false;
+#ifdef ATH10K_VENTURA
+    {
+        const IONetworkMedium *primaryMedium = nullptr;
+        const bool mediaOk = createVenturaMediumTables(&primaryMedium, true) &&
+            (primaryMedium == nullptr ||
+             (setCurrentMedium(primaryMedium) && setSelectedMedium(primaryMedium)));
+        venturaMediumDictionaryKeys(mediumKeys, sizeof(mediumKeys));
+        if (IOService *probe = getProvider()) {
+            probe->setProperty("Ath10kMediumPostBase", mediumKeys);
+            probe->setProperty("Ath10kMediumPostBaseOk", mediaOk);
+        }
+    }
+#endif
     interface->setProperty("IOModel","Ath10k WLAN Adapter");
     interface->setProperty("IOUserVisibleName","Ath10k WLAN Adapter");
     interface->setProperty("Product Name","Ath10k WLAN Adapter");

@@ -97,6 +97,15 @@ bool Ath10kVenturaInterface::init(IO80211Controller *controller, Ath10kPCIDevice
     // IOPrimaryInterface, which comes out as No here. Mark the interface
     // primary before the service is registered and see whether SC takes it.
     setProperty("IOPrimaryInterface", kOSBooleanTrue);
+    // airportd reaches a device through a user client on the interface node, so
+    // the node has to advertise one. Apple's interfaces carry
+    // IOUserClientClass = "IO80211APIUserClient" (published by the interface
+    // start path this driver bypasses). Without it Apple80211 enumerates the unit
+    // successfully - "_getIfListCopy: exit 0, ifCount[1]" - and then drops it in
+    // the public wrapper, which reports "-3903/ifCount[0]", leaving airportd with
+    // "Wireless is not available".
+    setProperty("IOUserClientClass", "IO80211APIUserClient");
+    if (probe) probe->setProperty("Ath10kUserClientClass", "IO80211APIUserClient");
     _owner = owner;
     if (probe) probe->setProperty("Ath10kIfacePhase", "inited");
     return true;
@@ -115,7 +124,20 @@ bool Ath10kVenturaInterface::initIfnetParams(struct ifnet_init_params *params)
 {
     if (params == nullptr)
         return false;
-    return IO80211Interface::initIfnetParams(params);
+    // Apple's implementation refuses anything but IFT_ETHER (it compares the
+    // interface type to 6 and bails), so that check has to run while the type
+    // still reads 6. What lands in the attached ifnet is a separate question:
+    // Apple80211's Apple80211GetIfListCopy() lists Wi-Fi interfaces from
+    // getifaddrs, keeps only ifi_type == IFT_IEEE80211 (71) and reports
+    // "Wireless is not available" / ifCount[0] otherwise - that is the gate
+    // airportd was failing at. SystemConfiguration reads the IOInterfaceType
+    // *property* instead, which stays 6 (see attachToDataLinkLayer).
+    if (!IO80211Interface::initIfnetParams(params))
+        return false;
+    params->type = 0x47 /* IFT_IEEE80211 */;
+    if (IOService *owner = getProvider())
+        owner->setProperty("Ath10kIfnetType", static_cast<UInt64>(params->type), 32);
+    return true;
 }
 
 // Keep the property at IFT_ETHER. See initIfnetParams(): the 802.11 value is a
