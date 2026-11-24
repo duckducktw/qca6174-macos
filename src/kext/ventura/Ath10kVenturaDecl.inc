@@ -6,6 +6,12 @@ public:
     // The live 13.7 IO80211Family has no apple80211Request virtual: airportd
     // reaches a driver through the Virtual/Skywalk request pair instead.
     SInt32 apple80211VirtualRequest(UInt, int, IO80211VirtualInterface *, void *) override;
+    // The live family's per-type handlers reach a driver through one of these two
+    // ioctl slots (setPower/setScanRequest both call [vptr+0xcb0]). They are shimmed
+    // so the arguments can be measured instead of guessed: they publish the raw
+    // registers and then run Apple's own implementation unchanged.
+    SInt32 apple80211_ioctl(IO80211VirtualInterface *, ifnet_t, unsigned long, void *) override;
+    SInt32 apple80211_ioctl(IO80211SkywalkInterface *, unsigned long, void *, void *) override;
     SInt32 apple80211SkywalkRequest(UInt, int, IO80211SkywalkInterface *, void *) override;
     UInt32 hardwareOutputQueueDepth() override;
     SInt32 performCountryCodeOperation(IO80211CountryCodeOp) override;
@@ -141,7 +147,12 @@ private:
     // (never written) here so "events cannot be delivered" is a measurement.
     void *_venturaEventPipe = nullptr;
     bool _venturaScanNotifySent = false;
-    bool _venturaPowerOn = false;
+    // The radio is up from the moment the firmware boots, so report it as on from
+    // the first POWER get: measured with this false, airportd's own state machine
+    // treats Wi-Fi as "Off" and never asks for a scan, while the POWER *set* that
+    // would fix it fails inside the family (Apple80211IOCTLSetWrapper returns
+    // 102/EOPNOTSUPP from IO80211Family's setPower).
+    bool _venturaPowerOn = true;
     UInt32 _venturaState = APPLE80211_S_INIT;
     UInt8 _venturaScanIndex = 0;
     // Request breadcrumbs: airportd reports "Off (forced)" when the power

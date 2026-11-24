@@ -882,6 +882,98 @@ pool，§6.12.8 第 4 點）：註冊完成後 `+0x208` 才有東西，事件（
 在註冊成功之前不要再去試 user client / infra attach 的變體，也不要靠猜測改 SCAN_RESULT 的格式
 —— 驅動端已經用 `tools/apple80211-scan.c` 證明是對的。
 
+### 6.18 第十四輪（v121–v126）：Skywalk 註冊那格填上了 —— 事件通道成立，但 airportd 的掃描握手還差一步
+
+#### 6.18.1 找到 `[ivars+0x208]` 的寫入者（本輪最大的發現）
+
+上一輪量到 `[vif ivars+0x208]`（event pipe 陣列）= 0，並推論「沒有任何 kext 寫它」。**推論方向對，位置錯**：
+寫入者在 `IO80211SkywalkInterface::start(IOService*)`（live `0x200043a`）：
+
+```
+0x0488 mov edi, 0x18
+0x048d call OSArray::withCapacity(0x18)
+0x0492 mov rcx, [r12 + 0x110]        ; ivars
+0x049a mov qword ptr [rcx + 0x208], rax   ; ← event pipe 陣列
+```
+
+而且 `IO80211VirtualInterface::start(provider)`（live `0x201627e`）本體是
+`pop rbp; jmp IO80211SkywalkInterface::start`——純 tail call。也就是說：
+**`createVirtualInterface()` 只 init()，從來沒有 start()，所以那一格永遠是 0。**
+
+修法（v121）：`attachPlatformVif()` 在掛 infra 介面之前先呼叫 Apple 自己的 start()：
+
+```cpp
+extern "C" bool ath10kVifStart(IO80211VirtualInterface *self, IOService *provider)
+    __asm("__ZN23IO80211VirtualInterface5startEP9IOService");
+const bool vifStarted = ath10kVifStart(vif, this);
+```
+
+同時：`attachInterface` 要求角色 ivar `[ivars+0x50] == 1`，而
+`IO80211VirtualInterface::newUserClient` 只接受 6/7（其餘 IOLog `invalid interfaceRole` 並回
+`kIOReturnBadArgument`）。所以流程是：**先用 1 attach，attach 完再寫回 7**。
+
+#### 6.18.2 v121 之後的量測（全部是 breakpoint，不是推論）
+
+| 斷點 | v120 | v121+ |
+|---|---|---|
+| `Ath10kVifStart` | — | `ok` |
+| `Ath10kVifEventPipe` | 0 | 非 0（核心指標） |
+| `Ath10kFamilyClient` | — | `created`（family 的 IO80211APIUserClient 真的建起來） |
+| `Ath10kInfraAttach` | ok | `ok` |
+| `ioreg -c IO80211APIUserClient` | 0 | 8–13 個 |
+| `Apple80211GetIfListCopy` | **-3903 / ifCount[0]** | **0 / ifCount[1]**（介面被接受） |
+| `Ath10kEventPipes` | — | **2**（真的有 2 個 client 掛了 event pipe） |
+| `Ath10kScanEvent` | `no-event-pipe` | **`posted-scan-done`** |
+
+`networksetup -getairportpower en1` 也從 Off 變成 **On**（把 `_venturaPowerOn` 預設改成 true：
+radio 開機就是開的，讓 POWER get 從第一次就答 On；否則 airportd 自己認定 Wi-Fi 關著，永遠不發掃描，
+而它想設 ON 時又被 family 的 `setPower` 擋掉）。
+
+#### 6.18.3 family 的請求是怎麼進來的（v124 破解）
+
+airportd 走 family client 之後，請求不再走 ifnet ioctl，而是進到
+`IO80211Controller::apple80211_ioctl(IO80211SkywalkInterface*, ...)`（live vtable slot 406，offset `0xcb0`）。
+反組譯 Apple 這份實作（`0x1febf98`）發現它其實只認兩個 cmd：
+
+```
+mov eax, 0xc03069c9 ; cmp rdx, rax ; je → eax=0x1ad   (get)
+mov eax, 0x803069c8 ; cmp rdx, rax ; jne → return 0x66 (EOPNOTSUPP)
+```
+
+而且 **同一個 slot 有兩種呼叫慣例**（family 自己前後不一致）：
+- getter 路徑：`(iface, 未用, cmd, req_block)`
+- `setPower` / `setScanRequest`：`(cmd, type, iface, payload)`
+
+因此 v124 把這個 override 改成 4 參數並兩種都認（見 `Ath10kVentura.cpp` 的 `apple80211_ioctl`），
+把 `apple80211req`（`if_name[16]; int type; int val; u32 len; void *data`）解出來丟進
+`venturaRecordRequest()`；不認得的情況才回 Apple 的實作。**效果：SCAN_REQ 從 102/EOPNOTSUPP 變成
+真的進到 driver**（`Ath10kIoctlReqType=10`、`Ath10kLastApple80211Request=10`、`Ath10kScanRequests` 成長）。
+
+#### 6.18.4 還差的那一步（下一輪直接從這裡開始）
+
+現況：SCAN_REQ 進得來、掃描 2.5 秒跑完、結果可用游標協議供應、SCAN_DONE 也真的 post 進 2 條 pipe，
+**但 airportd 仍然 20 秒後 -3905 放棄，而且從頭到尾沒發過一次 `SCAN_RESULT`(11) 請求**。
+
+已排除：請求通道（通了）、通道清單/角色 getter（補了）、dwell 太慢（2.5s）、沒有 pipe（有 2 條）、
+事件沒送（送了 M_SCAN_DONE + M_SCAN_CACHE_UPDATED，帶 payload）。
+
+因此下一個假設是**family 的掃描管理器**：`setScanRequest`（live `0x1fe2318`）在
+`IO80211Controller::getPrimaryInterfaceScanManager()` 回 null 時直接回 0x66，非 null 才走
+`IO80211ScanManager::startScan`。它要的物件有現成 initializer：
+`IO80211ScanManager::initWithControllerAndSkywalkInterface(IO80211Controller*, IO80211SkywalkInterface*)`
+（`0x2010568`，內部會 `commonInit(controller, service)`）。下一輪要做的就是把這個 manager 建起來、
+塞進介面那個 getter 讀的 ivar，讓 family 自己完成「掃描完成 → 通知 airportd → airportd 拉
+SCAN_RESULT」的握手。判斷成功的斷點：`Ath10kLastApple80211Request` 變成 11、`Ath10kScanServed` 成長。
+
+#### 6.18.5 這一輪的檔案變更
+
+- `src/kext/ventura/Ath10kVentura.cpp`：`ath10kVifStart` + start/角色 1→7 流程、
+  `venturaEventPipeCount()`（讀 `[+0x208]+0x130` 的 pipe 數 → `Ath10kEventPipes`）、
+  `runScanNotify()` 改為同時用 controller 與 vif 兩條路徑 post、兩種慣例的 `apple80211_ioctl` 分派。
+- `src/kext/ventura/Ath10kVenturaDecl.inc`：`_venturaPowerOn = true`、ioctl override 改 4 參數。
+- `vendor/itlwm-v1/Airport/IO80211Controller.h`：`apple80211_ioctl(IO80211SkywalkInterface*,unsigned long,void*,void*)`
+  的 arity 依 KC 實測改成 4（名稱沿用，slot 位置不變）。
+
 ## 7. 下一個接手的人：照這個順序
 
 ### 7.1 重疊的發布路徑（**v52 已完成**）

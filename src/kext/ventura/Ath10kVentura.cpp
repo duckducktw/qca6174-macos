@@ -896,6 +896,87 @@ SInt32 Ath10kPCIDevice::apple80211VirtualRequest(UInt requestType, int requestNu
     return venturaRecordRequest(requestType, requestNumber, data);
 }
 
+// Measurement shims for the two generic ioctl slots. The family's own per-type
+// handlers (setPower, setScanRequest, ...) call [controller vptr+0xcb0] with
+// arguments this driver never saw documented: setPower passes (0x803069c8, 19,
+// <interface>, <req_data>) there and takes the return value as the request result,
+// which is why a POWER set answers 102/EOPNOTSUPP. Publishing the raw registers
+// tells us which slot and which argument order that really is, and the Apple
+// implementation still runs afterwards so nothing regresses in the meantime.
+static void publishIoctlArgs(IOService *probe, const char *slot, unsigned long a, unsigned long b,
+                             unsigned long c, unsigned long d)
+{
+    if (probe == nullptr)
+        return;
+    char value[160];
+    snprintf(value, sizeof(value), "%s a=%lx b=%lx c=%lx d=%lx", slot, a, b, c, d);
+    probe->setProperty("Ath10kIoctlArgs", value);
+    probe->setProperty("Ath10kIoctlArgsSlot", slot);
+}
+
+SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211VirtualInterface *iface, ifnet_t ifp,
+                                         unsigned long cmd, void *data)
+{
+    publishIoctlArgs(getProvider(), "virtual-ifnet-cmd-data",
+                     reinterpret_cast<unsigned long>(iface), reinterpret_cast<unsigned long>(ifp),
+                     cmd, reinterpret_cast<unsigned long>(data));
+    return IO80211Controller::apple80211_ioctl(iface, ifp, cmd, data);
+}
+
+// The 48-byte request block every apple80211 ioctl carries:
+//   char if_name[16]; int req_type; int req_val; u32 req_len; void *req_data;
+struct VenturaRawRequest {
+    char ifName[16];
+    int type;
+    int val;
+    UInt32 len;
+    void *data;
+};
+
+SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigned long a,
+                                         void *b, void *c)
+{
+    const unsigned long kGetCmd = 0xc03069c9UL;   // _IOWR('i', 201, 48) - getter
+    const unsigned long kSetCmd = 0x803069c8UL;   // _IOW('i', 200, 48) - setter
+    const unsigned long second = a;
+    const unsigned long third = reinterpret_cast<unsigned long>(b);
+    const unsigned long fourth = reinterpret_cast<unsigned long>(c);
+    const unsigned long first = reinterpret_cast<unsigned long>(iface);
+    publishIoctlArgs(getProvider(), "skywalk", first, second, third, fourth);
+
+    // Two conventions reach this slot (see IO80211Controller.h). Getter paths put the
+    // cmd in the 2nd argument and the request block in the 3rd; setPower and
+    // setScanRequest put the cmd in the 1st, the type in the 2nd, the interface in the
+    // 3rd and the payload in the 4th. Serving both is what makes a POWER/SCAN_REQ from
+    // the family land in this driver instead of coming back as 102/EOPNOTSUPP.
+    if (second == kGetCmd || second == kSetCmd) {
+        const bool isSet = second == kSetCmd;
+        if (third >= 0xffffff0000000000UL) {
+            const auto *raw = reinterpret_cast<const VenturaRawRequest *>(third);
+            if (IOService *probe = getProvider())
+                probe->setProperty("Ath10kIoctlReqType", static_cast<UInt64>(
+                                       static_cast<UInt32>(raw->type)), 32);
+            const SInt32 status = venturaRecordRequest(isSet ? 1 : 0, raw->type, raw->data);
+            if (status == kIOReturnSuccess)
+                return kIOReturnSuccess;
+        }
+    } else if (first == kSetCmd || first == kGetCmd) {
+        const bool isSet = first == kSetCmd;
+        const int type = static_cast<int>(second);
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kIoctlReqType", static_cast<UInt64>(
+                                   static_cast<UInt32>(type)), 32);
+        if (isSet) {
+            const SInt32 status = venturaRecordRequest(1, type, c);
+            if (status == kIOReturnSuccess)
+                return kIOReturnSuccess;
+        }
+    }
+    // Anything this driver does not serve still goes to Apple's implementation, which
+    // is what answered the housekeeping gets before this shim existed.
+    return IO80211Controller::apple80211_ioctl(iface, a, b, c);
+}
+
 SInt32 Ath10kPCIDevice::apple80211SkywalkRequest(UInt requestType, int requestNumber,
                                                  IO80211SkywalkInterface *, void *data)
 {
@@ -1298,6 +1379,17 @@ extern "C" bool ath10kAttachSkywalkInterface(IO80211Controller *self, OSObject *
                                              IOService *service)
     __asm("__ZN17IO80211Controller15attachInterfaceEP8OSObjectP9IOService");
 
+// IO80211VirtualInterface::start() is a tail call into
+// IO80211SkywalkInterface::start(); that body is the only code in the kernel
+// cache that installs the event-pipe array:
+//     [ivars+0x208] = OSArray::withCapacity(0x18)      (capstone, live 0x200043a)
+// IO80211SkywalkInterface::createEventPipe() dereferences that slot and
+// IO80211APIUserClient's event subscription runs through it, so a virtual
+// interface that was only init()ed - which is all createVirtualInterface() does -
+// can never deliver an event. Measured before this call: Ath10kVifEventPipe=0.
+extern "C" bool ath10kVifStart(IO80211VirtualInterface *self, IOService *provider)
+    __asm("__ZN23IO80211VirtualInterface5startEP9IOService");
+
 IOService *Ath10kPCIDevice::attachPlatformVif()
 {
     IOService *probe = getProvider();
@@ -1307,6 +1399,18 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
         return nullptr;
     }
     void **ivarsSlot = reinterpret_cast<void **>(reinterpret_cast<char *>(vif) + 0x110);
+    // Apple's start() first, while the vif still carries the role
+    // createVirtualInterface() gave it. Everything below depends on its ivars.
+    const bool vifStarted = ath10kVifStart(vif, this);
+    if (*ivarsSlot != nullptr) {
+        _venturaEventPipe = *reinterpret_cast<void **>(
+            reinterpret_cast<char *>(*ivarsSlot) + 0x208);
+    }
+    if (probe) {
+        probe->setProperty("Ath10kVifStart", vifStarted ? "ok" : "failed");
+        probe->setProperty("Ath10kVifEventPipe",
+                           static_cast<UInt64>(reinterpret_cast<uintptr_t>(_venturaEventPipe)), 64);
+    }
     if (*ivarsSlot != nullptr)
         *reinterpret_cast<UInt32 *>(reinterpret_cast<char *>(*ivarsSlot) + 0x50) = 1;
     // The userspace filter that decides whether airportd keeps an interface reads
@@ -1322,16 +1426,14 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
     // the v1 interface node in Ath10kVenturaInterface::attachToDataLinkLayer(),
     // which is where the BSD name first exists.
     const bool attached = ath10kAttachSkywalkInterface(this, vif, this);
-    // The event pipe lives behind the interface's ivar block at +0x208. Nothing in
-    // the live family writes that slot (measured over the whole __TEXT), so a null
-    // here means airportd can never be signalled — worth recording as a number.
-    if (*ivarsSlot != nullptr) {
-        _venturaEventPipe = *reinterpret_cast<void **>(
-            reinterpret_cast<char *>(*ivarsSlot) + 0x208);
-    }
+    // attachInterface stored the infra pointer while the role read 1. Put the role
+    // back to what createVirtualInterface() made, because
+    // IO80211VirtualInterface::newUserClient() accepts 6 and 7 only and logs
+    // "invalid interfaceRole: 1" for anything else - measured in v112, and it is
+    // why airportd's IOServiceOpen on this node failed with 0xe00002c2.
+    if (*ivarsSlot != nullptr)
+        *reinterpret_cast<UInt32 *>(reinterpret_cast<char *>(*ivarsSlot) + 0x50) = 7;
     if (probe) {
-        probe->setProperty("Ath10kVifEventPipe",
-                           static_cast<UInt64>(reinterpret_cast<uintptr_t>(_venturaEventPipe)), 64);
         probe->setProperty("Ath10kInfraAttach", attached ? "ok" : "failed");
         probe->setProperty("Ath10kInfraPhase", attached ? "attached" : "attach-failed");
         probe->setProperty("Ath10kInfraIf",
@@ -1355,6 +1457,17 @@ void Ath10kPCIDevice::scanNotifyCall(thread_call_param_t param0, thread_call_par
     auto *self = static_cast<Ath10kPCIDevice *>(param0);
     if (self != nullptr)
         self->runScanNotify();
+}
+
+// [ivars+0x208] is an OSArray of per-client event pipes; the same vtable slot
+// createEventPipe reads to enforce its 0x18-pipe ceiling is its element count.
+static UInt32 venturaEventPipeCount(void *array)
+{
+    if (array == nullptr)
+        return 0;
+    void **vtable = *reinterpret_cast<void ***>(array);
+    using CountFn = UInt32 (*)(void *);
+    return reinterpret_cast<CountFn>(vtable[0x130 / 8])(array);
 }
 
 void Ath10kPCIDevice::runScanNotify()
@@ -1381,8 +1494,21 @@ void Ath10kPCIDevice::runScanNotify()
         return;
     }
     ath10kControllerPostMessage(this, APPLE80211_M_SCAN_DONE, nullptr, 0, nullptr);
+    // The controller's postMessage fans out from the primary interface; posting on the
+    // Skywalk interface itself is the direct route into the event pipe that airportd's
+    // IO80211APIUserClient subscribed to. A scan-done carries the completion status and
+    // the number of results collected so the client's bookkeeping matches.
+    if (_venturaVif != nullptr) {
+        struct { UInt32 status; UInt32 results; } payload{0, static_cast<UInt32>(_wmiBSS.count)};
+        _venturaVif->postMessage(APPLE80211_M_SCAN_DONE, &payload, sizeof(payload));
+        _venturaVif->postMessage(APPLE80211_M_SCAN_CACHE_UPDATED, &payload, sizeof(payload));
+    }
     _venturaScanNotifySent = true;
     probe->setProperty("Ath10kScanEvent", "posted-scan-done");
+    // How many clients actually hold an event pipe: with zero, posting is a no-op and
+    // airportd keeps waiting no matter what type is sent.
+    probe->setProperty("Ath10kEventPipes",
+                       static_cast<UInt64>(venturaEventPipeCount(_venturaEventPipe)), 32);
 }
 
 // The filter keeps an interface only when IORegistryEntryCreateCFProperty(entry,

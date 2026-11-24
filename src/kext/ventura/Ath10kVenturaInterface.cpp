@@ -271,32 +271,41 @@ void Ath10kVenturaInterface::noteUserClientAttempt(UInt32 type)
     }
 }
 
-// The family's virtual-interface newUserClient refuses any interface role other
-// than 6/7: IO80211VirtualInterface::newUserClient reads the role dword at
-// [ivars+0x50] and logs
-//   "newUserClient: ERROR: invalid interfaceRole: %d provided to newUserClient"
-// for anything else, returning kIOReturnBadArgument. Delegating the open to
-// IO80211SkywalkInterface::newUserClient with the vif as receiver does get past
-// that check (measured: the family's IO80211APIUserClient is created), but the
-// client then asks the vif for its event pipe and
-//   IO80211SkywalkInterface::createEventPipe + 0x1b
-// dereferences a null ivar at [ivars+0x208] — that slot is only populated for an
-// interface the Skywalk stack registered, so the whole VM panics as soon as
-// airportd subscribes. Do not hand airportd a family client on a vif we cannot
-// fully register.
+// Hand the open to the family's own client implementation with the Skywalk vif as
+// the provider. Two casts decide this: IO80211APIUserClient::commonStart casts its
+// provider to IO80211SkywalkInterface (a v1 IO80211Interface can never satisfy
+// that), and IO80211VirtualInterface::newUserClient accepts interface roles 6 and
+// 7 only. attachPlatformVif() therefore leaves the vif at the role
+// createVirtualInterface() gave it.
 //
-// Answer "unsupported" instead: airportd then falls back to the classic ifnet
-// ioctl channel, which is the path a pre-Skywalk interface driver is meant to
-// serve (see performCommand below).
+// This is the same delegation v112 tried, and it panicked because the client's
+// event subscription dereferences [ivars+0x208] (the event-pipe OSArray), which
+// only IO80211SkywalkInterface::start() installs - and createVirtualInterface()
+// only init()s. attachPlatformVif() now calls that start(), and the pipe pointer
+// is published as Ath10kVifEventPipe; if it is still null the open is refused
+// instead of panicking, so airportd falls back to the ifnet ioctl channel
+// (performCommand) the way v113-v120 ran.
 IOReturn Ath10kVenturaInterface::newUserClient(task_t owningTask, void *securityID,
                                                UInt32 type, OSDictionary *properties,
                                                IOUserClient **handler)
 {
-    (void)owningTask; (void)securityID; (void)type; (void)properties;
+    noteUserClientAttempt(type);
     if (handler != nullptr)
         *handler = nullptr;
-    noteUserClientAttempt(type);
-    return kIOReturnUnsupported;
+    Ath10kPCIDevice *owner = _owner;
+    IO80211VirtualInterface *vif = (owner != nullptr) ? owner->_venturaVif : nullptr;
+    if (vif == nullptr || handler == nullptr || owner->_venturaEventPipe == nullptr)
+        return kIOReturnUnsupported;
+    IOUserClient *client = nullptr;
+    const IOReturn result = vif->newUserClient(owningTask, securityID, type, properties, &client);
+    IOService *probe = (owner->getProvider() != nullptr) ? owner->getProvider() : getProvider();
+    if (probe != nullptr)
+        probe->setProperty("Ath10kFamilyClient",
+                           result == kIOReturnSuccess ? "created" : "failed");
+    if (result != kIOReturnSuccess || client == nullptr)
+        return kIOReturnUnsupported;
+    *handler = client;
+    return kIOReturnSuccess;
 }
 
 // airportd's bind chain, recovered from its own log:
@@ -406,11 +415,20 @@ SInt32 Ath10kVenturaInterface::performCommand(IONetworkController *controller, u
 IOReturn Ath10kVenturaInterface::newUserClient(task_t owningTask, void *securityID,
                                                UInt32 type, IOUserClient **handler)
 {
-    (void)owningTask; (void)securityID;
+    // IONetworkInterface's older overload: same delegation, no properties dict.
+    noteUserClientAttempt(type | 0x80000000u);
     if (handler != nullptr)
         *handler = nullptr;
-    noteUserClientAttempt(type | 0x80000000u);
-    return kIOReturnUnsupported;
+    Ath10kPCIDevice *owner = _owner;
+    IO80211VirtualInterface *vif = (owner != nullptr) ? owner->_venturaVif : nullptr;
+    if (vif == nullptr || handler == nullptr || owner->_venturaEventPipe == nullptr)
+        return kIOReturnUnsupported;
+    IOUserClient *client = nullptr;
+    const IOReturn result = vif->newUserClient(owningTask, securityID, type, nullptr, &client);
+    if (result != kIOReturnSuccess || client == nullptr)
+        return kIOReturnUnsupported;
+    *handler = client;
+    return kIOReturnSuccess;
 }
 
 UInt32 Ath10kVenturaInterface::inputPacket(mbuf_t packet, UInt32 length,

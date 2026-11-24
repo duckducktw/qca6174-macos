@@ -188,7 +188,13 @@ public:
     virtual int bpfOutputPacket(OSObject *,UInt,mbuf_t m);
     virtual SInt32 monitorModeSetEnabled(bool, UInt);
     virtual SInt32 apple80211_ioctl(IO80211VirtualInterface *, ifnet_t, unsigned long, void *);
-    virtual SInt32 apple80211_ioctl(IO80211SkywalkInterface *,unsigned long,void *);
+    // Live ABI: this slot serves BOTH call conventions the family uses. Getter paths
+    // call it as (interface, unused, cmd, data) and setPower/setScanRequest call it as
+    // (cmd, type, interface, data); disassembly of the live implementation
+    // (0xffffff8001febf98) shows it comparing the *second* argument against
+    // 0xc03069c9 / 0x803069c8 and returning 0x66 for anything else, so the arity here
+    // is what the KC really uses, not what the older SDK header described.
+    virtual SInt32 apple80211_ioctl(IO80211SkywalkInterface *,unsigned long,void *,void *);
     virtual SInt32 apple80211VirtualRequest(UInt,int,IO80211VirtualInterface *,void *);
     virtual SInt32 apple80211SkywalkRequest(UInt,int,IO80211SkywalkInterface *,void *);
     virtual UInt32 hardwareOutputQueueDepth();
