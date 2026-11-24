@@ -1500,8 +1500,14 @@ void Ath10kPCIDevice::runScanNotify()
     // the number of results collected so the client's bookkeeping matches.
     if (_venturaVif != nullptr) {
         struct { UInt32 status; UInt32 results; } payload{0, static_cast<UInt32>(_wmiBSS.count)};
+        // Three delivery shapes, because which one the Skywalk-era client listens on is
+        // not documented: the interface broadcast, the controller's fan-out with the
+        // "deliver" flag set, and the interface's named-IOUC channel (reached through a
+        // raw vtable call because IO80211VirtualInterface does not declare it).
         _venturaVif->postMessage(APPLE80211_M_SCAN_DONE, &payload, sizeof(payload));
         _venturaVif->postMessage(APPLE80211_M_SCAN_CACHE_UPDATED, &payload, sizeof(payload));
+        ath10kControllerPostMessage(this, APPLE80211_M_SCAN_DONE, &payload, sizeof(payload),
+                                    reinterpret_cast<void *>(1));
     }
     _venturaScanNotifySent = true;
     probe->setProperty("Ath10kScanEvent", "posted-scan-done");

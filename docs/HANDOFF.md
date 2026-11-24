@@ -974,6 +974,68 @@ SCAN_RESULT」的握手。判斷成功的斷點：`Ath10kLastApple80211Request` 
 - `vendor/itlwm-v1/Airport/IO80211Controller.h`：`apple80211_ioctl(IO80211SkywalkInterface*,unsigned long,void*,void*)`
   的 arity 依 KC 實測改成 4（名稱沿用，slot 位置不變）。
 
+### 6.19 第十五輪（v127）：牆的真正名字 —— **掃描快取住在 `IO80211ScanManager`，而那個物件我們拿不到**
+
+#### 6.19.1 決定性證據（兩支 family handler 都反組譯完了）
+
+`IO80211Controller::getPrimaryInterfaceScanManager()` 是最後一根柱子，**掃描請求與掃描結果都靠它**：
+
+`setScanRequest`（live `0x1fe2318`）：
+```
+req->req_len == 0 → 0x16 ; req->req_data == null → 0x16
+rax = getPrimaryInterfaceScanManager()
+if (!rax) → return 0x66            ← EOPNOTSUPP，airportd 早期看到的 102
+jmp IO80211ScanManager::startScan(rax, req->req_data)
+```
+
+`getScanResult`（live `0x1fdc76e`）：
+```
+req->req_len 必須 == 0x48c         ← 1164 = sizeof(apple80211_scan_result)，正好驗證 §6.17 的 inline IE 佈局
+rbx = req->req_data
+rax = getPrimaryInterfaceScanManager()
+if (!rax) → 錯誤路徑（airportd 永遠拿不到結果）
+IO80211ScanManager::getScanResult(&result, &ts) ; memcpy(req_data, result, 0x48c)
+```
+
+而 `IO80211SkywalkInterface::getScanManager()`（live `0x20037a8`，vtable index 373 / offset `0xba8`）本體是：
+
+```
+xor eax, eax
+ret            ← 無條件回 null
+```
+
+`setScanningState`（index 371 / `0xb98`）也只是 IOLog 的樁。**結論：live family 把掃描快取放在
+scan manager 裡，driver 不再「按需求送 SCAN_RESULT」，而是由 manager 收送；而 vif（Apple 的
+`IO80211VirtualInterface`）的 `getScanManager()` 永遠回 null，我們又不能用子類覆蓋它。**
+`ioreg` 的 `IOKitDiagnostics` 也印證：`"IO80211ScanManager"=0`（整個核心沒有任何實例）。
+
+這解釋了第十五輪所有量測：SCAN_REQ 我們自己服務會成功（v124 起 `Ath10kIoctlReqType=10`、
+`ScanRequests` 成長），但 airportd 之後的完成/取結果握手全在 manager 裡，manager 不存在 → 20 秒 -3905，
+且 `Ath10kScanServed` 永遠 0（它從沒向我們要 type 11，因為 type 11 是 family 內部處理掉/失敗掉）。
+
+#### 6.19.2 已排除的路（不要再重試）
+
+- 補 `SUPPORTED_CHANNELS` / `VIRTUAL_IF_ROLE` / `PARENT`：已做，只讓 SCAN_REQ 送得出來。
+- 加快掃描（110ms dwell，2.5 秒掃完）：已做，仍超時。
+- 事件通道：`Ath10kVifEventPipe` 非 0、`Ath10kEventPipes=2`、M_SCAN_DONE + M_SCAN_CACHE_UPDATED
+  三種送法（vif 廣播、controller fan-out 帶 flag、payload 有無）都試過，airportd 仍不動。
+- 直接建 `IO80211ScanManager`：`initWithControllerAndSkywalkInterface(controller, skywalkIface)`
+  存在（`0x2010568`），但它 init 時會對 driver 打 `cmd=0xc03069c9 / type=0x0c(CARD_CAPABILITIES)`
+  並要求回傳 caps 第 6 byte 的 bit 0x40（capability 索引 22）；而且**沒有任何人把 manager 寫回介面**，
+  `getScanManager()` 又是硬 null，所以「建了也接不上」。
+
+#### 6.19.3 下一輪只剩兩條路（都要動架構）
+
+1. **讓 infra 介面是 `IO80211InfraInterface`（而不是 vif）**：`IO80211InfraInterface` 是 Apple 為
+   role 1 準備的子類，很可能覆寫了 `getScanManager()` 並持有 manager。歷史紀錄說直接 new 會卡在
+   metaclass（§5.11），但值得先確認 family 有沒有現成 factory（`createVirtualInterface` 只給 role 7）。
+2. **自己實作掃描快取與握手**：既然 `setScanRequest`/`getScanResult` 都因 manager 缺席而失敗，
+   就必須讓 airportd 走另一條「driver 自己服務」的路徑 —— 目前唯一已知可行的是 v120 的純 ifnet ioctl
+   通道，但那條沒有事件通道，airportd 一樣會 -3905。除非找到「ioctl 通道 + 事件」的組合，
+   否則這條不成立。
+
+判斷進度的斷點仍然是：`Ath10kLastApple80211Request` 變成 11、`Ath10kScanServed` 成長。
+
 ## 7. 下一個接手的人：照這個順序
 
 ### 7.1 重疊的發布路徑（**v52 已完成**）
