@@ -1,15 +1,14 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-24（**第十三輪：S1 驅動端完成**。`venturaScan()` 會重新 arm 共用的 WMI 掃描
-（dwell 110 ms，實測 **2.5 秒**掃完 38 個通道），`venturaScanResult()` 用游標協議一筆一筆送出完整結果
-（channel/flags/RSSI/rates/inline RSN IE）——`tools/apple80211-scan.c` 實測一次拿到 15–25 個 AP、每個都
-帶 RSN IE。airportd 也真的會送 `SCAN_REQ`（CoreWLAN `cwscan` 觸發），但**收不到「掃描完成」**：
-20 秒後 -3905、從不拉 `SCAN_RESULT`。牆量到了：`[vif ivars+0x208]`（event pipe）= 0，那是 Skywalk
-註冊才會填的格子。詳見 §6.17。第十二輪：§6.16；第十一輪：§6.15。）
+最後更新：2026-11-24（**第十七輪：airportd/CoreWLAN 掃描成功**。`cwscan en1` 從 `networks=0` 變成
+**14–16 個真實網路**（SSID／頻道／RSSI／WPA2 全對），airportd 的判定從 `error=102` /
+`-536870160` 變成 **`error=0`**。三個關鍵：SCAN_RESULT 的**結束碼**必須是 `EIO(5)`（不是
+`kIOReturnNotFound`）、pointer-out 路徑**不能**掉進一般緩衝分支（會 panic）、每個 pid 要有**自己的
+游標**。詳見 §6.21。第十六輪：§6.20。）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v120**（`/tmp/vk120`，Acer 上）— kext 載入、en1 `UP,RUNNING`、SC 認得 IEEE80211、
-`Wi-Fi` 硬體埠、airportd 走 ifnet ioctl（power 查詢答 `On`）、`Ath10kApple80211Requests` 持續成長、
-**掃描結果可由驅動端完整供應**、`Ath10kVifEventPipe=0`（事件通道未成立）。v115/v110/v94/v87 都留著
+VM 現況：**v149**（`/tmp/vk149`，Acer 上，sha256 `f517336a…`）— kext 載入、en1 `UP,RUNNING`、
+airportd 走 ifnet ioctl + family 通道、`Ath10kScanMgrInit=ok`／`Visible=yes`、`Ath10kVifEventPipe` 非 0、
+**airportd 掃描 `error=0`、CoreWLAN 拿到 14–16 個網路**；v120/v146/v147/v148 都留著
 
 ---
 
@@ -22,7 +21,7 @@ VM 現況：**v120**（`/tmp/vk120`，Acer 上）— kext 載入、en1 `UP,RUNNI
 | **A** | `Ath10kIfacePhase = "inited"`、`Ath10kStartPhase = "controller-started"` | ✅ 已達成（Apple 的 `start()` 是唯一 publisher） |
 | **B** | `ioreg -r -c IO80211Interface` ≥1 筆且有 `BSD Name`；`networksetup -listallhardwareports` 出現 Wi-Fi | ✅ 已達成（v64 起 `SCNetworkInterfaceCopyAll()` 第 3 筆 = `en1 type=IEEE80211`，Wi-Fi 硬體埠成立；一旦替它建了服務，`listallhardwareports` 會把它當「已設定」而不列，屬正常） |
 | **C** | 「系統設定 → Wi-Fi」可見、開關可操作 | 🟢 幾乎（v120 同 v115：airportd 走 ioctl、`networksetup -getairportpower en1` 回 `On`、en1 `UP,RUNNING`、`Wi-Fi` 硬體埠在。仍缺「系統設定裡親眼看到開關」的截圖：VM 沒有 VNC 客戶端、auto-login 沒生效，見 §6.15.6） |
-| **D** | 可掃描到 AP 並以 WPA2 連線取得 IP | 🟡 一半（v120：驅動端掃描已通 —— WMI 掃描 2.5 秒完成、`SCAN_RESULT` 游標供應 15–25 個 AP 含 RSN IE，`tools/apple80211-scan.c` 實測；但 airportd 收不到「掃描完成」，20 秒 -3905 後放棄，卡在 `[vif ivars+0x208]` event pipe，§6.17；ASSOCIATE 仍 stub） |
+| **D** | 可掃描到 AP 並以 WPA2 連線取得 IP | 🟡 一半（v149：**airportd/CoreWLAN 掃描已通** —— `cwscan en1` 回 14–16 個真實網路、airportd `Completed scan … error=0`，§6.21；ASSOCIATE 仍 stub） |
 | **E** | 全程不改系統設定以外的東西、不需終端機、無獨立 app；最後部署回實體 ESP 並真機重驗 | ❌ 未開始（§7.4） |
 
 **一句話總結現況**：無線電在跑、Apple 的 `start()` 發布了 `en1`，而**第五輪找到了「SC 看不到介面」的真兇**：不是 SC 的分類規則、不是 80211 core 的註冊，而是介面節點上 `IOInterfaceType=71` 這個**屬性**——`SCNetworkInterface.c` 只接受 `IFT_ETHER(6)`/`IFT_IEEE1394(13)`，其他值直接 `"unknown interface type"` 把介面丟掉。改回 6 之後 SC 立刻列 `en1 type=IEEE80211`（因為它改看 controller 是否符合 `IO80211Controller`），Wi-Fi 硬體埠與服務都成立。**最後一哩是 airportd**：它透過 `IO80211Controller` 的 +0x200 ivar（`getNetworkInterface()`/`getInfraInterface()` 都只是讀這個 pointer）找裝置，而該 ivar 實測是 null。
@@ -1100,11 +1099,10 @@ v115 的 ioreg（不是推論，是實測）：
 `recordWMIBSS()` 在 `Ath10kBSS.hpp`），Ventura 版本來就有編進去。缺的只是把
 `venturaScan()` / `venturaScanResult()` 這兩個 stub 接上去。
 
-#### 7.3.1 第一步：讓 airportd 看得到掃描結果（S1）
+#### 7.3.1 第一步：讓 airportd 看得到掃描結果（S1）—— **v149 已完成**
 
-**驅動端已完成（v116–v120，§6.17）**：`venturaScan()` 重新 arm 掃描、`venturaScanResult()` 游標式送
-完整結果、`SUPPORTED_CHANNELS`/`VIRTUAL_IF_ROLE` 也補了。剩下的只有「告訴 airportd 掃描結束」這一步，
-而它需要 `[vif ivars+0x208]`（event pipe），也就是 Skywalk 註冊。
+現況：`cwscan en1` 回 14–16 個真實網路、airportd `Completed scan … error=0`（§6.21）。驅動端、
+family 的 scan manager、事件通道（kern_event）、結束碼（`EIO`）全部到位。
 
 要改的只有 `src/kext/ventura/Ath10kVentura.cpp` 兩個函式，外加一個 kick：
 
@@ -1405,6 +1403,60 @@ ssh 100.64.0.152 'printf "system_reset\n" | socat - UNIX-CONNECT:/tmp/ventura-vm
 - guest 的 `/tmp` **每次重開都會清空**，`cwscan`／`a11scan`／量測腳本要每次重傳。
 - 部署固定式：`bash ~/.hermes/cache/scratch/build_v.sh` → `ssh 100.64.0.152 'bash ~/qca-tools/pull_v.sh NN'`
   → `cat ~/sudo.pwd | ssh 100.64.0.152 'bash ~/qca-tools/deploy.sh /tmp/vkNN'`。
+
+---
+
+### 6.21 第十七輪（v143–v149）：airportd 的掃描從 0 筆變成 14–16 筆
+
+#### 6.21.1 用三入口斷點把「哪條通道」量出來（§6.20.4 的做法）
+
+新增 `Ath10kEnt_perf` / `Ath10kEnt_slot406` / `Ath10kEnt_slot408`（各自 type-11 的命中數、`len`、
+最後狀態）與 `Ath10kScanServeTrace`（最近 8 筆 `pid:index`）。一次 `cwscan` 就得到答案：
+
+- **type-11 只走 slot406（getter 慣例）與 slot408（manager 的 pointer-out）**，兩邊各 91–95 次、
+  `len=1164 (0x48c)`；`performCommand`（BSD ioctl）那條 **0 次**。
+- 讀者是 **airportd 本人**（`ScanServeTrace` 的 pid = airportd），不是 cwscan；cwscan 透過 XPC 請它掃。
+
+#### 6.21.2 死路（全部實測，勿重做）
+
+| # | 做法 | 結果 |
+|---|---|---|
+| 1 | pointer-out 用完時「掉進一般緩衝分支」當後備 | **panic**：在呼叫端只有 8 byte 的 local 上 `memset` 0x48c → 撞堆疊守衛頁（`IO80211ScanManager::scanDone` → `apple80211SkywalkRequest+0x6b`，RIP 在 memcpy，CR2 = 堆疊頂、RDX = 0x48c）。pointer-out 成立時**結尾直接回傳，不碰緩衝** |
+| 2 | manager 與 client 共用一個 `_venturaScanIndex` | 半份清單：manager 吃掉 0–10，airportd 從 11 開始只拿到 11–19。改成 **per-pid 游標**（`venturaReaderSlot()`）才讀完整份 |
+| 3 | 結束碼用 `kIOReturnNotFound`(0xe00002f0) | airportd log「Failed to perform Wi-Fi scan, returned error code **-536870160**」→ networks=0。**airportd 把結束碼原封不動當掃描結果** |
+| 4 | 跨檔 helper 只在一端寫 `extern "C"` | kext 允許 undefined symbol → build 照過，但 **OpenCore 靜默跳過整個 kext**（序列埠零 ath10k、`kmutil showloaded \| grep -c ath10k` = 0、ioreg 完全沒有 Ath10k 屬性）。兩端都要寫；驗證用 `nm -u \| grep <name>` |
+
+**正解**：結束碼用 **`EIO(5)`**（classic ioctl 通道本來就產生 5，itlwm 也是 5/12）→ airportd log 變
+`Completed scan … error=0`。
+
+#### 6.21.3 實測（v149，Acer `/tmp/vk149`，sha256 `f517336a…`）
+
+```
+./cwscan en1
+interface=en1 power=1
+networks=14                     ← 第二次跑 16
+  ssid='Qoonet'         bssid=(null) ch=10 rssi=-67 sec(wpa2=1 wpa3=0 wpa=0)
+  ssid='Jane'           bssid=(null) ch=3  rssi=-72 sec(wpa2=1 …)
+  ssid='142-wifi6'      bssid=(null) ch=6  rssi=-72 sec(wpa2=1 …)
+  …（共 14 筆，SSID／頻道／RSSI／WPA2 全對）
+airportd log: Completed scan for pid 373 (cwscan) (error=0, duration=22.01s, …)
+```
+
+- **BSSID 顯示 `(null)` 不是驅動問題**：airportd 對沒有 location 授權的行程會剝掉 BSSID 與國碼
+  （log：`Filtering BSSID and country code from scan results because location services not authorized
+  for pid N`）。同一份資料在 `airport -s` 與 `tools/apple80211-scan.c` 都印得出完整 BSSID。
+- 掃描本身 22 秒：airportd 把 5GHz 拆成 3 個 channel subset（6 個 channel 一次）各掃一輪，不是我們慢。
+
+#### 6.21.4 這輪的檔案變更
+
+- `src/kext/ventura/Ath10kVentura.cpp`：三入口斷點與 `Ath10kScanServeTrace`、pointer-out 結尾
+  不再掉進一般緩衝、pointer-out 走 per-pid 游標、`venturaScanResult()` 結束碼改 `EIO`、type-11
+  在 slot406 不再 fall-through 給 Apple（那只會回 0x66 = airportd 的 error 102）。
+- `src/kext/ventura/Ath10kVenturaInterface.cpp`：`performCommand` 也掛 slot 0 斷點。
+
+#### 6.21.5 下一步
+
+S1 完成，接 §7.3.2（WPA2-PSK 關聯）：PBKDF2 → `_connection` 綁 BSS → `venturaAssociate()`。
 
 ---
 

@@ -920,6 +920,51 @@ static void publishIoctlArgs(IOService *probe, const char *slot, unsigned long a
     probe->setProperty("Ath10kIoctlArgsSlot", slot);
 }
 
+// Which of the three transport paths carried airportd's SCAN_RESULT (type 11)?
+// A type-11 request can arrive three different ways: the BSD ioctl channel
+// (performCommand), the slot-406 getter convention (cmd in arg1), or the slot-408
+// Skywalk request the family's scan manager calls. They have different buffer
+// shapes, and serving two of them at once is what wedged the client's read loop.
+// Each entry records its own type-11 hit count, request length and status, so one
+// cwscan run answers the question instead of another round of guessing.
+struct VenturaEntryProbe {
+    const char *name;
+    UInt32 hits;
+    UInt32 type;
+    UInt32 len;
+    SInt32 status;
+};
+
+static VenturaEntryProbe gVenturaEntryProbe[3] = {
+    {"perf", 0, 0, 0, 0},
+    {"slot406", 0, 0, 0, 0},
+    {"slot408", 0, 0, 0, 0},
+};
+
+extern "C" void ath10kVenturaProbeEntry(int which, IOService *probe, UInt32 type, UInt32 len,
+                                       SInt32 status)
+{
+    if (which < 0 || which >= 3)
+        return;
+    if (type != APPLE80211_IOC_SCAN_RESULT)
+        return;
+    VenturaEntryProbe &entry = gVenturaEntryProbe[which];
+    ++entry.hits;
+    entry.type = type;
+    entry.len = len;
+    entry.status = status;
+    IOLog("Ath10kMac: SCAN_RESULT via %s len=%u st=%x (hit %u)\n", entry.name, len,
+          static_cast<unsigned>(static_cast<UInt32>(status)), entry.hits);
+    if (probe == nullptr)
+        return;
+    char key[32];
+    snprintf(key, sizeof(key), "Ath10kEnt_%s", entry.name);
+    char value[80];
+    snprintf(value, sizeof(value), "n=%u len=%u st=%x", entry.hits, entry.len,
+             static_cast<unsigned>(static_cast<UInt32>(entry.status)));
+    probe->setProperty(key, value);
+}
+
 SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211VirtualInterface *iface, ifnet_t ifp,
                                          unsigned long cmd, void *data)
 {
@@ -967,11 +1012,23 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
             // against. SCAN_RESULT is served from the driver's own cursor below, because
             // getScanResult() only answers a pid that owns one of those nodes.
             const SInt32 routed = venturaScanManagerRequest(raw->type, raw->data);
-            if (routed != kIOReturnUnsupported)
+            if (routed != kIOReturnUnsupported) {
+                ath10kVenturaProbeEntry(1, getProvider(), raw->type,
+                                        static_cast<UInt32>(raw->len), routed);
                 return routed;
+            }
             const SInt32 status = venturaRecordRequest(isSet ? 1 : 0, raw->type, raw->data);
+            ath10kVenturaProbeEntry(1, getProvider(), raw->type,
+                                    static_cast<UInt32>(raw->len), status);
             if (status == kIOReturnSuccess)
                 return kIOReturnSuccess;
+            // SCAN_RESULT must never fall through to Apple's implementation: its
+            // answer for a getter it does not route is 0x66 (EOPNOTSUPP = the 102
+            // airportd prints), and the client reads that as "the scan failed"
+            // even though it just walked a full list. The end-of-list status this
+            // driver returns is what ends the read loop.
+            if (raw->type == APPLE80211_IOC_SCAN_RESULT)
+                return status;
             _venturaFallType = raw->type;
         }
     } else if (first == kSetCmd || first == kGetCmd) {
@@ -984,8 +1041,12 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
         // airportd's SCAN_RESULT arrives this way, and leaving it to Apple's
         // implementation is what returned 0x66 (= the error 102 it reports).
         const SInt32 status = venturaRecordRequest(isSet ? 1 : 0, type, c);
+        ath10kVenturaProbeEntry(1, getProvider(), static_cast<UInt32>(type), 0, status);
         if (status == kIOReturnSuccess)
             return kIOReturnSuccess;
+        // Same rule as above: 0x66 here is what airportd reports as error 102.
+        if (type == APPLE80211_IOC_SCAN_RESULT)
+            return status;
         _venturaFallType = type;
     }
     // Anything this driver does not serve still goes to Apple's implementation, which
@@ -1014,12 +1075,30 @@ SInt32 Ath10kPCIDevice::apple80211SkywalkRequest(UInt requestType, int requestNu
         // its own local and memcpy's sizeof(apple80211_scan_result) from whatever is
         // stored there, so writing the struct in place would smash its stack.
         if (gVenturaScanSlot != nullptr) {
+            // The manager drains the sweep through this pointer-out shape and so
+            // does the client's own read; a single shared cursor handed the head of
+            // the list to whichever came first, and the other reader started
+            // mid-list (measured: manager consumed 0-10, airportd got 11-19 and
+            // still showed no networks). Give every pid its own position here too.
+            int8_t *slot = venturaReaderSlot();
+            if (slot != nullptr)
+                _venturaScanIndex = static_cast<UInt8>(*slot);
             _venturaIoctlLength = sizeof(*gVenturaScanSlot);
             const IOReturn status = venturaScanResult(gVenturaScanSlot);
+            if (slot != nullptr)
+                *slot = static_cast<int8_t>(_venturaScanIndex);
+            ath10kVenturaProbeEntry(2, getProvider(), requestNumber, _venturaIoctlLength, status);
             if (status == kIOReturnSuccess) {
                 *static_cast<apple80211_scan_result **>(data) = gVenturaScanSlot;
                 return kIOReturnSuccess;
             }
+            // End of the sweep. This caller stores a *pointer* here - the manager's
+            // own 8-byte local - and memcpy's 0x48c from whatever we put in it, so
+            // there is nothing to write for an empty answer. Falling through to the
+            // plain-buffer path below memset 0x48c bytes at that 8-byte local:
+            // measured as a page fault on the kernel stack guard page (CR2 = stack
+            // top, RDX = 0x48c) inside IO80211ScanManager::scanDone, which panics.
+            return status;
         }
         // Not the manager's pointer-out shape: the family also calls this slot with a
         // plain result buffer (airportd's SCAN_RESULT arrives here), so fill that with
@@ -1030,6 +1109,7 @@ SInt32 Ath10kPCIDevice::apple80211SkywalkRequest(UInt requestType, int requestNu
         const IOReturn plain = venturaScanResult(static_cast<apple80211_scan_result *>(data));
         if (slot != nullptr)
             *slot = static_cast<int8_t>(_venturaScanIndex);
+        ath10kVenturaProbeEntry(2, getProvider(), requestNumber, _venturaIoctlLength, plain);
         return plain;
     }
     return venturaRecordRequest(isSet ? 1 : 0, requestNumber, data);
@@ -1286,6 +1366,23 @@ static UInt32 venturaScanChannelFlags(UInt32 channel)
 
 extern "C" int proc_selfpid(void);
 
+// Who reads the sweep? Both the family's scan manager (a kernel thread) and the
+// client's own Apple80211 read drain it, and only the pid tells them apart. The
+// last few served entries carry "pid:index" so one client run says whether the
+// caller that ends up with zero networks is the one that actually got rows.
+static char gVenturaServeTrace[8][20];
+static UInt32 gVenturaServeTraceNext = 0;
+static UInt32 gVenturaServeTraceCount = 0;
+
+static void venturaTraceServe(UInt32 index)
+{
+    snprintf(gVenturaServeTrace[gVenturaServeTraceNext], sizeof(gVenturaServeTrace[0]), "%d:%u",
+             proc_selfpid(), static_cast<unsigned>(index));
+    gVenturaServeTraceNext = (gVenturaServeTraceNext + 1) % 8;
+    if (gVenturaServeTraceCount < 8)
+        ++gVenturaServeTraceCount;
+}
+
 // Per-process position in the last sweep, keyed by pid. getScanResult() in the
 // family keys its own cache the same way (proc_selfpid), and a shared cursor left
 // airportd reading past the end while a tool had already walked the list.
@@ -1331,7 +1428,13 @@ IOReturn Ath10kPCIDevice::venturaScanResult(apple80211_scan_result *result)
             probe->setProperty("Ath10kScanEnds", static_cast<UInt64>(_venturaScanEnds), 32);
             probe->setProperty("Ath10kScanCached", static_cast<UInt64>(_wmiBSS.count), 32);
         }
-        return kIOReturnNotFound;
+        // End of list. airportd propagates whatever this returns straight into its
+        // scan verdict ("Failed to perform Wi-Fi scan, returned error code X"), and
+        // measured: kIOReturnNotFound (0xe00002f0) turns a full, successful sweep
+        // into a failed scan with zero networks. EIO (5) is the end-of-list marker
+        // the classic ioctl path already produces and the one itlwm uses; the client
+        // reads it as "no more results", not as an error.
+        return EIO;
     }
 
     const Ath10k::WMIBSS &entry = _wmiBSS.entries[_venturaScanIndex++];
@@ -1376,12 +1479,21 @@ IOReturn Ath10kPCIDevice::venturaScanResult(apple80211_scan_result *result)
     }
 
     ++_venturaScanServed;
+    venturaTraceServe(static_cast<UInt32>(_venturaScanIndex - 1));
     if (IOService *probe = getProvider()) {
         probe->setProperty("Ath10kScanServed", static_cast<UInt64>(_venturaScanServed), 32);
         probe->setProperty("Ath10kScanEnds", static_cast<UInt64>(_venturaScanEnds), 32);
         probe->setProperty("Ath10kScanCached", static_cast<UInt64>(_wmiBSS.count), 32);
         probe->setProperty("Ath10kScanIeLen", static_cast<UInt64>(ieLen), 32);
         probe->setProperty("Ath10kScanReqLen", static_cast<UInt64>(_venturaIoctlLength), 32);
+        char trace[8 * 22];
+        trace[0] = 0;
+        const UInt32 first = (gVenturaServeTraceCount == 8) ? gVenturaServeTraceNext : 0;
+        for (UInt32 i = 0; i < gVenturaServeTraceCount; ++i) {
+            strlcat(trace, gVenturaServeTrace[(first + i) % 8], sizeof(trace));
+            strlcat(trace, " ", sizeof(trace));
+        }
+        probe->setProperty("Ath10kScanServeTrace", trace);
     }
     return kIOReturnSuccess;
 }

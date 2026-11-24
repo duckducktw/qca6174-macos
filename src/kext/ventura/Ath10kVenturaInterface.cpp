@@ -338,6 +338,11 @@ static const unsigned long kSiocgA80211New = 3224398281UL;
 static const unsigned long kSiocsA80211Old = 2150132168UL;
 static const unsigned long kSiocgA80211Old = 3223873993UL;
 
+// Round-17 probe (defined in Ath10kVentura.cpp): records which of the three
+// transports a SCAN_RESULT (type 11) arrived on. Slot 0 is this BSD ioctl path.
+extern "C" void ath10kVenturaProbeEntry(int which, IOService *probe, UInt32 type, UInt32 len,
+                                       SInt32 status);
+
 SInt32 Ath10kVenturaInterface::performCommand(IONetworkController *controller, unsigned long cmd,
                                               void *arg0, void *arg1)
 {
@@ -401,6 +406,8 @@ SInt32 Ath10kVenturaInterface::performCommand(IONetworkController *controller, u
     }
 
     const SInt32 status = _owner->venturaRecordRequest(isSet ? 1 : 0, req.req_type, buf);
+    ath10kVenturaProbeEntry(0, probe, static_cast<UInt32>(req.req_type),
+                            static_cast<UInt32>(req.req_len), status);
     if (probe != nullptr)
         probe->setProperty("Ath10kIoctlStatus",
                            static_cast<UInt64>(static_cast<UInt32>(status)), 32);
