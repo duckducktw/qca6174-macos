@@ -1460,6 +1460,69 @@ S1 完成，接 §7.3.2（WPA2-PSK 關聯）：PBKDF2 → `_connection` 綁 BSS 
 
 ---
 
+### 6.22 第十八輪（v150–v151）：開放網路關聯成功，上行通、下行還沒
+
+#### 6.22.1 測試環境（可重現，不需要使用者家的密碼）
+
+本機（跑 agent 這台，不是 Acer）用 hostapd 開一個開放 AP，SSID `QCA-TEST`、2.4 GHz ch6、
+`192.168.77.1/24`，dnsmasq 只發 IP（`--dhcp-option=3 --dhcp-option=6` 不派 gateway/DNS，
+避免動到 VM 的預設路由）：
+
+```
+nmcli dev set wlp9s0 managed no
+ip addr add 192.168.77.1/24 dev wlp9s0; ip link set wlp9s0 up
+hostapd -B docs/hostapd-qca.conf          # ssid=QCA-TEST hw_mode=g channel=6 wpa=0
+dnsmasq --port=0 --interface=wlp9s0 --bind-interfaces \
+        --dhcp-range=192.168.77.50,192.168.77.80,255.255.255.0,1h \
+        --dhcp-option=3 --dhcp-option=6 --log-dhcp
+```
+
+#### 6.22.2 `venturaAssociate()` 原本只是 stub → 接上共用狀態機
+
+- 解析 `apple80211_assoc_data`：用 `ad_ssid/ad_ssid_len` + `ad_bssid`；BSSID 全零時用
+  `_wmiBSS` 快取裡同 SSID 中 SNR 最好的那筆（family 的掃描快取在這裡讀不到）。
+- 填 `_connection`（ssid/bssid/local/txPowerHalfDbm 20）→ `stage=Scan`，之後
+  `serviceConnection()` 自己跑 vdev start → peer → auth → assoc。
+- 開放網路 `secure=false`：跳到 Connected 時狀態機自己 `portAuthorized=!secure`、
+  `networkLink(true)`。
+- WPA2-PSK 目前明確拒絕並留麵包屑 `Ath10kAssocPhase="psk-not-supported …"`（這個 personality
+  沒有核心內 supplicant）。
+
+#### 6.22.3 兩個實測陷阱
+
+| # | 假設 / 做法 | 實測結果 |
+|---|---|---|
+| 1 | `APPLE80211_IOC_ASSOCIATE` 的 type 當成 5 | **不是**：`apple80211_var.h` 是 **20**（STATE 是 13，不是 4）。送 5 會落到「相容清單」直接回 success，看起來像「關聯沒發生」，`Ath10kRequestTrace` 只會出現 `s5=0` |
+| 2 | 進關聯時把 `_connection.error` 清成 `nullptr` | **panic**：`publishConnection()` 把它直接丟給 `setProperty()`，`OSSymbol::withCString(NULL)` 在 `strnlen` 取址 0（RIP 在 `_strnlen+0x20`、CR2=0，frame 是 `publishConnection+0xef4` ← `serviceConnection+0xe78`）。要寫 `"none"` |
+
+#### 6.22.4 實測（v151，Acer `/tmp/vk151`，sha256 `f5e1b472…`）
+
+```
+./a11assoc QCA-TEST en1 20
+ASSOCIATE accepted for 'QCA-TEST' on en1
+  state=1
+  state=4 (RUN)                      ← APPLE80211_S_RUN
+```
+
+- 驅動：`Ath10kConnectionState="connected-open"`、`AID=1`、`Channel=6`、`PHY="HT20-1SS"`、
+  `PHYReason="ht-common-capabilities"`、`PeerCount=2`。
+- AP 端（`iw dev wlp9s0 station dump`）：`authorized/authenticated/associated: yes`、
+  `signal -35 dBm`、`last ack signal -33 dBm`、`rx bytes 6994` ← **上行真的通了**。
+- 串流指令：`0x5003`(vdev start) → `0x5008`(peer create) → `0x6004`(peer assoc) → `0x1d001`。
+- **下行未通**：`HTTRxIndications=0`、`DataRxPackets=0`、`HTTRxPoolPosted=1023`（韌體從沒把 RX
+  MPDU 交給主機），`ping6` 從 AP 打 guest 的 link-local 0/3。這是下一關。
+- `en1` 只有 link-local IPv6：`ipconfig set en1 DHCP` 回 `invalid operation`（en1 在 SC 裡還沒有
+  DHCP 服務），要先把 "Wi-Fi" 服務設成 DHCP 才有 IPv4。
+
+#### 6.22.5 下一步
+
+1. 查 HTT RX：`HTTRxIndications=0` 但 pool 已 post 1023 → 檢查 RX ring 的 fill/arm 與
+   `rxSetup` 之後的 re-fill 是否只在 native 路徑跑。
+2. DHCP：`networksetup -setdhcp "Wi-Fi"` 之後再驗 IPv4 + ping。
+3. 之後才是 WPA2-PSK（supplicant 搬進 Ventura）。
+
+---
+
 ## 13. 建議技能
 
 - `osx-kvm-headless-install`：VM 生命週期、qemu-nbd、SSH 進 guest。
