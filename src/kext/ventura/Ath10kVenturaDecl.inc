@@ -205,4 +205,14 @@ private:
     UInt32 _venturaTraceNext = 0;
     UInt32 _venturaTraceCount = 0;
 
+    // In-kernel WPA2 supplicant. This personality has no user-space helper, so the
+    // 4-way handshake runs here; key material still goes through the shared state
+    // machine, which owns the firmware key install and the controlled port.
+    // Opaque on purpose: the template type stays out of this header.
+    struct Ath10kVenturaSupplicant *_venturaSecurity = nullptr;
+    IOReturn venturaSecurityArm(const UInt8 *psk, UInt32 pskLength, UInt8 akm);
+    bool venturaSecurityAccept(unsigned int result);
+    const char *venturaSecurityService(UInt64 nowMs);
+    void venturaSecurityStop();
+
 public:

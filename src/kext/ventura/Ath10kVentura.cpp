@@ -15,6 +15,8 @@ extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifne
 
 #include "Ath10kVenturaInterface.hpp"
 #include "../Ath10kPCIDevice.hpp"
+#include "../../shared/Ath10kSupplicant.hpp"
+#include "../native/Ath10kKernelCrypto.hpp"
 #include <IOKit/IOCommandGate.h>
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSCollectionIterator.h>
@@ -965,6 +967,335 @@ extern "C" void ath10kVenturaProbeEntry(int which, IOService *probe, UInt32 type
     probe->setProperty(key, value);
 }
 
+// ---------------------------------------------------------------------------
+// In-kernel WPA2 supplicant (open networks never touch this)
+// ---------------------------------------------------------------------------
+//
+// The Ventura personality has no user-space helper, so M1/M3 arrive as EAPOL and
+// have to be answered here. The supplicant only produces the handshake messages
+// and the derived keys; installing them stays with the shared state machine
+// (buildSecurityWMI + the securityPhase ladder), which is the code path the
+// native personality already proves.
+
+struct Ath10kVenturaSupplicant {
+    AthSecurity::Supplicant<Ath10kKernelCrypto, true, true> supplicant;
+    UInt8 pmk[32]{};
+    UInt8 akm = 2;
+    bool pmkReady = false;
+    bool active = false;
+    bool replyPending = false;
+    bool keysPending = false;
+    UInt32 keyOperation = 0;
+    UInt8 reply[512]{};
+    UInt32 replyLength = 0;
+    UInt8 keys[56]{};
+};
+
+// WPA2 passphrase -> PMK (PBKDF2-HMAC-SHA256, 4096 rounds, salt = SSID). A 64-hex
+// key is already the PMK, which is the other documented form of `wpa-psk`.
+static bool venturaDerivePMK(const UInt8 *psk, UInt32 length, const UInt8 *ssid, UInt32 ssidLength,
+                             UInt8 *pmk)
+{
+    if (length == 64) {
+        UInt8 raw[32];
+        for (UInt32 i = 0; i < 32; ++i) {
+            UInt8 value = 0;
+            for (UInt32 nibble = 0; nibble < 2; ++nibble) {
+                const UInt8 c = psk[i * 2 + nibble];
+                UInt8 digit;
+                if (c >= '0' && c <= '9')
+                    digit = static_cast<UInt8>(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    digit = static_cast<UInt8>(c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F')
+                    digit = static_cast<UInt8>(c - 'A' + 10);
+                else
+                    return false;
+                value = static_cast<UInt8>((value << 4) | digit);
+            }
+            raw[i] = value;
+        }
+        bcopy(raw, pmk, 32);
+        AthSecurity::wipe(raw, sizeof(raw));
+        return true;
+    }
+    if (length < 8 || length > 63)
+        return false;
+    // WPA2-PSK derives the PMK with PBKDF2-HMAC-**SHA1** (RFC 2898 with SHA1, 4096
+    // rounds, salt = SSID, 32-byte output = two 20-byte blocks). SHA256 here makes
+    // the PMK wrong, and the only symptom is the AP dropping M2: hostapd logs
+    // "PTK derivation using PRF(SHA1)" then "invalid MIC in msg 2/4".
+    // Implemented over the HMAC the supplicant already links rather than calling
+    // corecrypto's ccpbkdf2_hmac: that symbol is C++-mangled in the kernel SDK, so
+    // importing it leaves an unresolved name and OpenCore silently skips the kext.
+    if (ssidLength > 60)
+        return false;
+    UInt8 msg[64];
+    bcopy(ssid, msg, ssidLength);
+    for (UInt32 blockIndex = 1; blockIndex <= 2; ++blockIndex) {
+        msg[ssidLength] = 0;
+        msg[ssidLength + 1] = 0;
+        msg[ssidLength + 2] = 0;
+        msg[ssidLength + 3] = static_cast<UInt8>(blockIndex);   // big-endian counter
+        UInt8 u[20], t[20];
+        if (!Ath10kKernelCrypto::hmac(psk, length, msg, ssidLength + 4, u))
+            return false;
+        bcopy(u, t, sizeof(t));
+        for (UInt32 round = 1; round < 4096; ++round) {
+            UInt8 next[20];
+            if (!Ath10kKernelCrypto::hmac(psk, length, u, sizeof(u), next))
+                return false;
+            bcopy(next, u, sizeof(u));
+            for (UInt32 i = 0; i < sizeof(t); ++i)
+                t[i] = static_cast<UInt8>(t[i] ^ u[i]);
+        }
+        if (blockIndex == 1)
+            bcopy(t, pmk, 20);
+        else
+            bcopy(t, pmk + 20, 12);
+        AthSecurity::wipe(u, sizeof(u));
+        AthSecurity::wipe(t, sizeof(t));
+    }
+    AthSecurity::wipe(msg, sizeof(msg));
+    return true;
+}
+
+IOReturn Ath10kPCIDevice::venturaSecurityArm(const UInt8 *psk, UInt32 pskLength, UInt8 akm)
+{
+    IOService *probe = getProvider();
+    auto &s = _connection;
+    if (_venturaSecurity == nullptr) {
+        _venturaSecurity = IONew(Ath10kVenturaSupplicant, 1);
+        if (_venturaSecurity == nullptr) {
+            if (probe != nullptr)
+                probe->setProperty("Ath10kSecPhase", "no-memory");
+            return kIOReturnNoMemory;
+        }
+        // IOMalloc gives raw memory: the default member initialisers do not run, so
+        // the one non-zero default (the error string publishConnection-style logging
+        // reads with %s) is restored by hand.
+        bzero(_venturaSecurity, sizeof(*_venturaSecurity));
+        _venturaSecurity->supplicant.error = "none";
+    }
+    Ath10kVenturaSupplicant *sec = _venturaSecurity;
+    if (!venturaDerivePMK(psk, pskLength, s.ssid, s.ssidLength, sec->pmk)) {
+        if (probe != nullptr) {
+            char phase[64];
+            snprintf(phase, sizeof(phase), "bad-psk len=%u", static_cast<unsigned>(pskLength));
+            probe->setProperty("Ath10kSecPhase", phase);
+        }
+        return kIOReturnBadArgument;
+    }
+    sec->akm = akm;
+    sec->pmkReady = true;
+    if (probe != nullptr) {
+        // Fingerprint only: lets the host-side test compare the derived PMK against
+        // an independent PBKDF2 without ever printing key material. Two leading bytes
+        // of the passphrase catch a mis-parsed apple80211_key offset, two of the PMK
+        // catch a wrong PRF.
+        char check[80];
+        snprintf(check, sizeof(check), "len=%u p=%02x%02x k=%02x%02x m=%02x%02x%02x%02x%02x%02x",
+                 static_cast<unsigned>(pskLength), psk[0], pskLength > 1 ? psk[1] : 0,
+                 sec->pmk[0], sec->pmk[1], s.local[0], s.local[1], s.local[2], s.local[3],
+                 s.local[4], s.local[5]);
+        probe->setProperty("Ath10kSecCheck", check);
+        probe->setProperty("Ath10kSecPhase", "pmk-ready");
+    }
+    return kIOReturnSuccess;
+}
+
+void Ath10kPCIDevice::venturaSecurityStop()
+{
+    auto sec = _venturaSecurity;
+    if (sec == nullptr)
+        return;
+    sec->supplicant.reset();
+    AthSecurity::wipe(sec->pmk, sizeof(sec->pmk));
+    AthSecurity::wipe(sec->reply, sizeof(sec->reply));
+    AthSecurity::wipe(sec->keys, sizeof(sec->keys));
+    sec->pmkReady = sec->active = sec->replyPending = sec->keysPending = false;
+    sec->replyLength = 0;
+    sec->keyOperation = 0;
+    if (IOService *probe = getProvider())
+        probe->setProperty("Ath10kSecPhase", "stopped");
+}
+
+// Push one supplicant result into the shared install machine's vocabulary.
+bool Ath10kPCIDevice::venturaSecurityAccept(unsigned int result)
+{
+    using S = AthSecurity::Supplicant<Ath10kKernelCrypto, true, true>;
+    auto sec = _venturaSecurity;
+    auto &s = _connection;
+    if (sec == nullptr || sec->replyPending || sec->keysPending)
+        return false;
+    const bool data = result == S::Keys || result == S::GroupKeys || result == S::PairKeys;
+    if (result != S::Reply && !data)
+        return false;
+    if (!sec->supplicant.outputLength || sec->supplicant.outputLength > sizeof(sec->reply))
+        return false;
+    if (data) {
+        const UInt8 changes = sec->supplicant.keyChanges;
+        if (changes & ~UInt8(S::PTKChanged | S::GTKChanged))
+            return false;
+        if ((result == S::Keys || result == S::PairKeys) && !(changes & S::PTKChanged))
+            return false;
+        if (result == S::GroupKeys && ((changes & S::GTKChanged) == 0 || (changes & S::PTKChanged)))
+            return false;
+        if (sec->supplicant.keys[49] > 3 || sec->supplicant.keys[48] != s.groupCipher)
+            return false;
+        bcopy(sec->supplicant.keys, sec->keys, sizeof(sec->keys));
+        sec->keysPending = true;
+        sec->keyOperation = result;
+    }
+    bcopy(sec->supplicant.output, sec->reply, sec->supplicant.outputLength);
+    sec->replyLength = static_cast<UInt32>(sec->supplicant.outputLength);
+    sec->replyPending = true;
+    // PTK exists only after M1 arrived, so the fingerprint belongs here and not at
+    // begin() time (where it reads as 0000).
+    if (IOService *probe = getProvider()) {
+        char ptk[24];
+        snprintf(ptk, sizeof(ptk), "%02x%02x", sec->supplicant.ptkByte(0),
+                 sec->supplicant.ptkByte(1));
+        probe->setProperty("Ath10kSecPtkFp", ptk);
+    }
+    return true;
+}
+
+const char *Ath10kPCIDevice::venturaSecurityService(UInt64 nowMs)
+{
+    using S = AthSecurity::Supplicant<Ath10kKernelCrypto, true, true>;
+    auto sec = _venturaSecurity;
+    if (sec == nullptr || !sec->pmkReady)
+        return nullptr;
+    auto &s = _connection;
+    IOService *probe = getProvider();
+    if (s.cancelRequested || s.disconnect != Ath10k::DisconnectStage::None ||
+        s.stage == Ath10k::LinkStage::Disabled || s.stage == Ath10k::LinkStage::Failed) {
+        if (sec->active)
+            venturaSecurityStop();
+        return nullptr;
+    }
+    if (!s.secure || !Ath10k::connectionAssociated(s))
+        return nullptr;
+    // The AP's RSN element is only known once the BSS candidate is committed, so
+    // the handshake starts here rather than at request time.
+    if (!sec->active) {
+        if (s.ap.rsnLength == 0)
+            return "wpa2-no-rsn-element";
+        UInt8 nonce[32];
+        if (!Ath10kKernelCrypto::random(nonce, sizeof(nonce)))
+            return "wpa2-no-random";
+        const bool started = sec->supplicant.begin(sec->pmk, nonce, s.local, s.bssid, s.ap.rsn,
+                                                   s.ap.rsnLength, sec->akm);
+        AthSecurity::wipe(nonce, sizeof(nonce));
+        if (!started) {
+            if (probe != nullptr)
+                probe->setProperty("Ath10kSecPhase", "begin-rejected");
+            return "wpa2-supplicant-rejected";
+        }
+        sec->active = true;
+        if (probe != nullptr) {
+            char phase[64];
+            snprintf(phase, sizeof(phase), "handshake akm=%u rsn=%u", sec->akm,
+                     static_cast<unsigned>(s.ap.rsnLength));
+            probe->setProperty("Ath10kSecPhase", phase);
+            char ptk[24];
+            snprintf(ptk, sizeof(ptk), "%02x%02x", sec->supplicant.ptkByte(0),
+                     sec->supplicant.ptkByte(1));
+            probe->setProperty("Ath10kSecPtkFp", ptk);
+        }
+    }
+    // Handshake frames are exchanged on the workloop; the same gates the native
+    // security service uses keep DMA and WMI transactions from overlapping.
+    const bool quiet = !s.txOwned && !s.dataPending && !s.wmiOwned && !s.submitted &&
+                       !s.stats.step && !s.maintenance.step && !s.radio.step && !s.csa.blocked &&
+                       !s.txPauseMask && _wmiScan.completed && !_wmi.credits.outstanding;
+
+    // The initial install happens while the ladder is still at phase 0 (native's
+    // own condition is "initial && !securityPhase"); a rekey only runs once the port
+    // is live at phase 5. Requiring phase != 0 here deadlocks the first handshake:
+    // the AP answers our M2 with M3, we derive keys, refuse to install them, and
+    // then deauthenticates with reason 15 after its own 4-way timeout.
+    const bool initial = sec->keysPending && sec->keyOperation == S::Keys;
+    const bool pair = sec->keysPending && sec->keyOperation == S::PairKeys;
+    if (sec->keysPending && quiet &&
+        ((initial && s.securityPhase == 0) || (!initial && s.securityPhase == 5 && s.portAuthorized))) {
+        const unsigned keyBytes = s.groupCipher == AthSecurity::cipherTKIP ? 32 : 16;
+        const bool sameGroup = s.groupInstalled[sec->keys[49]] &&
+                               AthSecurity::equal(sec->keys + 16, s.installedGroups[sec->keys[49]],
+                                                  keyBytes);
+        bcopy(sec->keys, s.temporalKey, 16);
+        bcopy(sec->keys + 16, s.groupKey, 32);
+        s.groupIndex = sec->keys[49];
+        bcopy(sec->keys + 50, s.groupRSC, 6);
+        if (initial) {
+            UInt64 pn = 0;
+            for (unsigned i = 0; i < 6; ++i)
+                pn |= UInt64(s.groupRSC[i]) << (8 * i);
+            for (auto &v : s.groupPN)
+                v = pn;
+        }
+        s.rekeyKind = initial ? 0 : (pair ? 2 : 1);
+        s.rekeySkipGroup = pair && sameGroup;
+        s.securityPhase = (initial || pair) ? 1 : 2;
+        s.submitted = false;
+        s.securityAck = false;
+        s.authorizeRequested = false;
+        s.portAuthorized = false;
+        s.sinceMs = nowMs;
+        sec->keysPending = false;
+        AthSecurity::wipe(sec->keys, sizeof(sec->keys));
+        if (probe != nullptr) {
+            char phase[64];
+            snprintf(phase, sizeof(phase), "keys-in initial=%u pair=%u gtk=%u", initial ? 1 : 0,
+                     pair ? 1 : 0, s.groupIndex);
+            probe->setProperty("Ath10kSecPhase", phase);
+        }
+    }
+    if (sec->replyPending && quiet && !sec->keysPending &&
+        (s.securityPhase == 0 || s.securityPhase == 3 || s.securityPhase == 5)) {
+        const char *error = submitNetworkPacket(sec->reply, sec->replyLength, false, nowMs);
+        if (error) {
+            s.error = error;
+            s.cancelRequested = true;
+            return error;
+        }
+        sec->replyPending = false;
+        AthSecurity::wipe(sec->reply, sizeof(sec->reply));
+        sec->replyLength = 0;
+    }
+    // Four-way handshake is done once the firmware acknowledged the M4/install
+    // transaction; the shared ladder then authorizes the controlled port.
+    if (s.securityPhase == 3 && !s.authorizeRequested && !sec->replyPending && !sec->keysPending &&
+        s.txComplete && !s.txStatus && !s.eapolTxFailed)
+        s.authorizeRequested = true;
+    if (!sec->replyPending && !sec->keysPending && s.eapolCount && !s.rekeyKind) {
+        const auto result = sec->supplicant.receive(s.eapolFrames[s.eapolRead],
+                                                    s.eapolLength[s.eapolRead]);
+        AthSecurity::wipe(s.eapolFrames[s.eapolRead], 512);
+        s.eapolRead = (s.eapolRead + 1) % 4;
+        --s.eapolCount;
+        if (result == S::Fatal) {
+            s.error = "wpa2-handshake-failed";
+            s.cancelRequested = true;
+            if (probe != nullptr) {
+                char phase[96];
+                snprintf(phase, sizeof(phase), "fatal %s", sec->supplicant.error);
+                probe->setProperty("Ath10kSecPhase", phase);
+            }
+            return nullptr;
+        }
+        if (result != S::Ignore && !venturaSecurityAccept(static_cast<UInt32>(result))) {
+            s.error = "wpa2-result-rejected";
+            s.cancelRequested = true;
+            s.portAuthorized = false;
+            if (probe != nullptr)
+                probe->setProperty("Ath10kSecPhase", "result-rejected");
+        }
+    }
+    return nullptr;
+}
+
 SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211VirtualInterface *iface, ifnet_t ifp,
                                          unsigned long cmd, void *data)
 {
@@ -1570,22 +1901,27 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
         }
     }
 
-    // Only open networks are wired to the shared link state machine so far: it
-    // authorises the controlled port immediately when s.secure is false. WPA2-PSK
-    // needs the in-kernel supplicant, which this personality does not carry yet.
+    // WPA2/WPA2-SHA256 personal: derive the PMK here and let the in-kernel
+    // supplicant answer the four-way handshake once the BSS is committed.
+    // Enterprise (802.1X) has no supplicant in this personality yet and SAE is
+    // handled by its own exchange, so both are still refused with a breadcrumb.
     const bool wantsKey = (request->ad_auth_upper != 0) ||
                           (request->ad_key.key_len != 0) ||
                           (request->ad_rsn_ie_len != 0);
+    UInt8 akm = 2;
     if (wantsKey) {
-        if (probe != nullptr) {
-            char phase[64];
-            snprintf(phase, sizeof(phase), "psk-not-supported upper=%x keylen=%u rsn=%u",
-                     static_cast<unsigned>(request->ad_auth_upper),
-                     static_cast<unsigned>(request->ad_key.key_len),
-                     static_cast<unsigned>(request->ad_rsn_ie_len));
-            probe->setProperty("Ath10kAssocPhase", phase);
+        // Bit 3 is WPA2-PSK (RSN AKM 2), bit 10 is PSK-SHA256 (AKM 6). Both share
+        // the PBKDF2 PMK; only the descriptor differs and the supplicant picks it
+        // from the validated RSN element.
+        if (request->ad_auth_upper & (1u << 10))
+            akm = 6;
+        else if (request->ad_auth_upper & (1u << 3))
+            akm = 2;
+        else if (request->ad_auth_upper & (0x100u << 0)) {
+            if (probe != nullptr)
+                probe->setProperty("Ath10kAssocPhase", "enterprise-not-supported");
+            return kIOReturnUnsupported;
         }
-        return kIOReturnUnsupported;
     }
 
     auto &s = _connection;
@@ -1597,9 +1933,18 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
     for (UInt32 i = 0; i < 6; ++i)
         s.local[i] = _wmiInit.mac[i];
     s.hiddenSSID = false;
-    s.secure = false;
-    s.securityAKM = 0;
-    s.portAuthorized = true;
+    s.secure = wantsKey;
+    s.securityAKM = wantsKey ? akm : 0;
+    s.portAuthorized = !wantsKey;
+    if (wantsKey) {
+        // Key material first: a failure here must refuse the join instead of
+        // associating and then failing every handshake frame.
+        const IOReturn armed = venturaSecurityArm(request->ad_key.key, request->ad_key.key_len, akm);
+        if (armed != kIOReturnSuccess)
+            return armed;
+    } else {
+        venturaSecurityStop();
+    }
     if (s.txPowerHalfDbm == 0 || s.txPowerHalfDbm > 40)
         s.txPowerHalfDbm = 20;   // 10 dBm; prepareBSSCandidate clamps to the AP limit
     s.cancelRequested = false;

@@ -97,6 +97,10 @@ public:
  IGTKCMAC128 managementKey{};uint8_t keyChanges=0;
  const char *error="none";
  bool pairwisePending() const {return pairRekey && state==2;}
+ // Diagnostic accessor: lets a caller compare this PTK's prefix against an
+ // independently computed PRF without exporting key material it does not
+ // already hold.
+ uint8_t ptkByte(unsigned i) const {return i<sizeof(ptk)?ptk[i]:0;}
  void cancelPairwiseAttempt(){
   if(!pairwisePending())return;
   copy(ptk,establishedPTK,48);copy(anonce,establishedANonce,32);copy(snonce,establishedSNonce,32);

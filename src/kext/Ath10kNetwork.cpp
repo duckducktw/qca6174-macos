@@ -658,6 +658,11 @@ const char *Ath10kPCIDevice::serviceConnection(UInt64 nowMs)
             d.mlmeSubtype,d.mlmeReason,d.mlmeChannel,static_cast<UInt32>(s.stage),s.securityPhase,s.peerCount,s.error);
     }
     const char *dataError=serviceDataTX(nowMs);if(dataError)return dataError;
+#ifndef ATH10K_NATIVE
+    // In-kernel WPA2 handshake: answers M1/M3 and hands the derived keys to the
+    // security ladder below. Runs before it so the install sees fresh material.
+    if(const char *secureError=venturaSecurityService(nowMs))return secureError;
+#endif
     if(s.stage==LinkStage::Failed && s.disconnect==Ath10k::DisconnectStage::None){
         if(s.cancelRequested || (s.error && (!strcmp(s.error,"authentication-rejected") || !strcmp(s.error,"association-rejected") || !strcmp(s.error,"ap-disconnected") || !strcmp(s.error,"peer-unmapped") || !strcmp(s.error,"vdev-start-rejected"))))s.cancelRequested=true;
         else return s.error;
