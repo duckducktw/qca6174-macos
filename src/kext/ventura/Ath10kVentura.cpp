@@ -1115,6 +1115,31 @@ SInt32 Ath10kPCIDevice::apple80211SkywalkRequest(UInt requestType, int requestNu
     return venturaRecordRequest(isSet ? 1 : 0, requestNumber, data);
 }
 
+// The client polls STATE while it waits for a join; answering a constant INIT
+// makes airportd believe the join never started.
+static UInt32 venturaStageState(const Ath10k::ConnectionState &s)
+{
+    using Ath10k::LinkStage;
+    switch (s.stage) {
+    case LinkStage::Disabled:
+        return APPLE80211_S_INIT;
+    case LinkStage::Scan:
+        return APPLE80211_S_SCAN;
+    case LinkStage::Start:
+    case LinkStage::Peer:
+    case LinkStage::PeerAssoc:
+    case LinkStage::Auth:
+        return 2;   // APPLE80211_S_AUTH
+    case LinkStage::Assoc:
+    case LinkStage::Barrier:
+        return 3;   // APPLE80211_S_ASSOC
+    case LinkStage::Connected:
+        return APPLE80211_S_RUN;
+    default:
+        return APPLE80211_S_SCAN;
+    }
+}
+
 SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int requestNumber,
                                                IO80211Interface *, void *data)
 {
@@ -1139,6 +1164,9 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
             return kIOReturnUnsupported;
         apple80211_state_data *state = static_cast<apple80211_state_data *>(data);
         state->version = APPLE80211_VERSION;
+        // Link progress, not radio power: this is what the client's join loop polls
+        // until it reaches APPLE80211_S_RUN.
+        _venturaState = venturaStageState(_connection);
         state->state = _venturaState;
         return kIOReturnSuccess;
     }
@@ -1498,9 +1526,104 @@ IOReturn Ath10kPCIDevice::venturaScanResult(apple80211_scan_result *result)
     return kIOReturnSuccess;
 }
 
-IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *)
+IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
 {
-    return kIOReturnUnsupported;
+    IOService *probe = getProvider();
+    if (request == nullptr || !_wmiLive.active)
+        return kIOReturnBadArgument;
+    const UInt32 ssidLength = request->ad_ssid_len;
+    if (ssidLength == 0 || ssidLength > APPLE80211_MAX_SSID_LEN)
+        return kIOReturnBadArgument;
+
+    // The family names the BSS it wants. A zeroed BSSID means "any AP with this
+    // SSID", which this driver resolves against its own beacon cache: the family's
+    // scan cache is not reachable from here.
+    UInt8 bssid[6] = {0, 0, 0, 0, 0, 0};
+    UInt8 nonzero = 0;
+    for (UInt32 i = 0; i < 6; ++i) {
+        bssid[i] = request->ad_bssid.octet[i];
+        nonzero |= bssid[i];
+    }
+    SInt32 bestSnr = -1;
+    if (nonzero == 0) {
+        for (UInt32 i = 0; i < _wmiBSS.count; ++i) {
+            const Ath10k::WMIBSS &entry = _wmiBSS.entries[i];
+            if (entry.ssidLength != ssidLength)
+                continue;
+            bool same = true;
+            for (UInt32 j = 0; j < ssidLength; ++j)
+                if (entry.ssid[j] != request->ad_ssid[j])
+                    same = false;
+            if (!same)
+                continue;
+            const SInt32 snr = static_cast<SInt32>(entry.snr);
+            if (snr <= bestSnr)
+                continue;
+            bestSnr = snr;
+            for (UInt32 j = 0; j < 6; ++j)
+                bssid[j] = entry.bssid[j];
+        }
+        if (bestSnr < 0) {
+            if (probe != nullptr)
+                probe->setProperty("Ath10kAssocPhase", "bss-not-in-cache");
+            return kIOReturnNotFound;
+        }
+    }
+
+    // Only open networks are wired to the shared link state machine so far: it
+    // authorises the controlled port immediately when s.secure is false. WPA2-PSK
+    // needs the in-kernel supplicant, which this personality does not carry yet.
+    const bool wantsKey = (request->ad_auth_upper != 0) ||
+                          (request->ad_key.key_len != 0) ||
+                          (request->ad_rsn_ie_len != 0);
+    if (wantsKey) {
+        if (probe != nullptr) {
+            char phase[64];
+            snprintf(phase, sizeof(phase), "psk-not-supported upper=%x keylen=%u rsn=%u",
+                     static_cast<unsigned>(request->ad_auth_upper),
+                     static_cast<unsigned>(request->ad_key.key_len),
+                     static_cast<unsigned>(request->ad_rsn_ie_len));
+            probe->setProperty("Ath10kAssocPhase", phase);
+        }
+        return kIOReturnUnsupported;
+    }
+
+    auto &s = _connection;
+    s.ssidLength = static_cast<UInt8>(ssidLength);
+    for (UInt32 i = 0; i < sizeof(s.ssid); ++i)
+        s.ssid[i] = i < ssidLength ? request->ad_ssid[i] : 0;
+    for (UInt32 i = 0; i < 6; ++i)
+        s.bssid[i] = bssid[i];
+    for (UInt32 i = 0; i < 6; ++i)
+        s.local[i] = _wmiInit.mac[i];
+    s.hiddenSSID = false;
+    s.secure = false;
+    s.securityAKM = 0;
+    s.portAuthorized = true;
+    if (s.txPowerHalfDbm == 0 || s.txPowerHalfDbm > 40)
+        s.txPowerHalfDbm = 20;   // 10 dBm; prepareBSSCandidate clamps to the AP limit
+    s.cancelRequested = false;
+    // Never null: publishConnection() hands this straight to setProperty(), and
+    // OSSymbol::withCString(NULL) faults in strnlen (measured panic at Start).
+    s.error = "none";
+    s.disconnect = Ath10k::DisconnectStage::None;
+    s.stage = Ath10k::LinkStage::Scan;
+    _venturaState = APPLE80211_S_SCAN;
+    if (probe != nullptr) {
+        char phase[96];
+        snprintf(phase, sizeof(phase), "requested bssid=%02x:%02x:%02x:%02x:%02x:%02x",
+                 bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+        probe->setProperty("Ath10kAssocPhase", phase);
+        char ssid[33];
+        for (UInt32 i = 0; i < ssidLength; ++i)
+            ssid[i] = static_cast<char>(request->ad_ssid[i]);
+        ssid[ssidLength] = 0;
+        probe->setProperty("Ath10kAssocSSID", ssid);
+    }
+    IOLog("Ath10kMac: ASSOCIATE request ssid-len=%u bssid=%02x:%02x:%02x:%02x:%02x:%02x open\n",
+          static_cast<unsigned>(ssidLength), bssid[0], bssid[1], bssid[2], bssid[3], bssid[4],
+          bssid[5]);
+    return kIOReturnSuccess;
 }
 
 void Ath10kPCIDevice::venturaDisassociate(bool)
