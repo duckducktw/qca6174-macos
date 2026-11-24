@@ -16,6 +16,7 @@ extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifne
 #include "Ath10kVenturaInterface.hpp"
 #include "../Ath10kPCIDevice.hpp"
 #include <IOKit/IOCommandGate.h>
+#include <IOKit/IOLib.h>
 #include <libkern/c++/OSCollectionIterator.h>
 #include <sys/_types/_size_t.h>
 #include <net/if_media.h>
@@ -30,6 +31,11 @@ extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifne
 // consumer below needs a pointer that survives that.
 static IO80211Interface *gVenturaPublishedInterface = nullptr;
 static UInt32 gVenturaCreateCalls = 0;
+// IO80211ScanManager plumbing (built in setupVenturaScanManager, further down):
+// declared up here because apple80211SkywalkRequest() must already know about the
+// manager's pointer-out result convention.
+static OSObject *gVenturaScanManager = nullptr;
+static apple80211_scan_result *gVenturaScanSlot = nullptr;
 
 // apple80211_scan_result as airportd sees it on 13.x: packed, with asr_ie_data
 // inline. The 13.7 SDK header we build against still describes the pointer-era
@@ -956,6 +962,14 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
             if (IOService *probe = getProvider())
                 probe->setProperty("Ath10kIoctlReqType", static_cast<UInt64>(
                                        static_cast<UInt32>(raw->type)), 32);
+            // Scan requests and results belong to the family's scan manager once it
+            // exists: the manager owns the pending-request bookkeeping that airportd's
+            // scan completion is matched against, and its cache is what a SCAN_RESULT
+            // return has to come from. kIOReturnUnsupported means "no manager", and
+            // the driver's own cursor below still answers.
+            const SInt32 routed = venturaScanManagerRequest(raw->type, raw->data);
+            if (routed != kIOReturnUnsupported)
+                return routed;
             const SInt32 status = venturaRecordRequest(isSet ? 1 : 0, raw->type, raw->data);
             if (status == kIOReturnSuccess)
                 return kIOReturnSuccess;
@@ -966,6 +980,11 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
         if (IOService *probe = getProvider())
             probe->setProperty("Ath10kIoctlReqType", static_cast<UInt64>(
                                    static_cast<UInt32>(type)), 32);
+        // setScanRequest-style calls carry the payload directly (no request block);
+        // the scan manager handles SCAN_REQ (set) and SCAN_RESULT (get) in both.
+        const SInt32 routed = venturaScanManagerRequest(type, c);
+        if (routed != kIOReturnUnsupported)
+            return routed;
         if (isSet) {
             const SInt32 status = venturaRecordRequest(1, type, c);
             if (status == kIOReturnSuccess)
@@ -980,7 +999,24 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
 SInt32 Ath10kPCIDevice::apple80211SkywalkRequest(UInt requestType, int requestNumber,
                                                  IO80211SkywalkInterface *, void *data)
 {
-    return venturaRecordRequest(requestType, requestNumber, data);
+    // The first argument is the ioctl command, not a get/set flag: the family's
+    // scan manager reaches this slot with 0x803069c8 / 0xc03069c9 exactly like the
+    // ioctl path does (live 0x201342c for SCAN_REQ, 0x2013fba for SCAN_RESULT).
+    const bool isSet = requestType == 0x803069c8UL;
+    if (requestNumber == APPLE80211_IOC_SCAN_RESULT && !isSet && data != nullptr) {
+        // Results come back as a *pointer* here: the manager passes the address of
+        // its own local and memcpy's sizeof(apple80211_scan_result) from whatever is
+        // stored there, so writing the struct in place would smash its stack.
+        if (gVenturaScanSlot == nullptr)
+            return kIOReturnNotFound;
+        _venturaIoctlLength = sizeof(*gVenturaScanSlot);
+        const IOReturn status = venturaScanResult(gVenturaScanSlot);
+        if (status != kIOReturnSuccess)
+            return status;
+        *static_cast<apple80211_scan_result **>(data) = gVenturaScanSlot;
+        return kIOReturnSuccess;
+    }
+    return venturaRecordRequest(isSet ? 1 : 0, requestNumber, data);
 }
 
 SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int requestNumber,
@@ -1311,6 +1347,11 @@ SInt32 Ath10kPCIDevice::venturaCapabilities(void *data)
     UInt8 *bits = capabilities->capabilities;
     bits[0] = 0x0f;   // 802.11a/b/g/n
     bits[1] = APPLE80211_CAPINFO_ESS >> 8;
+    // Capability #22. IO80211ScanManager::initWithControllerAndSkywalkInterface()
+    // (live 0x2010568) asks for CARD_CAPABILITIES and refuses to build the manager
+    // unless byte 6 of the reply - caps[2] - has bit 0x40 set: with it clear the
+    // family answers 0x66 and airportd's scan has no cache to land in.
+    bits[2] |= 0x40;
     bits[4] = 0x01;   // WEP40
     bits[5] = 0x01;   // WEP104
     bits[6] = 0x01;   // TKIP
@@ -1390,6 +1431,141 @@ extern "C" bool ath10kAttachSkywalkInterface(IO80211Controller *self, OSObject *
 extern "C" bool ath10kVifStart(IO80211VirtualInterface *self, IOService *provider)
     __asm("__ZN23IO80211VirtualInterface5startEP9IOService");
 
+// ---------------------------------------------------------------------------
+// IO80211ScanManager wiring
+//
+// The live family keeps its scan cache in IO80211ScanManager and airportd never
+// talks to the driver about results directly: `setScanRequest` forwards to the
+// manager, the manager calls the driver back (SCAN_REQ), and on completion its
+// `scanDone` pulls SCAN_RESULT until the driver answers non-zero, caches every
+// entry and then posts the event airportd waits for. A vif whose
+// `getScanManager()` is the live stub (xor eax,eax; ret) therefore can serve
+// perfect results and still time airportd out with -3905.
+//
+// Two facts from the live KC (0x20037a8, 0x2010568, 0x2013fba) make this
+// reachable without subclassing Apple's classes:
+//   * getScanManager is vtable slot 373 (vptr+0xb98) and reads no ivars at all,
+//     so a private vtable copy with that one entry replaced is enough;
+//   * initWithControllerAndSkywalkInterface() only needs getWorkQueue(), a
+//     provider for the interface, and a CARD_CAPABILITIES answer whose byte 6
+//     has bit 0x40 (capability #22) set.
+extern "C" char ath10kScanManagerMetaClass[] __asm("__ZN18IO80211ScanManager10gMetaClassE");
+extern "C" OSObject *ath10kScanManagerMetaClassAlloc(const void *self)
+    __asm("__ZNK18IO80211ScanManager9MetaClass5allocEv");
+extern "C" bool ath10kScanManagerInitWithInterface(OSObject *self, IO80211Controller *controller,
+                                                   IOService *iface)
+    __asm("__ZN18IO80211ScanManager37initWithControllerAndSkywalkInterfaceEP17IO80211ControllerP23IO80211SkywalkInterface");
+extern "C" SInt32 ath10kScanManagerStartScan(OSObject *self, const apple80211_scan_data *data)
+    __asm("__ZN18IO80211ScanManager9startScanEP20apple80211_scan_data");
+extern "C" void ath10kScanManagerScanDone(OSObject *self, bool done)
+    __asm("__ZN18IO80211ScanManager8scanDoneEb");
+extern "C" IOReturn ath10kScanManagerGetResult(OSObject *self, apple80211_scan_result **result)
+    __asm("__ZN18IO80211ScanManager13getScanResultEPP22apple80211_scan_result");
+// Reads exactly the path the family uses: getPrimarySkywalkInterface() then
+// [vptr+0xb98] (live 0x1fef034), i.e. the slot patched below.
+extern "C" void *ath10kGetPrimaryInterfaceScanManager(IO80211Controller *self)
+    __asm("__ZN17IO80211Controller30getPrimaryInterfaceScanManagerEv");
+
+// One manager for the whole controller; the thunk below is what the patched
+// vtable slot returns, so it has to be callable as a member function (this in
+// rdi, pointer out in rax). The storage itself is declared at the top of the file.
+static OSObject *venturaScanManagerThunk(OSObject *)
+{
+    return gVenturaScanManager;
+}
+
+bool Ath10kPCIDevice::setupVenturaScanManager()
+{
+    IOService *probe = getProvider();
+    IO80211VirtualInterface *vif = _venturaVif;
+    if (probe == nullptr || vif == nullptr)
+        return false;
+    if (gVenturaScanManager != nullptr)
+        return true;
+
+    OSObject *manager = ath10kScanManagerMetaClassAlloc(ath10kScanManagerMetaClass);
+    if (manager == nullptr) {
+        probe->setProperty("Ath10kScanMgrInit", "alloc-failed");
+        return false;
+    }
+    const bool inited = ath10kScanManagerInitWithInterface(manager, this, vif);
+    probe->setProperty("Ath10kScanMgrInit", inited ? "ok" : "init-failed");
+    if (!inited) {
+        manager->release();
+        return false;
+    }
+    if (gVenturaScanSlot == nullptr)
+        gVenturaScanSlot = static_cast<apple80211_scan_result *>(IOMalloc(sizeof(*gVenturaScanSlot)));
+    if (gVenturaScanSlot == nullptr) {
+        manager->release();
+        probe->setProperty("Ath10kScanMgrInit", "no-slot");
+        return false;
+    }
+    gVenturaScanManager = manager;
+    _venturaScanManager = manager;
+
+    // Replace exactly one vtable entry. The copy holds the already-relocated
+    // pointers Apple's own table has, so every other slot stays byte-identical.
+    void **vptr = *reinterpret_cast<void ***>(vif);
+    const size_t slots = kVenturaVtableCopySlots;
+    void **copy = static_cast<void **>(IOMalloc(slots * sizeof(void *)));
+    if (copy == nullptr) {
+        probe->setProperty("Ath10kScanMgrPatch", "no-memory");
+        return false;
+    }
+    memcpy(copy, vptr, slots * sizeof(void *));
+    // vptr points at vtable[2]; slot 373 is therefore copy[371]. (Every vtable
+    // offset in this file uses that -2 correction.)
+    copy[kVenturaVifGetScanManagerSlot - 2] = reinterpret_cast<void *>(&venturaScanManagerThunk);
+    _venturaVifVtableCopy = copy;
+    *reinterpret_cast<void ***>(vif) = copy;
+    probe->setProperty("Ath10kScanMgrPatch", "patched");
+    probe->setProperty("Ath10kScanMgr",
+                       static_cast<UInt64>(reinterpret_cast<uintptr_t>(manager)), 64);
+    if (ath10kGetPrimaryInterfaceScanManager(this) != nullptr)
+        probe->setProperty("Ath10kScanMgrVisible", "yes");
+    else
+        probe->setProperty("Ath10kScanMgrVisible", "no");
+    IOLog("Ath10kMac: scan manager %p installed on vif %p\n", manager, vif);
+    return true;
+}
+
+// Routes the two scan types the family would otherwise answer itself; returns
+// kIOReturnUnsupported for everything else (and when there is no manager), which
+// is the caller's signal to fall back to the driver's own result cursor.
+SInt32 Ath10kPCIDevice::venturaScanManagerRequest(int type, void *data)
+{
+    if (_venturaScanManager == nullptr || data == nullptr)
+        return kIOReturnUnsupported;
+    IOService *probe = getProvider();
+    if (type == APPLE80211_IOC_SCAN_REQ || type == APPLE80211_IOC_SCAN_REQ_MULTIPLE) {
+        // startScan() runs validateScanData(), allocates the pending request node
+        // (which is how airportd's pid is matched to the completion) and then calls
+        // back into this driver through the Skywalk request slot for the real
+        // SCAN_REQ, so the WMI sweep is still armed by venturaScan().
+        const SInt32 status = ath10kScanManagerStartScan(
+            _venturaScanManager, static_cast<const apple80211_scan_data *>(data));
+        if (probe != nullptr)
+            probe->setProperty("Ath10kScanMgrStart", status == 0 ? "ok" : "failed");
+        if (status != 0)
+            return kIOReturnUnsupported;
+        return kIOReturnSuccess;
+    }
+    if (type == APPLE80211_IOC_SCAN_RESULT) {
+        apple80211_scan_result *result = nullptr;
+        const IOReturn status = ath10kScanManagerGetResult(_venturaScanManager, &result);
+        if (status != kIOReturnSuccess || result == nullptr)
+            return kIOReturnUnsupported;
+        memcpy(data, result, sizeof(apple80211_scan_result));
+        ++_venturaScanMgrServes;
+        if (probe != nullptr)
+            probe->setProperty("Ath10kScanMgrServes",
+                               static_cast<UInt64>(_venturaScanMgrServes), 32);
+        return kIOReturnSuccess;
+    }
+    return kIOReturnUnsupported;
+}
+
 IOService *Ath10kPCIDevice::attachPlatformVif()
 {
     IOService *probe = getProvider();
@@ -1440,6 +1616,11 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
                            static_cast<UInt64>(reinterpret_cast<uintptr_t>(vif)), 64);
     }
     IOLog("Ath10kMac: infra attach vif %p -> %d\n", vif, (int)attached);
+    // Only after the attach: the manager's init calls back into this driver for
+    // CARD_CAPABILITIES through the Skywalk request slot, and getScanManager is
+    // only ever asked for through the vif that attachInterface() parks in the
+    // controller.
+    setupVenturaScanManager();
     return vif;
 }
 
@@ -1451,6 +1632,22 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
 extern "C" void ath10kControllerPostMessage(IO80211Controller *self, UInt type, void *data,
                                             UInt len, void *extra)
     __asm("__ZN17IO80211Controller11postMessageEjPvmjS0_");
+
+// The event a client actually waits for is posted through the IOUC pipe list
+// ([ivars+0x208]), and that path looks the pipe up by the interface's BSD name:
+//   postMessageInternal -> isIOUCPipeOpened -> getBSDName() -> postMessageIOUC()
+// getBSDName() derives the name from a real BSD interface (vtable slot 287) and
+// only then caches it at ivars+1, so a virtual interface that never got an ifnet
+// reports null - and postMessageIOUC then has nothing to match. Both calls are
+// exported, so the outcome is measured instead of assumed.
+extern "C" const char *ath10kVifGetBSDName(IO80211VirtualInterface *self)
+    __asm("__ZN23IO80211SkywalkInterface10getBSDNameEv");
+extern "C" IOReturn ath10kVifPostMessageIOUC(IO80211VirtualInterface *self, const char *name,
+                                             UInt32 message, void *data, size_t len)
+    __asm("__ZN23IO80211SkywalkInterface15postMessageIOUCEPKcjPvm");
+extern "C" IOReturn ath10kVifPostMessageInternal(IO80211VirtualInterface *self, UInt32 message,
+                                                 void *data, size_t len)
+    __asm("__ZN23IO80211SkywalkInterface19postMessageInternalEjPvm");
 
 void Ath10kPCIDevice::scanNotifyCall(thread_call_param_t param0, thread_call_param_t)
 {
@@ -1487,6 +1684,20 @@ void Ath10kPCIDevice::runScanNotify()
         return;
     }
     probe->setProperty("Ath10kScanCompletedMs", static_cast<UInt64>(_wmiScan.elapsedMs), 64);
+    // The family's own completion path: IO80211ScanManager::scanDone(true) pulls
+    // SCAN_RESULT from this driver until it answers non-zero, caches every entry
+    // against the pending request node (airportd's pid) and then posts the event the
+    // client waits for. A real driver reaches it through IO80211InfraInterface's
+    // postMessage(msg 10); this interface is Apple's vif, whose postMessage only fans
+    // out to client pipes, so the manager is called directly - once per scan.
+    if (_venturaScanManager != nullptr && _venturaScanMgrGeneration != _wmiScan.generation) {
+        _venturaScanMgrGeneration = _wmiScan.generation;
+        ath10kScanManagerScanDone(_venturaScanManager, true);
+        ++_venturaScanMgrDones;
+        probe->setProperty("Ath10kScanMgrDone", "ok");
+        probe->setProperty("Ath10kScanMgrDones",
+                           static_cast<UInt64>(_venturaScanMgrDones), 32);
+    }
     if (_venturaEventPipe == nullptr) {
         // No event pipe: Skywalk registration is what installs it, so airportd is
         // left polling nothing and abandons the scan with -3905.
@@ -1508,6 +1719,38 @@ void Ath10kPCIDevice::runScanNotify()
         _venturaVif->postMessage(APPLE80211_M_SCAN_CACHE_UPDATED, &payload, sizeof(payload));
         ath10kControllerPostMessage(this, APPLE80211_M_SCAN_DONE, &payload, sizeof(payload),
                                     reinterpret_cast<void *>(1));
+
+        // Measured delivery into the client pipes. The name is what the pipe lookup
+        // keys on; a vif has no ifnet, so getBSDName() comes back empty until the
+        // unit name is stamped at ivars+1 (the same slot getBSDName() itself fills).
+        const char *bsd = ath10kVifGetBSDName(_venturaVif);
+        char *vifIvars = *reinterpret_cast<char **>(reinterpret_cast<char *>(_venturaVif) + 0x110);
+        probe->setProperty("Ath10kVifBsdName", bsd != nullptr ? bsd : "(null)");
+        if (bsd == nullptr && vifIvars != nullptr) {
+            const char *unit = nullptr;
+            if (_venturaInterface != nullptr) {
+                if (OSString *n = OSDynamicCast(OSString,
+                                                _venturaInterface->getProperty("IOInterfaceName")))
+                    unit = n->getCStringNoCopy();
+            }
+            if (unit != nullptr) {
+                strlcpy(vifIvars + 1, unit, 16);
+                probe->setProperty("Ath10kVifBsdNameStamp", unit);
+                bsd = ath10kVifGetBSDName(_venturaVif);
+                probe->setProperty("Ath10kVifBsdNameAfter", bsd != nullptr ? bsd : "(null)");
+            }
+        }
+        const IOReturn doneStatus = ath10kVifPostMessageIOUC(
+            _venturaVif, bsd, APPLE80211_M_SCAN_DONE, nullptr, 0);
+        const IOReturn cacheStatus = ath10kVifPostMessageIOUC(
+            _venturaVif, bsd, APPLE80211_M_SCAN_CACHE_UPDATED, nullptr, 0);
+        const IOReturn internalStatus = ath10kVifPostMessageInternal(
+            _venturaVif, APPLE80211_M_SCAN_CACHE_UPDATED, nullptr, 0);
+        char statuses[96];
+        snprintf(statuses, sizeof(statuses), "done=%x cache=%x internal=%x",
+                 static_cast<unsigned>(doneStatus), static_cast<unsigned>(cacheStatus),
+                 static_cast<unsigned>(internalStatus));
+        probe->setProperty("Ath10kPostStatus", statuses);
     }
     _venturaScanNotifySent = true;
     probe->setProperty("Ath10kScanEvent", "posted-scan-done");

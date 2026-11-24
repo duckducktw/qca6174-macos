@@ -143,6 +143,19 @@ private:
     UInt32 _scanNotifyGeneration = 0;
     static void scanNotifyCall(thread_call_param_t, thread_call_param_t);
     void runScanNotify();
+    // IO80211ScanManager (see setupVenturaScanManager): the live family keeps the
+    // scan cache there, and the vif's getScanManager() is an unconditional null
+    // stub. One manager per controller, plus a private copy of the vif's vtable
+    // whose single slot 373 points at a thunk returning it.
+    static constexpr size_t kVenturaVifGetScanManagerSlot = 373; // vptr + 0xb98
+    static constexpr size_t kVenturaVtableCopySlots = 768;       // 660 live + headroom
+    bool setupVenturaScanManager();
+    OSObject *_venturaScanManager = nullptr;
+    void **_venturaVifVtableCopy = nullptr;
+    UInt32 _venturaScanMgrGeneration = 0xffffffffu;
+    UInt32 _venturaScanMgrDones = 0;
+    UInt32 _venturaScanMgrServes = 0;
+    SInt32 venturaScanManagerRequest(int type, void *data);
     // [iframeIvars+0x208]: the event pipe Skywalk registration would install. Read
     // (never written) here so "events cannot be delivered" is a measurement.
     void *_venturaEventPipe = nullptr;
