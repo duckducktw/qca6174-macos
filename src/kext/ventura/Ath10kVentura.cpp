@@ -962,11 +962,10 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
             if (IOService *probe = getProvider())
                 probe->setProperty("Ath10kIoctlReqType", static_cast<UInt64>(
                                        static_cast<UInt32>(raw->type)), 32);
-            // Scan requests and results belong to the family's scan manager once it
-            // exists: the manager owns the pending-request bookkeeping that airportd's
-            // scan completion is matched against, and its cache is what a SCAN_RESULT
-            // return has to come from. kIOReturnUnsupported means "no manager", and
-            // the driver's own cursor below still answers.
+            // SCAN_REQ has to go through the manager: it owns the pending request node
+            // that airportd's scan completion (and its later result read) is matched
+            // against. SCAN_RESULT is served from the driver's own cursor below, because
+            // getScanResult() only answers a pid that owns one of those nodes.
             const SInt32 routed = venturaScanManagerRequest(raw->type, raw->data);
             if (routed != kIOReturnUnsupported)
                 return routed;
@@ -980,11 +979,7 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
         if (IOService *probe = getProvider())
             probe->setProperty("Ath10kIoctlReqType", static_cast<UInt64>(
                                    static_cast<UInt32>(type)), 32);
-        // setScanRequest-style calls carry the payload directly (no request block);
-        // the scan manager handles SCAN_REQ (set) and SCAN_RESULT (get) in both.
-        const SInt32 routed = venturaScanManagerRequest(type, c);
-        if (routed != kIOReturnUnsupported)
-            return routed;
+        // setScanRequest-style calls carry the payload directly (no request block).
         if (isSet) {
             const SInt32 status = venturaRecordRequest(1, type, c);
             if (status == kIOReturnSuccess)
@@ -1096,8 +1091,22 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
     case APPLE80211_IOC_SCAN_REQ:
     case APPLE80211_IOC_SCAN_REQ_MULTIPLE:
         return venturaScan(static_cast<apple80211_scan_data *>(data));
-    case APPLE80211_IOC_SCAN_RESULT:
-        return venturaScanResult(static_cast<apple80211_scan_result *>(data));
+    case APPLE80211_IOC_SCAN_RESULT: {
+        // Every reader gets its own position in the last sweep. airportd retries the
+        // read inside one scan, a tool like apple80211-scan walks it once, and the
+        // manager drains it while caching - one shared cursor cannot serve all three.
+        int8_t *slot = venturaReaderSlot();
+        if (slot != nullptr)
+            _venturaScanIndex = static_cast<UInt8>(*slot);
+        const IOReturn status =
+            venturaScanResult(static_cast<apple80211_scan_result *>(data));
+        if (slot != nullptr)
+            *slot = static_cast<int8_t>(_venturaScanIndex);
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kCursorStatus",
+                               static_cast<UInt64>(static_cast<UInt32>(status)), 32);
+        return status;
+    }
     case APPLE80211_IOC_SCANCACHE_CLEAR:
         _venturaScanIndex = 0;
         return kIOReturnSuccess;
@@ -1237,6 +1246,33 @@ static UInt32 venturaScanChannelFlags(UInt32 channel)
     UInt32 flags = APPLE80211_C_FLAG_ACTIVE | APPLE80211_C_FLAG_20MHZ;
     flags |= (channel <= 14) ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ;
     return flags;
+}
+
+extern "C" int proc_selfpid(void);
+
+// Per-process position in the last sweep, keyed by pid. getScanResult() in the
+// family keys its own cache the same way (proc_selfpid), and a shared cursor left
+// airportd reading past the end while a tool had already walked the list.
+int8_t *Ath10kPCIDevice::venturaReaderSlot()
+{
+    const int pid = proc_selfpid();
+    for (UInt32 i = 0; i < kVenReaderSlots; ++i) {
+        if (_venturaReaders[i].pid == pid)
+            return &_venturaReaders[i].index;
+    }
+    // Reuse the slot of the oldest pid, which is almost always a finished tool.
+    UInt32 victim = 0;
+    UInt32 oldest = _venturaReaders[0].stamp;
+    for (UInt32 i = 1; i < kVenReaderSlots; ++i) {
+        if (_venturaReaders[i].stamp < oldest) {
+            oldest = _venturaReaders[i].stamp;
+            victim = i;
+        }
+    }
+    _venturaReaders[victim].pid = pid;
+    _venturaReaders[victim].index = 0;
+    _venturaReaders[victim].stamp = ++_venturaReaderStamp;
+    return &_venturaReaders[victim].index;
 }
 
 IOReturn Ath10kPCIDevice::venturaScanResult(apple80211_scan_result *result)
@@ -1465,6 +1501,23 @@ extern "C" IOReturn ath10kScanManagerGetResult(OSObject *self, apple80211_scan_r
 // [vptr+0xb98] (live 0x1fef034), i.e. the slot patched below.
 extern "C" void *ath10kGetPrimaryInterfaceScanManager(IO80211Controller *self)
     __asm("__ZN17IO80211Controller30getPrimaryInterfaceScanManagerEv");
+// Cache ages. scanDone() arms its purge timer from [ivars+8] (live 0x2013fba:
+// `imul esi, dword ptr [rax+8], 0x3e8`), so a zero there means the cache it just
+// filled is emptied on the next timer tick and a client that asks one millisecond
+// later finds nothing. setCacheAgeThreshold() writes that same field and is gated
+// on procIsSuperuser(); the per-client ages live at [ivars+0xc] / [ivars+0x14].
+extern "C" UInt32 ath10kScanManagerCacheAgeThresh(OSObject *self)
+    __asm("__ZN18IO80211ScanManager14cacheAgeThreshEv");
+extern "C" UInt32 ath10kScanManagerDirectAgeThresh(OSObject *self)
+    __asm("__ZN18IO80211ScanManager15directAgeThreshEv");
+extern "C" UInt32 ath10kScanManagerBroadcastAgeThresh(OSObject *self)
+    __asm("__ZN18IO80211ScanManager18broadcastAgeThreshEv");
+extern "C" SInt32 ath10kScanManagerSetCacheAgeThreshold(OSObject *self, UInt32 seconds)
+    __asm("__ZN18IO80211ScanManager20setCacheAgeThresholdEj");
+extern "C" void ath10kScanManagerSetDirectAgeThresh(OSObject *self, UInt32 seconds)
+    __asm("__ZN18IO80211ScanManager18setDirectAgeThreshEj");
+extern "C" void ath10kScanManagerSetBroadcastAgeThresh(OSObject *self, UInt32 seconds)
+    __asm("__ZN18IO80211ScanManager21setBroadcastAgeThreshEj");
 
 // One manager for the whole controller; the thunk below is what the patched
 // vtable slot returns, so it has to be callable as a member function (this in
@@ -1526,6 +1579,28 @@ bool Ath10kPCIDevice::setupVenturaScanManager()
         probe->setProperty("Ath10kScanMgrVisible", "yes");
     else
         probe->setProperty("Ath10kScanMgrVisible", "no");
+    // What the purge timer will actually use, read before anything touches it.
+    const UInt32 cacheAge = ath10kScanManagerCacheAgeThresh(manager);
+    const UInt32 directAge = ath10kScanManagerDirectAgeThresh(manager);
+    const UInt32 broadcastAge = ath10kScanManagerBroadcastAgeThresh(manager);
+    char ages[64];
+    snprintf(ages, sizeof(ages), "cache=%u direct=%u bcast=%u", cacheAge, directAge,
+             broadcastAge);
+    probe->setProperty("Ath10kScanMgrAges", ages);
+    if (cacheAge == 0 || cacheAge > 3600) {
+        ath10kScanManagerSetCacheAgeThreshold(manager, 30);
+        probe->setProperty("Ath10kScanMgrAgeSet", "cache=30");
+    }
+    if (directAge == 0)
+        ath10kScanManagerSetDirectAgeThresh(manager, 30);
+    if (broadcastAge == 0)
+        ath10kScanManagerSetBroadcastAgeThresh(manager, 300);
+    char agesAfter[64];
+    snprintf(agesAfter, sizeof(agesAfter), "cache=%u direct=%u bcast=%u",
+             ath10kScanManagerCacheAgeThresh(manager),
+             ath10kScanManagerDirectAgeThresh(manager),
+             ath10kScanManagerBroadcastAgeThresh(manager));
+    probe->setProperty("Ath10kScanMgrAgesAfter", agesAfter);
     IOLog("Ath10kMac: scan manager %p installed on vif %p\n", manager, vif);
     return true;
 }
@@ -1537,33 +1612,50 @@ SInt32 Ath10kPCIDevice::venturaScanManagerRequest(int type, void *data)
 {
     if (_venturaScanManager == nullptr || data == nullptr)
         return kIOReturnUnsupported;
+    // Only SCAN_REQ is routed. getScanResult() answers strictly by proc_selfpid
+    // against the pending node list (live 0x2013b84), and the family dispatches the
+    // request on its own workloop thread, so a routed read can only ever come back 5
+    // and would shadow the driver's cursor. Results are served below instead.
+    const bool isScanRequest = type == APPLE80211_IOC_SCAN_REQ ||
+                               type == APPLE80211_IOC_SCAN_REQ_MULTIPLE;
+    if (!isScanRequest)
+        return kIOReturnUnsupported;
     IOService *probe = getProvider();
-    if (type == APPLE80211_IOC_SCAN_REQ || type == APPLE80211_IOC_SCAN_REQ_MULTIPLE) {
-        // startScan() runs validateScanData(), allocates the pending request node
-        // (which is how airportd's pid is matched to the completion) and then calls
-        // back into this driver through the Skywalk request slot for the real
-        // SCAN_REQ, so the WMI sweep is still armed by venturaScan().
+    SInt32 routed = kIOReturnUnsupported;
+    // The manager scans and pulls results by calling straight back into this driver
+    // through the Skywalk request slot, which lands in venturaDispatchRequest again;
+    // the flag keeps that call from being routed back into the manager.
+    _venturaManagerCall = true;
+    if (isScanRequest) {
+        // startScan() runs validateScanData(), allocates the pending request node (the
+        // pid-keyed record getScanResult() matches on) and then calls this driver back
+        // through the Skywalk request slot for the real SCAN_REQ.
         const SInt32 status = ath10kScanManagerStartScan(
             _venturaScanManager, static_cast<const apple80211_scan_data *>(data));
         if (probe != nullptr)
             probe->setProperty("Ath10kScanMgrStart", status == 0 ? "ok" : "failed");
-        if (status != 0)
-            return kIOReturnUnsupported;
-        return kIOReturnSuccess;
-    }
-    if (type == APPLE80211_IOC_SCAN_RESULT) {
+        if (status == 0)
+            routed = kIOReturnSuccess;
+    } else {
         apple80211_scan_result *result = nullptr;
         const IOReturn status = ath10kScanManagerGetResult(_venturaScanManager, &result);
-        if (status != kIOReturnSuccess || result == nullptr)
-            return kIOReturnUnsupported;
-        memcpy(data, result, sizeof(apple80211_scan_result));
-        ++_venturaScanMgrServes;
-        if (probe != nullptr)
-            probe->setProperty("Ath10kScanMgrServes",
-                               static_cast<UInt64>(_venturaScanMgrServes), 32);
-        return kIOReturnSuccess;
+        if (probe != nullptr) {
+            char seen[64];
+            snprintf(seen, sizeof(seen), "st=%x %s", static_cast<unsigned>(status),
+                     result != nullptr ? "entry" : "null");
+            probe->setProperty("Ath10kScanMgrGet", seen);
+        }
+        if (status == kIOReturnSuccess && result != nullptr) {
+            memcpy(data, result, sizeof(apple80211_scan_result));
+            ++_venturaScanMgrServes;
+            if (probe != nullptr)
+                probe->setProperty("Ath10kScanMgrServes",
+                                   static_cast<UInt64>(_venturaScanMgrServes), 32);
+            routed = kIOReturnSuccess;
+        }
     }
-    return kIOReturnUnsupported;
+    _venturaManagerCall = false;
+    return routed;
 }
 
 IOService *Ath10kPCIDevice::attachPlatformVif()
@@ -1633,6 +1725,18 @@ extern "C" void ath10kControllerPostMessage(IO80211Controller *self, UInt type, 
                                             UInt len, void *extra)
     __asm("__ZN17IO80211Controller11postMessageEjPvmjS0_");
 
+// Apple's own bridge from a driver message to the kern_event stream: it builds
+// kev_msg{vendor_code=1, kev_class=6, subclass=1, event_code=msg, dv[0]={16,ifname},
+// dv[1]={len,data}} and queues it through IO80211QueueCall::kev_post_msg (live
+// 0x1ff029f -> 0x2048596). That is what Apple80211EventMonitoringInit2's reader
+// thread picks up with read(fd, buf, 0x1018) after its ioctl(fd, 0x800c6502, ...),
+// i.e. the channel airportd actually waits on. The Skywalk vif's postMessage only
+// fans out to IOUC pipes, so a driver that stops there can post every message with
+// status 0 and still leave the client timing out with -3905.
+extern "C" int ath10kInterfacePostMessage(const char *ifname, UInt32 msg, void *data,
+                                          size_t len, IO80211Controller *controller)
+    __asm("__Z27IO80211InterfacePostMessagePKcjPvmP17IO80211Controller");
+
 // The event a client actually waits for is posted through the IOUC pipe list
 // ([ivars+0x208]), and that path looks the pipe up by the interface's BSD name:
 //   postMessageInternal -> isIOUCPipeOpened -> getBSDName() -> postMessageIOUC()
@@ -1667,6 +1771,43 @@ static UInt32 venturaEventPipeCount(void *array)
     return reinterpret_cast<CountFn>(vtable[0x130 / 8])(array);
 }
 
+void Ath10kPCIDevice::eventSweepCall(thread_call_param_t param0, thread_call_param_t)
+{
+    auto *self = static_cast<Ath10kPCIDevice *>(param0);
+    if (self != nullptr)
+        self->runEventSweep();
+}
+
+// Posts one message id per 200 ms until the client reacts. "Reacted" is defined
+// from the driver side only: the client asks for SCAN_RESULT (type 11), which
+// every request channel records in _venturaLastRequest.
+void Ath10kPCIDevice::runEventSweep()
+{
+    IOService *probe = getProvider();
+    if (probe == nullptr || _venturaVif == nullptr)
+        return;
+    if (_venturaLastRequest == APPLE80211_IOC_SCAN_RESULT && _eventSweepId != 0) {
+        probe->setProperty("Ath10kEventSweepHit",
+                           static_cast<UInt64>(_eventSweepId - 1), 32);
+        probe->setProperty("Ath10kEventSweep", "hit");
+        return;
+    }
+    if (_eventSweepId == 0 || _eventSweepId > APPLE80211_M_MAX) {
+        probe->setProperty("Ath10kEventSweep", "exhausted");
+        return;
+    }
+    const UInt32 message = _eventSweepId;
+    const char *name = ath10kVifGetBSDName(_venturaVif);
+    ath10kVifPostMessageIOUC(_venturaVif, name, message, nullptr, 0);
+    probe->setProperty("Ath10kEventSweepId", static_cast<UInt64>(message), 32);
+    ++_eventSweepId;
+    if (_eventSweepId <= APPLE80211_M_MAX && _eventSweepCall != nullptr) {
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(200, kMillisecondScale, &deadline);
+        thread_call_enter_delayed(_eventSweepCall, deadline);
+    }
+}
+
 void Ath10kPCIDevice::runScanNotify()
 {
     IOService *probe = getProvider();
@@ -1697,6 +1838,27 @@ void Ath10kPCIDevice::runScanNotify()
         probe->setProperty("Ath10kScanMgrDone", "ok");
         probe->setProperty("Ath10kScanMgrDones",
                            static_cast<UInt64>(_venturaScanMgrDones), 32);
+        // The manager consumed the driver's result cursor while it cached the sweep
+        // (scanDone pulls SCAN_RESULT until the driver reports end), and the client's
+        // own SCAN_RESULT is served from that same cursor, so rewind it here or the
+        // client's first read finds nothing left.
+        _venturaScanIndex = 0;
+        for (UInt32 i = 0; i < kVenReaderSlots; ++i)
+            _venturaReaders[i].index = 0;
+        // One sweep per boot: it walks the message ids the client might be waiting
+        // for (see runEventSweep) and stops at the first one that produces a
+        // SCAN_RESULT request.
+        if (_eventSweepId == 0) {
+            if (_eventSweepCall == nullptr) {
+                _eventSweepCall = thread_call_allocate_with_options(
+                    eventSweepCall, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+            }
+            if (_eventSweepCall != nullptr) {
+                _eventSweepId = 1;
+                probe->setProperty("Ath10kEventSweep", "armed");
+                thread_call_enter(_eventSweepCall);
+            }
+        }
     }
     if (_venturaEventPipe == nullptr) {
         // No event pipe: Skywalk registration is what installs it, so airportd is
@@ -1751,6 +1913,24 @@ void Ath10kPCIDevice::runScanNotify()
                  static_cast<unsigned>(doneStatus), static_cast<unsigned>(cacheStatus),
                  static_cast<unsigned>(internalStatus));
         probe->setProperty("Ath10kPostStatus", statuses);
+
+        // The kern_event route airportd's reader actually consumes.
+        char ifname[16] = {};
+        const char *unit = nullptr;
+        if (_venturaInterface != nullptr) {
+            if (OSString *n = OSDynamicCast(OSString,
+                                            _venturaInterface->getProperty("IOInterfaceName")))
+                unit = n->getCStringNoCopy();
+        }
+        strlcpy(ifname, unit != nullptr ? unit : "en1", sizeof(ifname));
+        struct { UInt32 status; UInt32 results; } kevPayload{0, static_cast<UInt32>(_wmiBSS.count)};
+        const int kevDone = ath10kInterfacePostMessage(
+            ifname, APPLE80211_M_SCAN_DONE, &kevPayload, sizeof(kevPayload), this);
+        const int kevCache = ath10kInterfacePostMessage(
+            ifname, APPLE80211_M_SCAN_CACHE_UPDATED, &kevPayload, sizeof(kevPayload), this);
+        char kevStatus[64];
+        snprintf(kevStatus, sizeof(kevStatus), "done=%d cache=%d", kevDone, kevCache);
+        probe->setProperty("Ath10kKevStatus", kevStatus);
     }
     _venturaScanNotifySent = true;
     probe->setProperty("Ath10kScanEvent", "posted-scan-done");

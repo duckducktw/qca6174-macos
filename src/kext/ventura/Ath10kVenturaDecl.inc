@@ -143,6 +143,14 @@ private:
     UInt32 _scanNotifyGeneration = 0;
     static void scanNotifyCall(thread_call_param_t, thread_call_param_t);
     void runScanNotify();
+    // Which message id the userspace client actually acts on is not documented and
+    // not visible from the kernel side of a normal post, so after the first scan
+    // every id in 1..APPLE80211_M_MAX is posted once, 200 ms apart, and the sweep
+    // stops as soon as the client reacts by asking for SCAN_RESULT.
+    thread_call_t _eventSweepCall = nullptr;
+    UInt32 _eventSweepId = 0;
+    static void eventSweepCall(thread_call_param_t, thread_call_param_t);
+    void runEventSweep();
     // IO80211ScanManager (see setupVenturaScanManager): the live family keeps the
     // scan cache there, and the vif's getScanManager() is an unconditional null
     // stub. One manager per controller, plus a private copy of the vif's vtable
@@ -156,6 +164,16 @@ private:
     UInt32 _venturaScanMgrDones = 0;
     UInt32 _venturaScanMgrServes = 0;
     SInt32 venturaScanManagerRequest(int type, void *data);
+    bool _venturaManagerCall = false;
+    // Per-pid read positions in the last sweep (see venturaReaderSlot).
+    static constexpr UInt32 kVenReaderSlots = 8;
+    struct VenturaReader {
+        int pid = 0;
+        int8_t index = 0;
+        UInt32 stamp = 0;
+    } _venturaReaders[kVenReaderSlots]{};
+    UInt32 _venturaReaderStamp = 0;
+    int8_t *venturaReaderSlot();
     // [iframeIvars+0x208]: the event pipe Skywalk registration would install. Read
     // (never written) here so "events cannot be delivered" is a measurement.
     void *_venturaEventPipe = nullptr;
