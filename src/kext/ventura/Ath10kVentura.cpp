@@ -972,6 +972,7 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
             const SInt32 status = venturaRecordRequest(isSet ? 1 : 0, raw->type, raw->data);
             if (status == kIOReturnSuccess)
                 return kIOReturnSuccess;
+            _venturaFallType = raw->type;
         }
     } else if (first == kSetCmd || first == kGetCmd) {
         const bool isSet = first == kSetCmd;
@@ -979,16 +980,26 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
         if (IOService *probe = getProvider())
             probe->setProperty("Ath10kIoctlReqType", static_cast<UInt64>(
                                    static_cast<UInt32>(type)), 32);
-        // setScanRequest-style calls carry the payload directly (no request block).
-        if (isSet) {
-            const SInt32 status = venturaRecordRequest(1, type, c);
-            if (status == kIOReturnSuccess)
-                return kIOReturnSuccess;
-        }
+        // Both verbs carry the payload directly here. Getters have to be served too:
+        // airportd's SCAN_RESULT arrives this way, and leaving it to Apple's
+        // implementation is what returned 0x66 (= the error 102 it reports).
+        const SInt32 status = venturaRecordRequest(isSet ? 1 : 0, type, c);
+        if (status == kIOReturnSuccess)
+            return kIOReturnSuccess;
+        _venturaFallType = type;
     }
     // Anything this driver does not serve still goes to Apple's implementation, which
-    // is what answered the housekeeping gets before this shim existed.
-    return IO80211Controller::apple80211_ioctl(iface, a, b, c);
+    // is what answered the housekeeping gets before this shim existed. Its 0x66
+    // (EOPNOTSUPP) is exactly the 102 airportd reports when a scan comes back empty, so
+    // which type falls through and what it answers is published here.
+    const SInt32 appleStatus = IO80211Controller::apple80211_ioctl(iface, a, b, c);
+    if (IOService *probe = getProvider()) {
+        char fall[64];
+        snprintf(fall, sizeof(fall), "type=%d st=%x", _venturaFallType,
+                 static_cast<unsigned>(appleStatus));
+        probe->setProperty("Ath10kIoctlFall", fall);
+    }
+    return appleStatus;
 }
 
 SInt32 Ath10kPCIDevice::apple80211SkywalkRequest(UInt requestType, int requestNumber,
@@ -1002,14 +1013,24 @@ SInt32 Ath10kPCIDevice::apple80211SkywalkRequest(UInt requestType, int requestNu
         // Results come back as a *pointer* here: the manager passes the address of
         // its own local and memcpy's sizeof(apple80211_scan_result) from whatever is
         // stored there, so writing the struct in place would smash its stack.
-        if (gVenturaScanSlot == nullptr)
-            return kIOReturnNotFound;
-        _venturaIoctlLength = sizeof(*gVenturaScanSlot);
-        const IOReturn status = venturaScanResult(gVenturaScanSlot);
-        if (status != kIOReturnSuccess)
-            return status;
-        *static_cast<apple80211_scan_result **>(data) = gVenturaScanSlot;
-        return kIOReturnSuccess;
+        if (gVenturaScanSlot != nullptr) {
+            _venturaIoctlLength = sizeof(*gVenturaScanSlot);
+            const IOReturn status = venturaScanResult(gVenturaScanSlot);
+            if (status == kIOReturnSuccess) {
+                *static_cast<apple80211_scan_result **>(data) = gVenturaScanSlot;
+                return kIOReturnSuccess;
+            }
+        }
+        // Not the manager's pointer-out shape: the family also calls this slot with a
+        // plain result buffer (airportd's SCAN_RESULT arrives here), so fill that with
+        // this reader's own position in the sweep.
+        int8_t *slot = venturaReaderSlot();
+        if (slot != nullptr)
+            _venturaScanIndex = static_cast<UInt8>(*slot);
+        const IOReturn plain = venturaScanResult(static_cast<apple80211_scan_result *>(data));
+        if (slot != nullptr)
+            *slot = static_cast<int8_t>(_venturaScanIndex);
+        return plain;
     }
     return venturaRecordRequest(isSet ? 1 : 0, requestNumber, data);
 }
@@ -1102,9 +1123,24 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
             venturaScanResult(static_cast<apple80211_scan_result *>(data));
         if (slot != nullptr)
             *slot = static_cast<int8_t>(_venturaScanIndex);
-        if (IOService *probe = getProvider())
+        if (IOService *probe = getProvider()) {
             probe->setProperty("Ath10kCursorStatus",
                                static_cast<UInt64>(static_cast<UInt32>(status)), 32);
+            // Only a served entry says anything: the loop always ends on NotFound,
+            // and that call never touches the buffer.
+            const auto *seen = static_cast<const apple80211_scan_result *>(data);
+            if (status != kIOReturnSuccess)
+                return status;
+            char shape[96];
+            snprintf(shape, sizeof(shape), "ch=%u fl=%x nr=%u ie=%u",
+                     static_cast<unsigned>(seen->asr_channel.channel),
+                     static_cast<unsigned>(seen->asr_channel.flags),
+                     static_cast<unsigned>(seen->asr_nrates),
+                     static_cast<unsigned>(seen->asr_ie_len));
+            probe->setProperty("Ath10kResultShape", shape);
+            probe->setProperty("Ath10kResultReqLen",
+                               static_cast<UInt64>(_venturaIoctlLength), 32);
+        }
         return status;
     }
     case APPLE80211_IOC_SCANCACHE_CLEAR:

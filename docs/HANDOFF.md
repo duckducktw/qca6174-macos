@@ -1335,6 +1335,79 @@ ssh 100.64.0.152 'printf "system_reset\n" | socat - UNIX-CONNECT:/tmp/ventura-vm
 
 ---
 
+## 6.20 第十六輪：掃描接上家庭的 scan manager，完成事件走 kern_event（v128–v142）
+
+### 6.20.1 這一輪做完的三件事（全部實測）
+
+1. **真正的 `IO80211ScanManager`**（v128）。`IO80211Controller::getPrimaryInterfaceScanManager()`
+   是 `getPrimarySkywalkInterface()` 之後再打 vtable slot 373（`vptr+0xb98`），而 vif 那一格是
+   `xor eax,eax; ret`。做法：用 `MetaClass::alloc()`（`__ZNK18IO80211ScanManager9MetaClass5allocEv`）
+   建 manager、`initWithControllerAndSkywalkInterface` 初始化、再把 vif 的 vtable **執行期複製
+   一份**、只換 slot 373 指向回傳 manager 的 thunk、把 `[vif]` 換成新表。不子類化、不 `new` Apple 類別。
+   - init 只要求：`getWorkQueue()` 非 null、`service->GetProvider()` 非 null、而且
+     `CARD_CAPABILITIES` 回覆的第 6 byte（`caps[2]`）要有 `0x40`（capability #22）——這一條是本輪
+     才發現的硬門檻，沒設 manager 就建不起來。
+   - 斷點：`Ath10kScanMgrInit=ok`、`Ath10kScanMgrPatch=patched`、`Ath10kScanMgrVisible=yes`，
+     `IOKitDiagnostics` 裡 `IO80211ScanManager` 實例 = 1。
+
+2. **驅動端把 manager 的流程驅動起來**。`SCAN_REQ` 走 `startScan()`（它會建 pid-keyed 的 pending
+   request node）、掃完由驅動呼叫 `scanDone(true)`，manager 會**自己**用
+   `apple80211_scan_result **`（pointer-out，0x48c，IE 內嵌在 0x8c）連拉結果直到 driver 回非 0。
+   斷點：`Ath10kScanMgrStart=ok`、`Ath10kScanMgrDone=ok`、`Ath10kScanServed` 隨每次掃描增加。
+
+3. **完成事件走 kern_event，`-3905` 消失**（v131，本輪關鍵）。airportd 讀的不是 IOUC 管道
+   （`postMessage` 回 0 也沒用），而是 `Apple80211EventMonitoringInit2` 用
+   `ioctl(fd, 0x800c6502, …)` 註冊的 **kernel-event fd**，讀端是 `read(fd, buf, 0x1018)`（要 ≥0x18
+   byte）。真正的入口是 `IO80211Interface::postMessage(ifname, msg, data, len, controller)`
+   （live `0x1ff029f`，EXT），它組 `kev_msg{vendor=1, class=6, subclass=1, event=msg,
+   dv[0]={16,ifname}, dv[1]={len,data}}` 交給 `IO80211QueueCall::kev_post_msg`（`0x2048596`）→
+   xnu `_kev_post_msg`。補上這條之後 `cwscan` 從「重試 85 秒失敗」變成 26 秒回來。
+   斷點：`Ath10kKevStatus="done=0 cache=0"`。
+
+### 6.20.2 反編譯得到的兩個語意（不要再用猜的）
+
+- **`IO80211ScanManager::getScanResult`（`0x2013b84`）**：讀 `[manager+0x10]+0xa8` 的 pending req
+  node 鏈，逐一比 `proc_selfpid()`（節點內 `+0x2a60` 是結果鏈、`+0x2a50` 是完成旗標）。命中才回
+  `*result = [entry+0x18]+0x14` 並把該節點游標推進，否則回 **5**。也就是說「回 5」的意義是
+  「沒有屬於我的節點」，**不是**「cache 空」；kernel 執行緒（pid 0）去呼叫永遠會拿到 5。
+- **`IO80211ScanManager` 的快取年齡**：`setCacheAgeThreshold` 寫 `[ivars+8]`（`procIsSuperuser`
+  才能寫），`cacheAgeThresh` 讀它，direct/broadcast 在 `[ivars+0x14]` / `[ivars+0xc]`。
+  本機原本 `direct=0 bcast=0`，已設成 30/300（`Ath10kScanMgrAges` / `AgesAfter` 斷點）。
+
+### 6.20.3 現在的真實狀態（v141 穩定，v142 已回退）
+
+- **驅動端掃描完全可用**：guest 內 `airport -s` 與 `tools/apple80211-scan.c` 都列出十多個真實 AP
+  （SSID／BSSID／頻道／RSSI／速率／內嵌 RSN IE 全正確，`total=14` 級別）。
+- **airportd／CoreWLAN 仍是 0 筆網路**，失敗點已鎖定到單一斷點：
+  `Ath10kIoctlFall="type=11 st=66"` —— 有一個 `SCAN_RESULT`（type 11）落到 Apple 原實作、回
+  `0x66`（= 它回報的 `error=102`）。`Ath10kResultShape="ch=… fl=8a nr=12 ie=22"`、
+  `Ath10kResultReqLen=1164`（= 0x48c）證明**驅動給的結構是完整且長度正確的**。
+- **v142 的死路（別重做）**：在 `apple80211SkywalkRequest` 的 type-11 分支「pointer-out 失敗就改填
+  一般緩衝」會讓 airportd 的讀取迴圈卡死（`cwscan` >290 秒無回應），已回退到 v141。
+
+### 6.20.4 下一輪的第一步（明確）
+
+不要在 fall-through 之後記錄，要在**入口**分辨 airportd 的 type-11 是三條通道中的哪一條：
+`performanceCommand`（BSD ioctl 40 byte）、slot 406 的 getter 慣例（cmd 在 arg1）、slot 408
+`apple80211SkywalkRequest`。在三個入口各自記一組 `type/verb/req_len` 斷點，一次 `cwscan` 就能看出
+它走哪條，再只修那一條（v142 的教訓：混著改會卡死）。伺服器端不需要任何改動。
+
+### 6.20.5 這輪新增/留下的斷點
+
+`Ath10kScanMgrInit|Patch|Visible|Start|Done|Dones|Serves`、`Ath10kScanMgrAges|AgesAfter`、
+`Ath10kKevStatus`、`Ath10kPostStatus`、`Ath10kResultShape|ResultReqLen`、`Ath10kCursorStatus`、
+`Ath10kIoctlFall`、`Ath10kScanServed|ScanEnds|ScanCached`。
+
+### 6.20.6 部署備忘（這輪踩到的）
+
+- Acer 上的工具在 `~/qca-tools/`（`pull_v.sh`、`deploy.sh`、`oc_enable.py`…），不是 `/tmp`；
+  HANDOFF 早期章節寫的 `/tmp/pull_v.sh`、`/tmp/deploy_arg.sh` 已經不在了。
+- guest 的 `/tmp` **每次重開都會清空**，`cwscan`／`a11scan`／量測腳本要每次重傳。
+- 部署固定式：`bash ~/.hermes/cache/scratch/build_v.sh` → `ssh 100.64.0.152 'bash ~/qca-tools/pull_v.sh NN'`
+  → `cat ~/sudo.pwd | ssh 100.64.0.152 'bash ~/qca-tools/deploy.sh /tmp/vkNN'`。
+
+---
+
 ## 13. 建議技能
 
 - `osx-kvm-headless-install`：VM 生命週期、qemu-nbd、SSH 進 guest。

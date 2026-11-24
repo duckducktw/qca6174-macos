@@ -165,6 +165,7 @@ private:
     UInt32 _venturaScanMgrServes = 0;
     SInt32 venturaScanManagerRequest(int type, void *data);
     bool _venturaManagerCall = false;
+    int _venturaFallType = -1;
     // Per-pid read positions in the last sweep (see venturaReaderSlot).
     static constexpr UInt32 kVenReaderSlots = 8;
     struct VenturaReader {
