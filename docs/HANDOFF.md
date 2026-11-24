@@ -1523,6 +1523,57 @@ ASSOCIATE accepted for 'QCA-TEST' on en1
 
 ---
 
+### 6.23 第十九輪（v154–v160）：WPA2-PSK 通了，加密鏈路可上網
+
+#### 6.23.1 這輪補上的東西
+
+- `venturaAssociate()` 不再拒絕有金鑰的網路：WPA2-PSK（AKM 2）與 PSK-SHA256（AKM 6）走核心內
+  supplicant；802.1X/EAP 仍明確拒絕（`enterprise-not-supported`）。
+- 新增 `Ath10kVenturaSupplicant`（`AthSecurity::Supplicant<Ath10kKernelCrypto,true,true>`
+  + PMK + reply/keys 暫存），`venturaSecurityArm/Accept/Service/Stop`；
+  金鑰仍交給共用狀態機的 securityPhase 階梯安裝（`buildSecurityWMI`），不自己寫 WMI。
+- `Ath10kNetwork.cpp` 的 `serviceConnection()` 在 `#ifndef ATH10K_NATIVE` 下先跑
+  `venturaSecurityService()`，讓握手結果比安裝階梯早一步就緒。
+- `tools/apple80211-assoc.c` 支援帶密碼（argv 或 stdin），並用 SDK 的真實位移填 `ad_key`。
+
+#### 6.23.2 三個只看得到「AP 丟掉 M2」的坑
+
+| # | 坑 | 症狀 → 修法 |
+|---|---|---|
+| 1 | PMK 用 PBKDF2-HMAC-**SHA256** | hostapd log：`PTK derivation using PRF(SHA1)` 之後 `invalid MIC in msg 2/4`，三次重傳後 deauth reason 15。WPA2-PSK 的 PMK 是 **SHA1**（4096 輪、salt=SSID、32 byte = 兩個 20-byte block） |
+| 2 | 初次安裝金鑰時要求 `securityPhase != 0` | 死鎖：金鑰只在 phase 0 該裝，條件寫反就永遠不裝 → 一樣是 reason 15。正確條件是 native 的 `initial && !securityPhase` |
+| 3 | 直接呼叫 corecrypto `ccpbkdf2_hmac` | MacKernelSDK 把這個符號宣告成 **C++ 修飾名**（`__Z13ccpbkdf2_hmac…`），核心匯出的是 C 名 → 未解析符號 → OpenCore 整個 kext 靜默跳過（序列埠零 ath10k、`nm -u` 看得到修飾名）。改成用 supplicant 已連結的 HMAC 自己實作 PBKDF2 |
+
+#### 6.23.3 驗證（v160，Acer `/tmp/vk160`，sha256 `cd3c3548…`）
+
+驗證方式：本機 hostapd（`QCA-TEST`、WPA2-PSK/CCMP、passphrase 為一次性測試值）＋ guest 內
+`a11assoc QCA-TEST en1`（密碼走 stdin）。
+
+```
+ASSOCIATE accepted for 'QCA-TEST' on en1 (wpa2-psk)
+  state=4 (RUN)
+```
+- AP 端（hostapd `-d`）：`received EAPOL-Key frame (2/4 Pairwise)` → `PTK derivation using PRF(SHA1)`
+  → `sending 3/4 msg` → `Set STA flags … authorized=1` → **`AP-STA-CONNECTED`**；
+  `iw station dump`：authorized/authenticated/associated = yes、signal −33 dBm、rx 5614 bytes。
+- 驅動端：`Ath10kConnectionState="connected-wpa2"`、`Ath10kSecurityPhase=5`、
+  `Ath10kSecPhase="keys-in initial=1 pair=0 gtk=1"`、`DataTxPackets=24`。
+- 加密鏈路上網：`ping 1.1.1.1` 2/2、**`https://example.com` → HTTP 200**。
+- 中間用兩個指紋把問題釘死（只在 ioreg，不輸出金鑰）：`Ath10kSecCheck`（passphrase 長度／前 2 byte
+  ＋ PMK 前 2 byte）與 `Ath10kSecPtkFp`（PTK 前 2 byte）。兩者都與本地獨立算的
+  PBKDF2-SHA1、PRF-384 一致 → 證明問題在別處，最後才鎖定「phase 0 才該裝金鑰」這個條件。
+
+#### 6.23.4 還沒做的
+
+- 802.1X/EAP（需要 Apple 的 user-space supplicant 或 802.1X 堆疊，不是核心內能解決的）。
+- WPA3-SAE（native 已有 `Ath10kSAE*` 那套；Ventura 還沒接）。
+- PMF（AP 要求 MFPR 時的 IGTK/BIP）。
+- DHCP：`ipconfig set en1 DHCP` 在 en1 仍回 `invalid operation`（`networksetup -setdhcp "Wi-Fi"`
+  之後還沒生效），目前用靜態 IP + 預設路由驗證；要讓系統自己拿 IP 還得修這條。
+- 省電：工作站睡著時 AP 會壓住封包（`HTTRxIndications=0`），一有 TX 就恢復；要徹底解得關韌體 PS。
+
+---
+
 ## 13. 建議技能
 
 - `osx-kvm-headless-install`：VM 生命週期、qemu-nbd、SSH 進 guest。
