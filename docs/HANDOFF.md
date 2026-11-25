@@ -1,16 +1,15 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-25（**第二十一輪：DHCP 通了 —— 介面型別 71 才是兇手**。反組譯 configd 的
-`arp_client_init`（IPConfiguration 本體，非猜測）得到它只接受 `IFT_ETHER(6)`／`IFT_L2VLAN(135)`／
-`IFT_IEEE8023ADLAG(136)`／`IFT_IEEE1394(144)`，其餘一律 `unsupported network type`；先前為了
-airportd 把 ifnet 型別釘在 71 是錯的（airportd 的 Wi-Fi 判定走 `SIOCGIFMEDIA`）。v165 改回 6 後
-`if_data.ifi_type=6`、`dhcp_bound(en1) 192.168.77.75`、`RouterARPVerified=TRUE`，
-預設路由指到 AP 時 `ping 1.1.1.1` 3/3（8.6 ms）、`https://example.com` 200，**而且
-airportd 完全沒退化**（`Power (en1): On`、`cwscan` 13 個網路）。§1 條件 D 正式 ✅。詳見 §6.25。
-第十九輪：§6.23；第十七輪掃描：§6.21。）
+最後更新：2026-11-25（**第二十九輪：join 流程逆向總圖**。新增 `docs/join-flow-reverse.md`，
+把 `CoreWLAN → airportd → family IO80211APIUserClient → apple80211RequestIoctl → 驅動四入口`
+整條鏈路連同每個位址／偏移／呼叫慣例寫成一份文件。本輪修掉兩個真 bug：`apple80211VirtualRequest`
+把 cmd 字當成 1/0 動詞（導致 **所有 set 被當成 get**）、以及 CARD_CAPABILITIES 的欄位偏移全錯
+（改用 Apple 驅動的實際佈局）。DHCP／上網在 v165 後一直是通的；系統發起的 join 仍卡在 airportd
+內部 `-3903`，且 `ASSOCIATE(20)` 從未送出。第二十六輪：§6.31；§6.30：入口軌跡。）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v165**（`/tmp/vk165`，Acer 上，sha256 `86ff4b92…`）— kext 載入、en1 `UP,RUNNING`、
-airportd 掃描 `error=0`、WPA2-PSK 關聯＋握手＋**DHCP 取得 192.168.77.75**、加密鏈路可上網
+VM 現況：**v188**（`/tmp/vk188`，Acer 上，sha256 `43a1a9c9…`）— kext 載入、en1 `UP,RUNNING`、
+airportd 掃描 `error=0`、WPA2-PSK 關聯＋握手＋DHCP（192.168.77.75）＋加密鏈路上網（41 Mbit/s）
+第十九輪：§6.23；第十七輪掃描：§6.21；§1 條件 D ✅ 的推導見 §6.25。
 
 ---
 
@@ -2150,6 +2149,28 @@ family 的 `extRunDriverCommand` 最後呼叫的是 controller 上的 `apple8021
 **下一步**：accepted 的路只剩兩條——(a) 讓 airportd 改開我們的 user client（`newUserClient`
 回傳自家的 client 並支援 selector 0 的 `apple80211req` 轉發），或 (b) 直接反 family 的
 `extRunDriverCommand` 看它在什麼條件下才會前進到 assoc。
+
+### 6.35 交接：join 流程逆向總圖（新文件 `docs/join-flow-reverse.md`）
+
+把這幾輪逆向出來的整條鏈路整理成獨立文件 `docs/join-flow-reverse.md`，內容包含：
+
+1. **完整鏈路**：`networksetup/CoreWLAN → airportd（/var/log/wifi.log）→ family 的
+   IO80211APIUserClient → IO80211Controller::apple80211RequestIoctl（call [rax+0x388]，
+   esi=cmd edx=type rcx=iface r8=data）→ 驅動四個入口 → WMI/HTT → 韌體`，每層都有證據。
+2. **family 內部關鍵常式**（都附位址與關鍵指令）：`setAssociateRequest`（只 IOLog＋轉發）、
+   `getCurrentNetwork`（0x48c 佈局）、`setRSN_Conf`（`[req+0x20]`→ivars+0x118）、
+   `useAppleRSNSupplicant`（bit1，實測 already-on）。
+3. **Apple 驅動的 0x109 項型別跳表**：115 個實作、default 分支位址、實作清單、
+   以及「255/256/103/177 在 Apple 眼裡也是 default」這個決定性事實。
+4. **驅動四個入口的可覆寫性**（三個 virtual + 一個 non-virtual，附標頭行號）。
+5. **v165→v188 修了什麼**，含 v187「`apple80211VirtualRequest` 把 cmd 當 1/0」這個潛伏 bug。
+6. **符號歸屬表**：`RSNSupplicant` 只在 legacy bundle；P-256 在 `kec.corecrypto`；SHA 在 kernel；
+   `cczp_prime/cczp_n` 不是符號。
+7. **未解問題與兩個方案**：family 的 `IO80211APIUserClient` 才是 airportd 的通道，
+   方案 A＝攔 `newUserClient` 用自家 client 轉發 `apple80211req`；方案 B＝反
+   `extRunDriverCommand` 找它前進條件。
+8. **量測工具／麵包屑一覽** 與 **七個會浪費整輪的陷阱**（stale object、32-bit 截斷、
+   networksetup 只印一行、unified log 空、密碼走 stdin…）。
 
 ---
 
