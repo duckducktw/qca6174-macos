@@ -2097,6 +2097,60 @@ dump cache 反 CoreWLAN，要嘛直接對 airportd 下 XPC。兩條都比重複�
 前 8 個 dword 也印出來（目前 `Ath10kArgDump` 只涵蓋核心指標），確認 airportd 那批請求的
 `req_type` 到底落在哪個偏移、是不是我們讀成 255/256/387 的那批。
 
+### 6.34 第二十九輪（v186–v188）：CoreWLAN 直測 + 兩個真 bug
+
+#### 6.34.1 用 CoreWLAN 直接發 join（新增 `tools/cwjoin.m`）
+
+`networksetup` 只印一行錯誤，看不出理由；改用 System Settings 同一條路徑（`CWInterface
+associateToNetwork:password:error:`）並把 NSError 全部印出來，密碼走 stdin：
+
+```
+iface=en1 power=1 serviceActive=1
+scan-saw-target=1                     ← CoreWLAN 自己的掃描看得到 QCA-TEST
+assoc-ok=0
+assoc-error domain=com.apple.wifi.apple80211API.error code=-3903
+assoc-userinfo={}                     ← 空，沒有更多線索
+```
+
+所以 -3903 是 airportd 內部回報的，掃描、電源、service 都正常。
+
+#### 6.34.2 修掉的真 bug（v187）
+
+`apple80211VirtualRequest` 的第一個參數是 **ioctl cmd 字**（`0xc03069c9` / `0x803069c8`），
+而原程式直接把它當成 `1/0` 傳給 `venturaRecordRequest(type == 1)` ——
+**所有 set 都被當成 get 處理**，於是 airportd 的 power/SSID/associate 寫入全部「回 success 但什麼都沒做」。
+修法：
+
+```cpp
+const bool isSet = requestType == 0x803069c8UL || requestType == 1;
+```
+
+同時加了 `Ath10kVirtualReqType` breadcrumb。實測該入口最後一個請求是 **type 12
+（CARD_CAPABILITIES）**，之後就沒了。
+
+#### 6.34.3 能力表照 Apple 驅動重寫（v188）
+
+反 `AppleBCMWLANCore::getCARD_CAPABILITIES`（`0xffffff800154a77a`）得到 Apple 的填法：
+`[0x00]=1`(version)、`[0x04]=0xee6f`、`[0x06]=0x61`、`[0x09]=0x40`、`[0x0c]=0x201`，
+之後再 OR feature bits。先前我們把 WEP/TKIP/CCMP 用「每種一個 byte」的偏移填，位置全錯。
+v188 改成照抄並加上 n/ac/WPA2 位元，現在 `Ath10kCaps = "01 ee 73 a0 04 41 01 02 00 00 00"`。
+
+**結果**：caps 換對之後仍是 -3903、`Ath10kVirtualReqType` 仍停在 12。也就是說 airportd 讀完
+能力表就放棄，不再往驅動問任何東西。
+
+#### 6.34.4 目前唯一還沒被解釋的環節
+
+`ioreg -n IO80211APIUserClient` 顯示那個 client 的建立者是 **pid 86, configd**，而
+`Ath10kUserClientBefore/After = "IO80211APIUserClient"`（Attempt=2）代表 airportd 開的是
+**family 自己的 user client**，不是我們 `Ath10kVenturaUserClient`（所以 `Ath10kUC*` 一個都沒有）。
+family 的 `extRunDriverCommand` 最後呼叫的是 controller 上的 `apple80211VirtualRequestIoctl`，
+但它在兩份 SDK 標頭裡都**不是 virtual**（`SInt32 (...)(unsigned int,int,IO80211VirtualInterface*,void*)`），
+我們無法覆寫 → 只能走它內部、而它內部會用 family 自己的狀態機去 join。
+
+**下一步**：accepted 的路只剩兩條——(a) 讓 airportd 改開我們的 user client（`newUserClient`
+回傳自家的 client 並支援 selector 0 的 `apple80211req` 轉發），或 (b) 直接反 family 的
+`extRunDriverCommand` 看它在什麼條件下才會前進到 assoc。
+
 ---
 
 ## 13. 建議技能

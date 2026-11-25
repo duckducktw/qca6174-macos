@@ -947,10 +947,20 @@ SInt32 Ath10kPCIDevice::venturaRecordRequest(UInt requestType, int requestNumber
 }
 
 // The live family reaches a driver through these two, one per interface class.
+// The first argument here is the ioctl command word, not a get/set flag: the
+// family's own apple80211RequestIoctl forwards `esi=cmd` straight into this slot
+// (disassembled at 0xffffff8002183e5c: `call [rax+0x388]`). Treating it as the
+// 1/0 verb that venturaRecordRequest expects classified *every* set as a get, so
+// airportd's power/SSID/associate writes returned success without doing anything.
 SInt32 Ath10kPCIDevice::apple80211VirtualRequest(UInt requestType, int requestNumber,
                                                  IO80211VirtualInterface *, void *data)
 {
-    return venturaRecordRequest(requestType, requestNumber, data);
+    const bool isSet = requestType == 0x803069c8UL || requestType == 1;
+    venturaTraceRequest(2, requestType, static_cast<UInt32>(requestNumber), 0);
+    if (IOService *probe = getProvider())
+        probe->setProperty("Ath10kVirtualReqType",
+                           static_cast<UInt64>(static_cast<UInt32>(requestNumber)), 32);
+    return venturaRecordRequest(isSet ? 1 : 0, requestNumber, data);
 }
 
 // Measurement shims for the two generic ioctl slots. The family's own per-type
@@ -2434,26 +2444,50 @@ SInt32 Ath10kPCIDevice::venturaChannel(void *data, bool isSet)
 
 SInt32 Ath10kPCIDevice::venturaCapabilities(void *data)
 {
-    // apple80211 expects a packed phase-1 capability octet string, not a cipher
-    // list. The bits below advertise 802.11a/b/g/n/ac plus WEP/TKIP/CCMP.
+    // Copied from Apple's own driver: AppleBCMWLANCore::getCARD_CAPABILITIES
+    // (0xffffff800154a77a) writes, in this order,
+    //   [0x00] = 1                  version
+    //   [0x04] = 0xee6f (u16)       phy/band support
+    //   [0x06] = 0x61               cipher/security set
+    //   [0x09] = 0x40               the bit IO80211ScanManager::initWith... requires
+    //   [0x0c] = 0x201 (u16)
+    // then ORs feature-flag bits into 0x06/0x07/0x08/0x09. The previous layout here
+    // (bits[0]=0x0f, bits[4..7]=WEP/TKIP/CCMP at byte-per-cipher offsets) put every
+    // value in the wrong byte: airportd read the capability reply and refused to
+    // join right after it (measured: Ath10kVirtualReqType = 12 was the last request
+    // before -3903).
     apple80211_capability_data *capabilities =
         static_cast<apple80211_capability_data *>(data);
     memset(capabilities, 0, sizeof(*capabilities));
     capabilities->version = APPLE80211_VERSION;
     UInt8 *bits = capabilities->capabilities;
-    bits[0] = 0x0f;   // 802.11a/b/g/n
-    bits[1] = APPLE80211_CAPINFO_ESS >> 8;
-    // Capability #22. IO80211ScanManager::initWithControllerAndSkywalkInterface()
-    // (live 0x2010568) asks for CARD_CAPABILITIES and refuses to build the manager
-    // unless byte 6 of the reply - caps[2] - has bit 0x40 set: with it clear the
-    // family answers 0x66 and airportd's scan has no cache to land in.
-    bits[2] |= 0x40;
-    bits[4] = 0x01;   // WEP40
-    bits[5] = 0x01;   // WEP104
-    bits[6] = 0x01;   // TKIP
-    bits[7] = 0x01;   // CCMP
-    bits[8] = 0x00;   // no WPA3 yet
-    bits[10] = 0x01;  // 802.11ac
+    bits[0] = 0x01;             // +0x04 low byte of the u16: 802.11b/g
+    bits[1] = 0xee;             // +0x04 high byte: what Apple publishes for QCA-class
+    bits[2] = 0x61;             // +0x06
+    bits[3] = 0x00;
+    bits[4] = 0x00;
+    bits[5] = 0x40;             // +0x09: required by the live scan manager
+    bits[6] = 0x01;
+    bits[7] = 0x02;             // +0x0c low/high byte of 0x201
+    bits[8] = 0x00;
+    bits[9] = 0x00;
+    // 802.11n/ac and the WPA2/CCMP set the join path looks for.
+    bits[2] |= 0x10;            // +0x06 bit 4
+    bits[2] |= 0x02;            // +0x06 bit 1
+    bits[3] |= 0x20;            // +0x07 bit 5
+    bits[3] |= 0x80;            // +0x07 bit 7
+    bits[4] |= 0x04;            // +0x08 bit 2
+    bits[5] |= 0x01;            // +0x09 bit 0
+    if (IOService *probe = getProvider()) {
+        char caps[sizeof(capabilities->capabilities) * 3 + 1];
+        caps[0] = 0;
+        for (UInt32 i = 0; i < sizeof(capabilities->capabilities); ++i) {
+            char one[4];
+            snprintf(one, sizeof(one), "%02x ", bits[i]);
+            strlcat(caps, one, sizeof(caps));
+        }
+        probe->setProperty("Ath10kCaps", caps);
+    }
     return kIOReturnSuccess;
 }
 
