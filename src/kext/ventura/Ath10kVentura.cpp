@@ -2109,6 +2109,19 @@ extern "C" bool ath10kAttachSkywalkInterface(IO80211Controller *self, OSObject *
                                              IOService *service)
     __asm("__ZN17IO80211Controller15attachInterfaceEP8OSObjectP9IOService");
 
+// Apple's in-kernel RSN supplicant (live IO80211Family's RSNSupplicant class) is
+// gated by this one predicate. Disassembly of the live implementation
+// (0xffffff8001fed798) is only:
+//   mov rax,[rsi+0x118]      ; the vif's Skywalk ivars
+//   mov al,[rax+0x118]       ; RSN-conf byte
+//   and al,2 ; shr al,1 ; ret
+// i.e. bit 1 of the dword that APPLE80211_IOC_OFFLOAD_RSN (177) writes into the
+// same ivars (handler at 0xffffff8002038e2c stores the request's upper dword
+// there, then forwards the set to the driver). airportd never sends 177 to this
+// driver, so the bit stays 0 and the family keeps its supplicant switched off.
+extern "C" bool ath10kUseAppleRSN(IO80211Controller *self, IO80211VirtualInterface *iface)
+    __asm("__ZN17IO80211Controller21useAppleRSNSupplicantEP23IO80211VirtualInterface");
+
 // IO80211VirtualInterface::start() is a tail call into
 // IO80211SkywalkInterface::start(); that body is the only code in the kernel
 // cache that installs the event-pipe array:
@@ -2331,6 +2344,32 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
         probe->setProperty("Ath10kVifStart", vifStarted ? "ok" : "failed");
         probe->setProperty("Ath10kVifEventPipe",
                            static_cast<UInt64>(reinterpret_cast<uintptr_t>(_venturaEventPipe)), 64);
+    }
+    // Turn Apple's in-kernel RSN supplicant on and record whether the predicate
+    // flipped. The gate reads [vif+0x118] -> ivars, then byte [ivars+0x118], so
+    // this is a *different* ivars pointer than the 0x110 one holding the role.
+    // airportd never sends APPLE80211_IOC_OFFLOAD_RSN(177) to this driver, so
+    // the family otherwise keeps RSNSupplicant switched off for our interface.
+    {
+        void **skywalkIvars = reinterpret_cast<void **>(reinterpret_cast<char *>(vif) + 0x118);
+        UInt32 rsnBefore = 0;
+        const bool gateBefore = ath10kUseAppleRSN(this, vif);
+        if (*skywalkIvars != nullptr) {
+            volatile UInt32 *rsnConf = reinterpret_cast<volatile UInt32 *>(
+                reinterpret_cast<char *>(*skywalkIvars) + 0x118);
+            rsnBefore = *rsnConf;
+            *rsnConf = rsnBefore | 2;
+        }
+        const bool gateAfter = ath10kUseAppleRSN(this, vif);
+        if (probe) {
+            probe->setProperty("Ath10kRSNConfIvars",
+                               static_cast<UInt64>(reinterpret_cast<uintptr_t>(*skywalkIvars)), 64);
+            probe->setProperty("Ath10kRSNConfBefore", static_cast<UInt64>(rsnBefore), 32);
+            probe->setProperty("Ath10kAppleRSNGate",
+                               gateAfter ? (gateBefore ? "already-on" : "set-by-driver") : "refused");
+        }
+        IOLog("Ath10kMac: apple-rsn gate before=%d after=%d conf=0x%x\n",
+              (int)gateBefore, (int)gateAfter, (unsigned)rsnBefore);
     }
     if (*ivarsSlot != nullptr)
         *reinterpret_cast<UInt32 *>(reinterpret_cast<char *>(*ivarsSlot) + 0x50) = 1;

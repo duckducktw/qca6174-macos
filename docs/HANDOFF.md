@@ -1767,6 +1767,81 @@ Sequoia/Tahoe 的 WCL personality。要嘛自帶 802.1X，要嘛冒 panic 風險
 
 ---
 
+### 6.27 第二十二輪（v166）：Apple 的「核心內 RSN supplicant」是 legacy-only —— 但 802.1X 根本不是走那條
+
+用戶的判斷是對的：社群的 panic 不是平台極限。查完之後，**真相比「會 panic」更清楚**：
+
+#### 6.27.1 那顆 supplicant 不在 live bundle 裡（決定性）
+
+KC 符號表實查（`n_type & N_EXT`，逐 fileset 條目）：
+
+| 符號 | 提供者 |
+|---|---|
+| `RSNSupplicant::init()` `0xffffff80021bfa74` | **`com.apple.iokit.IO80211FamilyLegacy`** |
+| `RSNSupplicant::initWithInterfaceIEAndMode(IO80211Interface*,u_char,bool)` `0xffffff80021c030e` | 同上 |
+| `RSNSupplicant::process1of4/3of4`、`installPTK`、`installGTK`、`cachePMKSA` | 同上 |
+
+Apple 的核心內 supplicant（4-way＋EAPOL 轉發）**只存在於 legacy bundle**，跟 §6.12 的 5 參數
+infra handler 同一個狀況：注入 kext 只能綁 live（OpenCore 只查 `OSBundleLibraries`，kernel 排第一），
+所以**永遠拿不到它**。社群那些「開 Apple RSN 就 panic」的 build，就是把 legacy 才有的東西從
+live 形狀的介面叫下去，虛擬位落到隔壁槽（§6.15.5 的同型死法），不是 macOS 不給。
+
+#### 6.27.2 開關本身其實是開的，所以「開啟」不是問題
+
+live `IO80211Controller::useAppleRSNSupplicant(IO80211VirtualInterface*)`
+（`0xffffff8001fed798`）整支只有：
+
+```
+mov rax,[rsi+0x118]   ; vif 的 Skywalk ivars
+mov al,[rax+0x118]    ; RSN-conf 位元組
+and al,2 ; shr al,1 ; ret
+```
+
+那個位元組是 `APPLE80211_IOC_OFFLOAD_RSN(177)` 的 setter 寫的（`0xffffff8002038e2c`：copyIn 8 bytes →
+`*(u32*)(ivars+0x118)=payload[4..8]` → 再轉給 `apple80211VirtualRequestIoctl`）。
+v166 加了量測（`attachPlatformVif()` 裡讀 gate、直接呼叫 `ath10kUseAppleRSN`、記錄 ivars）：
+**`Ath10kRSNConfBefore = 0x22`、`Ath10kAppleRSNGate = "already-on"`** → 開關預設就是開的，
+airportd 也從來沒送過 177（`Ath10kRequestTrace` 沒有 `s177=`）。所以這條不是卡點。
+
+#### 6.27.3 真正的卡點：沒有東西會去「建」那顆 supplicant
+
+v166 實測：關聯成功（`connected-wpa2`、SecurityPhase 5）之後，`ioreg -c RSNSupplicant` 仍然是 **0 個實例**。
+live `setAssociateRequest`（`0xffffff8001fe2533`）本體只是 `IOLog` ＋ 轉給
+`apple80211VirtualRequestIoctl`，它不建 supplicant。結論：**live 這條路上根本沒有 supplicant 可開**，
+開關是 legacy 時代留下的旗標。
+
+#### 6.27.4 802.1X 的正解：它本來就是使用者空間（`eapolclient` over EAPOL socket）
+
+把 `/System/Library/SystemConfiguration/EAPOLController.bundle/Contents/MacOS/EAPOLController`
+（212 KB，磁碟上就有）抓回來看字串：
+
+```
+EAPOLController: failed to open EAPOL socket over %s
+EAPOLController: starting 802.1X authentication with system ethernet profile
+EAPOLController: %s requires 802.1X
+/System/Library/PrivateFrameworks/EAP8021X.framework/Versions/A/EAP8021X
+eapolclient
+```
+
+也就是 macOS 的企業驗證是 **`EAPOLController` → `eapolclient` → 在介面上開 EAPOL socket（BPF 類）**
+收送 `0x888e` 幀，根目錄不是核心 supplicant。這條對我們反而是好消息：只要 BSD 介面能把 EAPOL 幀
+tapped 給 bpf、並把 bpf 寫入的 EAPOL 送出去（介面已經有 `attachToBpf()`），802.1X 就成立，
+完全不需要 legacy bundle。
+
+**下一步（工程順序）**：
+1. 在 guest 內驗 bpf：`tcpdump -i en1 -y IEEE802_11 ether proto 0x888e`（或自寫 bpf 程式）看
+   關聯後 M1（EAPOL-Start/Request）有沒有被 tap 到；RX 端 `inputPacket`/`deliverNetworkRX` 的 EAPOL
+   也要確認有走 `bpf_tap_in`。
+2. hostapd 換成 WPA2-Enterprise（`ieee8021x=1`、`wpa_key_mgmt=WPA-EAP`、`eap_server=1`、
+   `eap_user_file` 用 EAP-MD5 最省事）當測試 AP。
+3. 用 `networksetup -set8021X...`／直接寫 `com.apple.network.eapolclient.configuration.plist`
+   （屬「系統設定」範圍）讓 EAPOLController 對 en1 起 eapolclient，觀察它開 socket 成不成功。
+4. 若 bpf 這關通，企業驗證剩下的就是 4-way（拿到 PMK 之後）—— 那時才會碰到「誰做 4-way」：
+   我們的 supplicant 可以做（PMK 由 EAP 交換產生，需 eapolclient 把 MSK 交回 → 這條要看
+   `EAP8021X.framework` 是否透過 ioctl 把 PMK 塞進驅動，下一步再查）。
+
+---
+
 ## 13. 建議技能
 
 - `osx-kvm-headless-install`：VM 生命週期、qemu-nbd、SSH 進 guest。
