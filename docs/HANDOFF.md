@@ -1927,6 +1927,39 @@ v170 把 `APPLE80211_IOC_SSID` 的 **set** 從 `kIOReturnUnsupported` 改成接�
 沒進 dispatcher 的）型別記下來，找出 `chg 1` 是哪個 type；那一個補上回應後 airportd 才會真的
 送 ASSOCIATE（`s20`）。
 
+### 6.29 第二十四輪（v172）：airportd join 又前進三關，順便把吞吐量量出來
+
+#### 6.29.1 新增修掉的三個阻塞（每一個都是「掉回 Apple 實作 → EOPNOTSUPP → airportd -3903」）
+
+用程式裡本來就有的 `Ath10kIoctlFall`（記錄「哪個 type 掉到 Apple 實作、它回什麼」）當指針，
+一次修一個、一次 build：
+
+| `Ath10kIoctlFall` | 型別 | 修法 |
+|---|---|---|
+| `type=103 st=66` | `CURRENT_NETWORK` | 原本用 `_venturaIoctlLength` 當緩衝區長度，但那條路徑根本沒設它（值 0/舊值）→ 回 `BadArgument` → 掉落。改成「長度不合理就用 8+sizeof(scan_result)」，並加 `Ath10kCurrentNetReqLen` breadcrumb |
+| `type=2`（`AUTH_TYPE` get） | 之前 `return success` 但**不寫任何資料**，呼叫端讀到垃圾 | 依 `_connection.securityAKM` 回 upper-auth 位元（2→WPA2_PSK、6→SHA256_PSK、8→WPA3_SAE），`OP_MODE` 回 `APPLE80211_M_STA` |
+| `type=94` | `VIRTUAL_IF_CREATE` | 我們本來就有一個 attached station vif（en1、role 0），所以直接承認（`Ath10kVirtualIfRequest=create`），不重複建 |
+
+#### 6.29.2 現在卡在 `type=255 st=2d`
+
+v172 之後 `networksetup -setairportnetwork` 仍回 -3903，`Ath10kIoctlFall = "type=255 st=2d"`。
+255 不是任何已知 `APPLE80211_IOC_*`，而回傳碼 0x2d 也不是 family 慣用的 0x66，所以這比較像是
+**在另一個 slot 上 `raw->type` 被讀成垃圾**（結構佈局不符），而不是真的有一個 type 255 的請求。
+下一步應該在 `apple80211SkywalkRequest`/`performCommand` 那幾個入口把 `(cmd, type, len)` 三件一起記下來，
+用 cmd 判斷是哪一種呼叫慣例，而不是只信 `raw->type`。
+
+#### 6.29.3 吞吐量（第一次量到真實數字）
+
+VM 內 `a11assoc QCA-TEST en1` 關聯成功後，從 host 的 AP 介面抓 20 MB：
+
+```
+curl http://192.168.77.1:8000/dl.bin   (host: python3 -m http.server 8000 --bind 192.168.77.1)
+speed=5111182 B/s  size=20000000  time=3.91 s   → 約 5.1 MB/s = 41 Mbit/s
+```
+
+2.4 GHz、ch6、20 MHz、單流 HT 的情況下這是合理值（不是瓶頸在驅動）。這也順便證明
+加密鏈路上的大量資料傳輸是穩定的，不只是 ping。
+
 ---
 
 ## 13. 建議技能

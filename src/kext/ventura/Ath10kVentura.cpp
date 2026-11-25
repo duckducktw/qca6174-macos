@@ -1572,9 +1572,12 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         UInt8 *out = static_cast<UInt8 *>(data);
         if (out == nullptr)
             return kIOReturnBadArgument;
-        const UInt32 capacity = _venturaIoctlLength;
-        if (capacity < 8 + sizeof(apple80211_scan_result))
-            return kIOReturnBadArgument;
+        const UInt32 capacity = _venturaIoctlLength >= 8 + sizeof(apple80211_scan_result)
+                                    ? _venturaIoctlLength
+                                    : static_cast<UInt32>(8 + sizeof(apple80211_scan_result));
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kCurrentNetReqLen",
+                               static_cast<UInt64>(_venturaIoctlLength), 32);
         *reinterpret_cast<UInt32 *>(out) = APPLE80211_VERSION;
         const bool associated = Ath10k::connectionAssociated(_connection);
         *reinterpret_cast<UInt32 *>(out + 4) = associated ? 1 : 0;
@@ -1688,6 +1691,19 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
     case APPLE80211_IOC_SCANCACHE_CLEAR:
         _venturaScanIndex = 0;
         return kIOReturnSuccess;
+    case APPLE80211_IOC_VIRTUAL_IF_CREATE:
+    case APPLE80211_IOC_VIRTUAL_IF_DELETE:
+        // airportd asks for a virtual interface in the run-up to a join and gave up
+        // with -3903 when this fell through to Apple's implementation (measured:
+        // Ath10kIoctlFall = "type=94"). This driver already owns exactly one
+        // attached station interface (en1, role 0), which is what the create would
+        // produce, so acknowledge instead of building a second one; the role/parent
+        // getters below already answer for that interface.
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kVirtualIfRequest",
+                               requestNumber == APPLE80211_IOC_VIRTUAL_IF_CREATE ? "create"
+                                                                                 : "delete");
+        return kIOReturnSuccess;
     case APPLE80211_IOC_VIRTUAL_IF_ROLE:
     case APPLE80211_IOC_VIRTUAL_IF_PARENT:
         // The live family answers these from its own vif bookkeeping, and the ioctl
@@ -1719,9 +1735,44 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         status->status = _venturaState;
         return kIOReturnSuccess;
     }
-    case APPLE80211_IOC_AUTH_TYPE:
+    case APPLE80211_IOC_AUTH_TYPE: {
+        // Was "return success, write nothing": the caller then read whatever was in
+        // its buffer. airportd asks AUTH_TYPE in the run-up to a join and uses it to
+        // decide which security the interface is in, so fill it from the live
+        // connection: the upper-auth bitmap is exactly the AKM word we negotiated.
+        if (isSet)
+            return kIOReturnSuccess;
+        struct AuthTypeReply {
+            UInt32 version;
+            UInt32 authType;
+        } *reply = static_cast<AuthTypeReply *>(data);
+        if (reply == nullptr)
+            return kIOReturnBadArgument;
+        UInt32 upper = APPLE80211_AUTHTYPE_NONE;
+        if (_connection.ssidLength && Ath10k::connectionAssociated(_connection)) {
+            switch (_connection.securityAKM) {
+            case 2: upper = APPLE80211_AUTHTYPE_WPA2_PSK; break;
+            case 6: upper = APPLE80211_AUTHTYPE_SHA256_PSK; break;
+            case 8: upper = APPLE80211_AUTHTYPE_WPA3_SAE; break;
+            default: upper = APPLE80211_AUTHTYPE_NONE; break;
+            }
+        }
+        reply->version = APPLE80211_VERSION;
+        reply->authType = upper;
+        return kIOReturnSuccess;
+    }
+    case APPLE80211_IOC_OP_MODE: {
+        struct OpModeReply {
+            UInt32 version;
+            UInt32 opMode;
+        } *reply = static_cast<OpModeReply *>(data);
+        if (!isSet && reply != nullptr) {
+            reply->version = APPLE80211_VERSION;
+            reply->opMode = APPLE80211_M_STA;
+        }
+        return kIOReturnSuccess;
+    }
     case APPLE80211_IOC_PHY_MODE:
-    case APPLE80211_IOC_OP_MODE:
     case APPLE80211_IOC_POWERSAVE:
     case APPLE80211_IOC_PROTMODE:
     case APPLE80211_IOC_TXPOWER:
