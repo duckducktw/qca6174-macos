@@ -1800,8 +1800,23 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
             }
             return kIOReturnSuccess;
         }
-        apple80211_ssid_data *ssid = static_cast<apple80211_ssid_data *>(data);
-        ssid->version = APPLE80211_VERSION;
+        // airportd reads the SSID from offset 0 of this reply: with the versioned
+        // apple80211_ssid_data layout it printed our version byte (0x01) as the
+        // whole network name ("Current Wi-Fi Network: \u0001"). The flat layout
+        // below - 32 name bytes then the length - is what makes
+        // `networksetup -getairportnetwork`, `wdutil info` and System Settings show
+        // the real SSID, verified against QCA-TEST.
+        {
+            UInt8 *flat = reinterpret_cast<UInt8 *>(data);
+            bzero(flat, 40);
+            const UInt32 n = (_connection.ssidLength && Ath10k::connectionAssociated(_connection))
+                                 ? (_connection.ssidLength > 32 ? 32 : _connection.ssidLength)
+                                 : 0;
+            if (n)
+                bcopy(_connection.ssid, flat, n);
+            *reinterpret_cast<UInt32 *>(flat + 32) = n;
+            return kIOReturnSuccess;
+        }
         // Returning an empty SSID made `networksetup -getairportnetwork` print a
         // stray 0x01 and made configd log "en1: SSID ^A BSSID 01:00:..". The
         // associated BSS's SSID is already kept in the connection state, so
