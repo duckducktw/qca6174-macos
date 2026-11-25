@@ -45,6 +45,7 @@ static apple80211_scan_result *gVenturaScanSlot = nullptr;
 // asr_channel 0x04, asr_rates 0x24, asr_ssid 0x61, asr_age 0x84, asr_ie_len
 // 0x8a, then 1024 bytes of IE data at 0x8c (no asr_unk3 field after 12.0).
 #define ATH10K_SCAN_IE_OFFSET 0x8cu
+static UInt32 venturaScanChannelFlags(UInt32 channel);
 static_assert(__builtin_offsetof(apple80211_scan_result, asr_ie_len) == 0x8a,
               "apple80211_scan_result: asr_ie_len moved");
 static_assert(__builtin_offsetof(apple80211_scan_result, asr_ssid) == 0x61,
@@ -1540,6 +1541,56 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
     }
     case APPLE80211_IOC_CHANNEL:
         return venturaChannel(data, isSet);
+    case APPLE80211_IOC_CURRENT_NETWORK: {
+        // live getCurrentNetwork (0xffffff8001fde40a) just forwards 0x67 (103) to
+        // the driver through apple80211VirtualRequestIoctl and turns any failure
+        // into 0x66/EOPNOTSUPP, which is the e00002c7 airportd was getting. The
+        // caller's buffer is 0x48c bytes = version + num_bss + one
+        // apple80211_scan_result, i.e. "the current BSS, shaped like a scan hit".
+        if (isSet)
+            return kIOReturnUnsupported;
+        UInt8 *out = static_cast<UInt8 *>(data);
+        if (out == nullptr)
+            return kIOReturnBadArgument;
+        const UInt32 capacity = _venturaIoctlLength;
+        if (capacity < 8 + sizeof(apple80211_scan_result))
+            return kIOReturnBadArgument;
+        *reinterpret_cast<UInt32 *>(out) = APPLE80211_VERSION;
+        const bool associated = Ath10k::connectionAssociated(_connection);
+        *reinterpret_cast<UInt32 *>(out + 4) = associated ? 1 : 0;
+        if (!associated)
+            return kIOReturnSuccess;
+        auto *result = reinterpret_cast<apple80211_scan_result *>(out + 8);
+        bzero(result, sizeof(*result));
+        result->version = APPLE80211_VERSION;
+        const UInt32 channel = _connection.operatingChannel;
+        result->asr_channel.version = APPLE80211_VERSION;
+        result->asr_channel.channel = channel;
+        result->asr_channel.flags = venturaScanChannelFlags(channel);
+        const SInt16 noise = (_connection.fwStats.noiseValid &&
+                              _connection.fwStats.noiseDbm > -128)
+                                 ? static_cast<SInt16>(_connection.fwStats.noiseDbm)
+                                 : static_cast<SInt16>(-95);
+        result->asr_noise = noise;
+        const int32_t dbm = _connection.signalDbm != INT32_MIN ? _connection.signalDbm
+                                                              : noise + 30;
+        result->asr_rssi = static_cast<SInt16>(dbm);
+        result->asr_snr = static_cast<SInt16>(dbm - noise);
+        result->asr_beacon_int = static_cast<SInt16>(_connection.ap.beaconInterval);
+        result->asr_cap = static_cast<SInt16>(_connection.ap.capabilities);
+        memcpy(result->asr_bssid, _connection.bssid, sizeof(result->asr_bssid));
+        const UInt32 ssidBytes = _connection.ssidLength > APPLE80211_MAX_SSID_LEN
+                                     ? APPLE80211_MAX_SSID_LEN
+                                     : _connection.ssidLength;
+        result->asr_ssid_len = static_cast<UInt8>(ssidBytes);
+        memcpy(result->asr_ssid, _connection.ssid, ssidBytes);
+        const UInt32 ieLen = _connection.ap.rsnPresent ? _connection.ap.rsnLength : 0;
+        if (ieLen != 0 && capacity >= 8 + ATH10K_SCAN_IE_OFFSET + ieLen) {
+            memcpy(out + 8 + ATH10K_SCAN_IE_OFFSET, _connection.ap.rsn, ieLen);
+            result->asr_ie_len = static_cast<SInt16>(ieLen);
+        }
+        return kIOReturnSuccess;
+    }
     case APPLE80211_IOC_RATE: {
         if (isSet)
             return kIOReturnUnsupported;

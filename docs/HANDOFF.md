@@ -1879,6 +1879,28 @@ Ath10kApple80211Requests = 684
 2. `APPLE80211_IOC_STATE` 在未連線時的值、以及 family 快取的 link 狀態是否為 RUN。
 3. airportd 可能要求 `APPLE80211_IOC_SSID` 在 **scan 結果/family 快取**裡也對得上（它不只看驅動 getter）。
 
+#### 6.28.3 v169 追加：`CURRENT_NETWORK(103)` 補上，airportd 的中止點縮到 caps
+
+`APPLE80211_IOC_CURRENT_NETWORK` 依 live `getCurrentNetwork`（`0xffffff8001fde40a`）的行為實作：
+它把 103 直接轉給驅動（`apple80211VirtualRequestIoctl(0xc03069c9, 0x67, …)`），失敗就變 0x66
+（airportd 看到的 `e00002c7`）；緩衝區是 `0x48c` = `version + num_bss + 一個 apple80211_scan_result`。
+v169 填成「目前 BSS 的 scan_result」（SSID/BSSID/channel/RSSI/RSN IE，未連線時 `num_bss=0`）。
+
+修完後 trace 變成：
+
+```
+Ath10kRequestTrace = "g12=0 g19=0 g1=0 g1=0 g2=0 g15=0 g4=0 g19=0 g1=0 g1=0 g1=0 g2=0 g12=0 g12=0 g19=0 g1=0 "
+```
+
+`g103` 不再出現（該請求已經成功），但 `networksetup -setairportnetwork` 仍回 -3903，
+而且整段還是只有 getter：**SSID(1) → AUTH_TYPE(2) → CHANNEL(4) → CARD_CAPABILITIES(12) →
+OP_MODE(15) → POWER(19)**，一個 `s` 都沒有。也就是 airportd 在這些 getter 的回值上就判定
+「這張卡不能加入 WPA2-PSK」，從未送出 ASSOCIATE。
+
+**下一個下手點（最高嫌疑）**：`venturaCapabilities()` 回的能力位元。airportd 讀
+`CARD_CAPABILITIES(12)` 決定要不要顯示/允許 WPA2-PSK，若 WPA/WPA2 位元沒開就會直接放棄；
+其次是 `AUTH_TYPE(2)` 與 `OP_MODE(15)` 的回值。這兩個都是純資料填充，改完一次 build 就能驗。
+
 ---
 
 ## 13. 建議技能
