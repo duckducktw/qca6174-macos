@@ -157,15 +157,18 @@ bool Ath10kVenturaInterface::initIfnetParams(struct ifnet_init_params *params)
         return false;
     // Apple's implementation refuses anything but IFT_ETHER (it compares the
     // interface type to 6 and bails), so that check has to run while the type
-    // still reads 6. What lands in the attached ifnet is a separate question:
-    // Apple80211's Apple80211GetIfListCopy() lists Wi-Fi interfaces from
-    // getifaddrs, keeps only ifi_type == IFT_IEEE80211 (71) and reports
-    // "Wireless is not available" / ifCount[0] otherwise - that is the gate
-    // airportd was failing at. SystemConfiguration reads the IOInterfaceType
-    // *property* instead, which stays 6 (see attachToDataLinkLayer).
+    // still reads 6 - and the attached ifnet has to stay 6 as well.
+    // IPConfiguration's ARP client (configd, decompiled) accepts exactly
+    // IFT_ETHER(6), IFT_L2VLAN(135), IFT_IEEE8023ADLAG(136) and IFT_IEEE1394(144)
+    // and logs "arp_client_init(%s): unsupported network type" for anything else;
+    // with no ARP client there is no DHCP client, so a 71 here costs the IPv4
+    // address. 71 was set on the belief that Apple80211's interface filter keys
+    // on it - the Wi-Fi classification actually comes from SIOCGIFMEDIA
+    // (kIOMediumIEEE80211Auto, published in configureInterface), so the type must
+    // follow Apple's own Wi-Fi shape: IFT_ETHER throughout.
     if (!IO80211Interface::initIfnetParams(params))
         return false;
-    params->type = 0x47 /* IFT_IEEE80211 */;
+    params->type = 0x6 /* IFT_ETHER: what IPConfiguration's ARP client accepts */;
     if (IOService *owner = getProvider())
         owner->setProperty("Ath10kIfnetType", static_cast<UInt64>(params->type), 32);
     return true;

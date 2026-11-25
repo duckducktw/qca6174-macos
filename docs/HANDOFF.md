@@ -1,14 +1,16 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-25（**第二十輪：WPA2-PSK 穩定化 ＋ DHCP 卡點定位**。關聯／4-way 握手可重複成功
-（`connected-wpa2`、securityPhase 5），但 en1 拿不到 IPv4：決定性 log 是 IPConfiguration 的
-`arp_client_init(en1): unsupported network type`——沒有 ARP client 就不會啟動 DHCP client，IPv6 卻照跑，
-所以先前看起來「IPConfiguration 正常」。已把 ifnet 型別從 `IFT_IEEE80211(71)` 改成 `IFT_ETHER(6)`
-（v164），但 DHCP 仍未啟動，還有第二層條件沒找到。另更正：先前「加密鏈路 HTTP 200」其實走 en0
-（QEMU user-net），Wi-Fi 端只證明到 ping 得到 AP。詳見 §6.24。第十九輪：§6.23；第十七輪掃描：§6.21。）
+最後更新：2026-11-25（**第二十一輪：DHCP 通了 —— 介面型別 71 才是兇手**。反組譯 configd 的
+`arp_client_init`（IPConfiguration 本體，非猜測）得到它只接受 `IFT_ETHER(6)`／`IFT_L2VLAN(135)`／
+`IFT_IEEE8023ADLAG(136)`／`IFT_IEEE1394(144)`，其餘一律 `unsupported network type`；先前為了
+airportd 把 ifnet 型別釘在 71 是錯的（airportd 的 Wi-Fi 判定走 `SIOCGIFMEDIA`）。v165 改回 6 後
+`if_data.ifi_type=6`、`dhcp_bound(en1) 192.168.77.75`、`RouterARPVerified=TRUE`，
+預設路由指到 AP 時 `ping 1.1.1.1` 3/3（8.6 ms）、`https://example.com` 200，**而且
+airportd 完全沒退化**（`Power (en1): On`、`cwscan` 13 個網路）。§1 條件 D 正式 ✅。詳見 §6.25。
+第十九輪：§6.23；第十七輪掃描：§6.21。）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v164**（`/tmp/vk164`，Acer 上，sha256 `c7daca51…`）— kext 載入、en1 `UP,RUNNING`、airportd
-掃描 `error=0`、WPA2-PSK 可關聯並完成握手、`Ath10kSecPhase="keys-in …"`；**IPv4 DHCP 尚未通**
+VM 現況：**v165**（`/tmp/vk165`，Acer 上，sha256 `86ff4b92…`）— kext 載入、en1 `UP,RUNNING`、
+airportd 掃描 `error=0`、WPA2-PSK 關聯＋握手＋**DHCP 取得 192.168.77.75**、加密鏈路可上網
 
 ---
 
@@ -21,7 +23,7 @@ VM 現況：**v164**（`/tmp/vk164`，Acer 上，sha256 `c7daca51…`）— kext
 | **A** | `Ath10kIfacePhase = "inited"`、`Ath10kStartPhase = "controller-started"` | ✅ 已達成（Apple 的 `start()` 是唯一 publisher） |
 | **B** | `ioreg -r -c IO80211Interface` ≥1 筆且有 `BSD Name`；`networksetup -listallhardwareports` 出現 Wi-Fi | ✅ 已達成（v64 起 `SCNetworkInterfaceCopyAll()` 第 3 筆 = `en1 type=IEEE80211`，Wi-Fi 硬體埠成立；一旦替它建了服務，`listallhardwareports` 會把它當「已設定」而不列，屬正常） |
 | **C** | 「系統設定 → Wi-Fi」可見、開關可操作 | ✅ 有截圖（v149 起：`kcpassword` 自動登入生效，System Settings → Wi-Fi 面板可開、開關顯示為開；掃描清單仍受系統的「重開機提示」與 airportd 過濾影響，見 §6.15.6／§6.24） |
-| **D** | 可掃描到 AP 並以 WPA2 連線取得 IP | 🟡 大部分（v164：掃描通、開放網路與 **WPA2-PSK 關聯＋4-way 握手都完成**（`connected-wpa2`、AP `authorized=1`），§6.22／§6.23；**只差 IPv4**：IPConfiguration 的 ARP client 拒收介面型別，DHCP client 不啟動，§6.24.2） |
+| **D** | 可掃描到 AP 並以 WPA2 連線取得 IP | ✅ 已達成（v165：`cwscan` 13 個網路、WPA2-PSK 關聯＋4-way（`connected-wpa2`、securityPhase 5）、**DHCP 取得 192.168.77.75**（`dhcp_bound(en1)`、`RouterARPVerified=TRUE`）、預設路由指到 AP 時 `ping 1.1.1.1` 3/3 且 `https` 200，§6.25） |
 | **E** | 全程不改系統設定以外的東西、不需終端機、無獨立 app；最後部署回實體 ESP 並真機重驗 | ❌ 未開始（§7.4） |
 
 **一句話總結現況**：無線電在跑、Apple 的 `start()` 發布了 `en1`，而**第五輪找到了「SC 看不到介面」的真兇**：不是 SC 的分類規則、不是 80211 core 的註冊，而是介面節點上 `IOInterfaceType=71` 這個**屬性**——`SCNetworkInterface.c` 只接受 `IFT_ETHER(6)`/`IFT_IEEE1394(13)`，其他值直接 `"unknown interface type"` 把介面丟掉。改回 6 之後 SC 立刻列 `en1 type=IEEE80211`（因為它改看 controller 是否符合 `IO80211Controller`），Wi-Fi 硬體埠與服務都成立。**最後一哩是 airportd**：它透過 `IO80211Controller` 的 +0x200 ivar（`getNetworkInterface()`/`getInfraInterface()` 都只是讀這個 pointer）找裝置，而該 ivar 實測是 null。
@@ -1647,6 +1649,61 @@ MANUAL en1: arp_client_init failed
    active」擋住）。
 2. 拿到 IPv4 後把預設路由指到 `192.168.77.1`，用 `netstat`/AP 端計數確認封包真的從 en1 出去。
 3. WPA3-SAE：搬 `Ath10kSAE*`；企業 802.1X：先量 Apple RSN 的 panic 風險再說。
+
+---
+
+### 6.25 第二十一輪（v165）：DHCP 通了 —— 型別 71 是自己釘的，不是 airportd 要的
+
+#### 6.25.1 反組譯 `arp_client_init`（`IPConfiguration.bundle`，不是猜的）
+
+guest 裡 `/System/Library/SystemConfiguration/IPConfiguration.bundle/Contents/MacOS/IPConfiguration`
+（1.05 MB，x86_64 slice 在磁碟上，不必碰 dyld cache）。字串 `arp_client_init(%s): unsupported network type`
+在 VA `0x5c5f0`，唯一 xref 在 `0xa1ce`，函式本體 `0xa022`：
+
+```
+a0a6  call <ifi_type(if_p)>
+a0ab  lea  ecx, [rax - 0x87]     ; 135
+a0b1  cmp  ecx, 2
+a0b4  jb   0xa0e2                ; 135 (IFT_L2VLAN) / 136 (IFT_IEEE8023ADLAG) → 收
+a0b6  cmp  eax, 6                ; IFT_ETHER → 收
+a0b9  je   0xa0e2
+a0bb  cmp  eax, 0x90             ; 144 IFT_IEEE1394 → 走 firewire 取位址
+a0c0  jne  0xa16e                ; 其餘 → "unsupported network type"
+```
+
+也就是 **只接受 6 / 135 / 136 / 144**，71 一定被拒。真機 Wi-Fi 拿得到 DHCP，代表 Apple 自己的 Wi-Fi
+ifnet 就是 `IFT_ETHER`（`IOEthernetInterface::initIfnetParams` 的 `cmp eax,6` 也印證）。
+
+#### 6.25.2 為什麼 71 之前被當成必要條件（錯誤推論的來源）
+
+§6.11 量到的是 `SIOCGIFMEDIA` 要帶 `IFM_IEEE80211`（媒體，不是型別），§6.14 把它誤記成
+`getifaddrs` 只收 `ifi_type == 71`，於是 `initIfnetParams()` 在 base 之後多寫了
+`params->type = 0x47`。結果 airportd 沒問題、IPConfiguration 的 ARP client 卻永遠建不起來
+→ 沒有 DHCP client，只有 IPv6 在動。
+
+#### 6.25.3 v165 的實測（Acer `/tmp/vk165`，sha256 `86ff4b92…`）
+
+改動只有一行：`Ath10kVenturaInterface::initIfnetParams()` 的 `params->type` 由 `0x47` 改成 `0x6`
+（airportd 端不再靠型別）。
+
+| 檢查 | 結果 |
+|---|---|
+| `tools/ifnet-type`（guest 內編譯） | `en1 type=0x06 (6)` |
+| `networksetup -getairportpower en1` | `Wi-Fi Power (en1): On`（**沒有退化**） |
+| `cwscan en1`（airportd 真實路徑） | `networks=13`，清單與之前相同 |
+| 關聯（`a11assoc QCA-TEST en1`，密碼走 stdin） | `state=4 (RUN)`、`Ath10kConnectionState=connected-wpa2`、`SecurityPhase=5` |
+| DHCP | `dhcp_bound(en1) 192.168.77.75`、`ipconfig getpacket en1` = BOOTREPLY、`RouterARPVerified : TRUE`（ARP client 這次真的活著）、`ConfigMethod : DHCP`、租約 1h |
+| L3（`route change default 192.168.77.1`） | `ping 1.1.1.1` 3/3、avg 8.7 ms；`curl https://example.com` → **200**，`remote_ip=104.20.23.154`；測完把 default 還原成 en0 的 `10.0.2.2` |
+
+結論：**掃描 → 關聯 → 4-way → DHCP → 加密鏈路上網，整條鏈在 VM 內全通**，全程沒有手動設 IP。
+
+#### 6.25.4 剩下的小瑕疵（不擋驗收）
+
+- `configd` 會印 `en1: SSID ^A BSSID 01:00:00:00:00:00 Security UNKNOWN`：它用 apple80211 get
+  問 SSID/BSSID，我們的回覆是垃圾值（長度 1、內容 0x01）。不影響 DHCP/上網，但系統設定裡的
+  網路名稱會顯示錯，下一輪順手修 `APPLE80211_IOC_SSID` / `BSSID` / `SECURITY` 的 getter。
+- 802.1X/EAP、WPA3-SAE、PMF 仍未做（§6.23.4／§6.24.4 的結論不變）。
+- 真機驗證（§7.4）還沒開始；VM 內 ASPM 寫入被忽略這件事在真機上會消失。
 
 ---
 
