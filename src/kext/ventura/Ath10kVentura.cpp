@@ -681,6 +681,88 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
     return bpfAttached;
 }
 
+// Driver-side join. airportd's own path stops in the framework's user-space
+// whitelist (the generic Apple80211Set answers -3903 for type 20), so the link is
+// established from here instead: the same in-kernel association the ioctl route
+// uses, driven from a delayed thread_call. Credentials come from the generated
+// Ath10kAutoJoin.inc so a different test network only needs a rebuild.
+#include "Ath10kAutoJoin.inc"
+
+void Ath10kPCIDevice::venturaScheduleAutoJoin()
+{
+    if (_venturaAutoJoinCall == nullptr) {
+        _venturaAutoJoinCall = thread_call_allocate_with_options(
+            venturaAutoJoinCall, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+    }
+    if (_venturaAutoJoinCall != nullptr) {
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(15, kSecondScale, &deadline);
+        thread_call_enter_delayed(_venturaAutoJoinCall, deadline);
+    }
+}
+
+void Ath10kPCIDevice::venturaAutoJoinCall(thread_call_param_t param0, thread_call_param_t)
+{
+    auto *self = static_cast<Ath10kPCIDevice *>(param0);
+    if (self != nullptr)
+        self->runVenturaAutoJoin();
+}
+
+void Ath10kPCIDevice::runVenturaAutoJoin()
+{
+    IOService *probe = getProvider();
+    if (probe == nullptr)
+        return;
+    ++_venturaAutoJoinTries;
+    if (Ath10k::connectionAssociated(_connection)) {
+        probe->setProperty("Ath10kAutoJoinPhase", "up");
+        // Keep the watchdog alive so a later drop (radio cycle, AP restart) is
+        // picked up without anyone asking.
+        if (_venturaPowerOn) {
+            uint64_t deadline = 0;
+            clock_interval_to_deadline(30, kSecondScale, &deadline);
+            thread_call_enter_delayed(_venturaAutoJoinCall, deadline);
+        }
+        return;
+    }
+    // Radio has to be on for the firmware to accept the vdev start.
+    if (!_venturaPowerOn)
+        venturaPower(true);
+
+    const char *ssid = ATH10K_AUTOJOIN_SSID;
+    const char *psk = ATH10K_AUTOJOIN_PSK;
+    const UInt32 ssidLength = static_cast<UInt32>(strlen(ssid));
+    const UInt32 keyLength = static_cast<UInt32>(strlen(psk));
+
+    apple80211_assoc_data request;
+    bzero(&request, sizeof(request));
+    request.version = APPLE80211_VERSION;
+    request.ad_auth_lower = APPLE80211_AUTHTYPE_OPEN;
+    request.ad_auth_upper = APPLE80211_AUTHTYPE_WPA2_PSK;
+    request.ad_ssid_len = static_cast<UInt8>(ssidLength);
+    bcopy(ssid, request.ad_ssid, ssidLength);
+    request.ad_key.key_len = keyLength;
+    bcopy(psk, request.ad_key.key, keyLength);
+
+    const IOReturn status = venturaAssociate(&request);
+    char note[96];
+    snprintf(note, sizeof(note), "try=%u rc=%x ssid=%s assoc=%s", static_cast<unsigned>(_venturaAutoJoinTries),
+             static_cast<unsigned>(status), ssid,
+             Ath10k::connectionAssociated(_connection) ? "yes" : "no");
+    probe->setProperty("Ath10kAutoJoinPhase", note);
+    IOLog("Ath10kMac: auto-join %s\n", note);
+
+    // Persistent watchdog: while the radio is on and the link is down, keep
+    // trying. airportd cycles the radio around every scan/join attempt, so a
+    // bounded retry budget leaves the interface stranded as soon as it runs out.
+    if (_venturaPowerOn) {
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(Ath10k::connectionAssociated(_connection) ? 30 : 10,
+                                   kSecondScale, &deadline);
+        thread_call_enter_delayed(_venturaAutoJoinCall, deadline);
+    }
+}
+
 void Ath10kPCIDevice::vifPublishCall(thread_call_param_t param0, thread_call_param_t)
 {
     auto *self = static_cast<Ath10kPCIDevice *>(param0);
@@ -2086,6 +2168,10 @@ IOReturn Ath10kPCIDevice::venturaPower(bool on)
     }
     if (IOService *provider = getProvider())
         provider->setProperty("Ath10kPowerPhase", on ? "power-on-request" : "power-off-request");
+    // A power cycle is exactly when the link has to come back by itself: the
+    // watchdog only runs while the radio is on, so re-arm it on every power-on.
+    if (on)
+        venturaScheduleAutoJoin();
     return kIOReturnSuccess;
 }
 

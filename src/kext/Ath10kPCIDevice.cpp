@@ -332,6 +332,9 @@ bool Ath10kPCIDevice::start(IOService *provider)
 #endif
     provider->setProperty("Ath10kStartPhase", "controller-started");
 #if defined(ATH10K_VENTURA)
+    // airportd cannot start a join (framework whitelist), so the driver does
+    // it itself a few seconds after the controller is up.
+    venturaScheduleAutoJoin();
     // airportd's own enumeration is Apple80211GetIfListCopy(): it asks each
     // interface for SIOCGIFMEDIA, accepts only answers that advertise
     // IFM_IEEE80211 (its log line is "Added 'IFM_IEEE80211' supported

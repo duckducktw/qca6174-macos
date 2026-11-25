@@ -137,8 +137,13 @@ private:
     // thread call.
     IO80211VirtualInterface *_venturaVif = nullptr;
     thread_call_t _vifPublishCall = nullptr;
+    thread_call_t _venturaAutoJoinCall = nullptr;
+    UInt32 _venturaAutoJoinTries = 0;
     UInt32 _vifPublishAttempts = 0;
     static void vifPublishCall(thread_call_param_t, thread_call_param_t);
+    static void venturaAutoJoinCall(thread_call_param_t, thread_call_param_t);
+    void runVenturaAutoJoin();
+    void venturaScheduleAutoJoin();
     void runVifPublish();
     // airportd collects scan results only after the scan-finished signal; the v1
     // interface has no postMessage on the live family, so this polls the shared
