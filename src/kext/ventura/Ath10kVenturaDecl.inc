@@ -62,6 +62,11 @@ private:
     // built from our FaultReporter stream, or null to let the controller log.
     void *getFaultReporterFromDriver() override;
     SInt32 venturaRecordRequest(UInt requestType, int requestNumber, void *data);
+    // Who called, with which ioctl command, and with what request number: the
+    // dispatcher only sees what survives each slot's calling convention, so a
+    // request that dies above it (Apple's own handler answering 0x66) has to be
+    // caught here - entry id 1 = interface ioctl, 2 = skywalk slot.
+    void venturaTraceRequest(UInt32 entry, UInt32 cmd, UInt32 type, UInt32 len);
     bool alignVenturaVtable();
     bool createVenturaMediumTables(const IONetworkMedium **primary, bool forcePublish = false);
     // Dumps the controller's published medium keys plus the current medium type,
@@ -207,6 +212,22 @@ private:
         UInt32 status = 0;
         bool isSet = false;
     } _venturaTrace[kVenTraceSlots]{};
+    // Entry-point trace: entry id, ioctl cmd word, request number, length. The
+    // dispatcher trace above cannot see a request that Apple's own handler kills
+    // before it reaches us, which is exactly the case that refused the join.
+    static constexpr UInt32 kVenEntryTraceSlots = 12;
+    struct VenturaEntryTrace {
+        UInt32 entry = 0;
+        UInt32 cmd = 0;
+        UInt32 type = 0;
+        UInt32 len = 0;
+    } _venturaEntryTrace[kVenEntryTraceSlots]{};
+    UInt32 _venturaEntryTraceNext = 0;
+    UInt32 _venturaEntryTraceCount = 0;
+    // Last entry point / cmd seen, so the fall-through breadcrumb can name where
+    // the request that Apple's handler refused actually came from.
+    UInt32 _venturaLastEntry = 0;
+    UInt32 _venturaLastEntryCmd = 0;
     UInt32 _venturaTraceNext = 0;
     UInt32 _venturaTraceCount = 0;
 

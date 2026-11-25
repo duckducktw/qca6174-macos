@@ -1960,6 +1960,36 @@ speed=5111182 B/s  size=20000000  time=3.91 s   → 約 5.1 MB/s = 41 Mbit/s
 2.4 GHz、ch6、20 MHz、單流 HT 的情況下這是合理值（不是瓶頸在驅動）。這也順便證明
 加密鏈路上的大量資料傳輸是穩定的，不只是 ping。
 
+### 6.30 第二十五輪（v173–v179）：把 airportd join 的請求一路追到「未知 setter」
+
+#### 6.30.1 新工具：入口軌跡 + 記憶體傾印
+
+新增 `venturaTraceRequest(entry, cmd, type, len)`（entry 1 = 介面 ioctl、2 = skywalk slot），
+發佈成 `Ath10kEntryTrace`；`Ath10kIoctlFall` 也加上 `entry=` 與 `cmd=`。
+
+#### 6.30.2 一格一格拆掉的阻塞
+
+| 觀測 | 真相 | 修法 |
+|---|---|---|
+| `Ath10kEntryTrace` 出現 `1:c03069c9:559930376:65535` | 第三個參數是**使用者空間指標**（不是核心結構），我們只處理核心指標，所以整段請求被跳過 | 加 `ath10kControllerCopyIn`/`CopyOut`（`__ZN17IO80211Controller6copyInEyPvm` / `7copyOutEPKvym`），把 48-byte 請求 copyIn 到核心、處理完再 copyOut；scratch 0x800（0x1000 會踩 `-Wframe-larger-than` 4096） |
+| `Ath10kIoctlReqType = 96` 出現 | copyIn 路徑生效，`VIRTUAL_IF_ROLE` 已經被正確解析 | — |
+| `Ath10kIoctlFall = type=255 st=2d entry=1 cmd=803069c8` | 是 **set**，而且 `VenturaRawRequest` **本來就是對的**（`ifName[16]` 在最前；`setPowersave` 讀 `[rcx+0x14]`、`getCurrentNetwork` 比 `[rcx+0x18]`、`setRSN_Conf` 讀 `[rcx+0x20]` 完全吻合） | 只補註解（sha 沒變，也順手發現 v175/v176/v177 撞到 stale object，必須 `rm -rf build/ventura`） |
+| `Ath10kReqDump = "65 6e 31 … ff 00 00 00 … 38 00 00 00 … <kernel ptr>"` | `if_name="en1"`、**type 真的是 0xff**、`req_val=0`、`req_len=0x38`、`req_data` 是核心指標 | 確認不是佈局問題，是 airportd 真的在送一個 13.x 表裡沒有的 setter |
+| 把「未知 setter 視為 no-op」後 | 下一個未知 setter 立刻出現：`Ath10kUnknownSet = "type=256"` | 代表 airportd 是在**連續送一串專有 setter**，不是單一阻塞 |
+
+#### 6.30.3 現況（v179，sha `e44d6232…`）
+
+- 我們自己的 `a11assoc` 照舊：`state=4 (RUN)`、`192.168.77.75`、`ping 192.168.77.1` 2/2（2.2 ms）
+  → **協定與資料路徑沒有退化**。
+- `networksetup -setairportnetwork` 仍 `-3903`，`Ath10kRequestTrace` 只有 getter，**ASSOCIATE（s20）從未送出**。
+- 未知 setter 停在 `type=256`（0xff 之後的下一個）。
+
+**下一輪的兩條假說**（都還要驗）：
+1. 那一串 0xff/0x100 的 setter 其實是 macOS 13 版的「join 參數包」——只回 success 不夠，
+   要用真正的語意填欄位（例如 SSID/BSSID/憑證）才算完成，airportd 才會送 ASSOCIATE。
+2. `VIRTUAL_IF_CREATE(94)` 只「承認」不夠：airportd 可能真的要一個**新的** vif（有自己的 BSD 名稱），
+   我們回 success 卻沒建，導致它後面找不到介面而 -3903。
+
 ---
 
 ## 13. 建議技能

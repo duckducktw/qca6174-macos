@@ -46,6 +46,14 @@ static apple80211_scan_result *gVenturaScanSlot = nullptr;
 // 0x8a, then 1024 bytes of IE data at 0x8c (no asr_unk3 field after 12.0).
 #define ATH10K_SCAN_IE_OFFSET 0x8cu
 static UInt32 venturaScanChannelFlags(UInt32 channel);
+// Declared up here because the ioctl entry below uses them; both are live
+// IO80211Controller exports and return 0 on success.
+extern "C" int ath10kControllerCopyIn(IO80211Controller *self, UInt64 address, void *to,
+                                      size_t bytes)
+    __asm("__ZN17IO80211Controller6copyInEyPvm");
+extern "C" int ath10kControllerCopyOut(IO80211Controller *self, const void *from, UInt64 address,
+                                       size_t bytes)
+    __asm("__ZN17IO80211Controller7copyOutEPKvym");
 static_assert(__builtin_offsetof(apple80211_scan_result, asr_ie_len) == 0x8a,
               "apple80211_scan_result: asr_ie_len moved");
 static_assert(__builtin_offsetof(apple80211_scan_result, asr_ssid) == 0x61,
@@ -863,6 +871,38 @@ void Ath10kPCIDevice::venturaPublishState(UInt32 state)
 // breadcrumbs can answer "did the request arrive, and what did we answer".
 // airportd surfaces only "Off (forced)" for both a missing request and a
 // refused one.
+// Record every request that reaches a driver entry point, before any filtering.
+// airportd's join died on a request whose type came back as 255 through this
+// path, so the cmd word has to travel with the type: it says which calling
+// convention the caller used and therefore where the type field really lives.
+void Ath10kPCIDevice::venturaTraceRequest(UInt32 entry, UInt32 cmd, UInt32 type, UInt32 len)
+{
+    _venturaLastEntry = entry;
+    _venturaLastEntryCmd = cmd;
+    _venturaEntryTrace[_venturaEntryTraceNext].entry = entry;
+    _venturaEntryTrace[_venturaEntryTraceNext].cmd = cmd;
+    _venturaEntryTrace[_venturaEntryTraceNext].type = type;
+    _venturaEntryTrace[_venturaEntryTraceNext].len = len;
+    _venturaEntryTraceNext = (_venturaEntryTraceNext + 1) % kVenEntryTraceSlots;
+    if (_venturaEntryTraceCount < kVenEntryTraceSlots)
+        ++_venturaEntryTraceCount;
+    IOService *probe = getProvider();
+    if (probe == nullptr)
+        return;
+    char trace[kVenEntryTraceSlots * 32];
+    trace[0] = 0;
+    const UInt32 first = (_venturaEntryTraceCount == kVenEntryTraceSlots) ? _venturaEntryTraceNext : 0;
+    for (UInt32 i = 0; i < _venturaEntryTraceCount; ++i) {
+        const UInt32 slot = (first + i) % kVenEntryTraceSlots;
+        char item[32];
+        snprintf(item, sizeof(item), "%u:%lx:%u:%u ", _venturaEntryTrace[slot].entry,
+                 _venturaEntryTrace[slot].cmd, _venturaEntryTrace[slot].type,
+                 _venturaEntryTrace[slot].len);
+        strlcat(trace, item, sizeof(trace));
+    }
+    probe->setProperty("Ath10kEntryTrace", trace);
+}
+
 SInt32 Ath10kPCIDevice::venturaRecordRequest(UInt requestType, int requestNumber, void *data)
 {
     ++_venturaRequestCount;
@@ -1314,12 +1354,16 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211VirtualInterface *iface, ifnet_t
 
 // The 48-byte request block every apple80211 ioctl carries:
 //   char if_name[16]; int req_type; int req_val; u32 req_len; void *req_data;
+// The family's own handlers prove the offsets: setPowersave reads req_val at
+// +0x14, getCurrentNetwork compares req_len at +0x18 against 0x48c, and
+// setRSN_Conf loads req_data from +0x20. Reading req_type from the start of the
+// block (as this struct used to) is what returned 255.
 struct VenturaRawRequest {
     char ifName[16];
-    int type;
-    int val;
-    UInt32 len;
-    void *data;
+    int type;      // +0x10
+    int val;       // +0x14
+    UInt32 len;    // +0x18
+    void *data;    // +0x20
 };
 
 SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigned long a,
@@ -1332,6 +1376,8 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
     const unsigned long fourth = reinterpret_cast<unsigned long>(c);
     const unsigned long first = reinterpret_cast<unsigned long>(iface);
     publishIoctlArgs(getProvider(), "skywalk", first, second, third, fourth);
+    venturaTraceRequest(1, static_cast<UInt32>(second), static_cast<UInt32>(third),
+                        static_cast<UInt32>(fourth));
 
     // Two conventions reach this slot (see IO80211Controller.h). Getter paths put the
     // cmd in the 2nd argument and the request block in the 3rd; setPower and
@@ -1342,9 +1388,27 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
         const bool isSet = second == kSetCmd;
         if (third >= 0xffffff0000000000UL) {
             const auto *raw = reinterpret_cast<const VenturaRawRequest *>(third);
-            if (IOService *probe = getProvider())
+            if (IOService *probe = getProvider()) {
                 probe->setProperty("Ath10kIoctlReqType", static_cast<UInt64>(
                                        static_cast<UInt32>(raw->type)), 32);
+                // A request number outside the apple80211 type range means this
+                // pointer is not a request block at all (measured: type 255 for
+                // cmd 0x803069c8). Dump the first 0x28 bytes so the next run says
+                // what it really is instead of needing another guess.
+                if (raw->type < 0 || raw->type > 200) {
+                    const UInt8 *bytes = reinterpret_cast<const UInt8 *>(raw);
+                    char dump[0x28 * 3 + 1];
+                    dump[0] = 0;
+                    if (bytes != nullptr) {
+                        for (UInt32 i = 0; i < 0x28; ++i) {
+                            char one[4];
+                            snprintf(one, sizeof(one), "%02x ", bytes[i]);
+                            strlcat(dump, one, sizeof(dump));
+                        }
+                    }
+                    probe->setProperty("Ath10kReqDump", dump);
+                }
+            }
             // SCAN_REQ has to go through the manager: it owns the pending request node
             // that airportd's scan completion (and its later result read) is matched
             // against. SCAN_RESULT is served from the driver's own cursor below, because
@@ -1368,6 +1432,44 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
             if (raw->type == APPLE80211_IOC_SCAN_RESULT)
                 return status;
             _venturaFallType = raw->type;
+        } else if (third != 0) {
+            // User-space apple80211req. Apple's own path copies it in before using
+            // it, which is why airportd's join reached this slot with a user address
+            // (measured: 1:c03069c9:559930376:65535) and every type read here was
+            // garbage - the join then died "unsupported" without an ASSOCIATE ever
+            // being sent. Copy the request in, serve it against kernel memory, and
+            // copy the answer back out for getters.
+            VenturaRawRequest raw{};
+            if (ath10kControllerCopyIn(this, static_cast<UInt64>(third), &raw, sizeof(raw)) == 0) {
+                if (IOService *probe = getProvider())
+                    probe->setProperty("Ath10kIoctlReqType",
+                                       static_cast<UInt64>(static_cast<UInt32>(raw.type)), 32);
+                if (raw.len != 0 && raw.len <= 0x800 && raw.data != nullptr) {
+                    UInt8 scratch[0x800];
+                    bzero(scratch, sizeof(scratch));
+                    const bool haveInput =
+                        !isSet || ath10kControllerCopyIn(this,
+                                                         reinterpret_cast<UInt64>(raw.data),
+                                                         scratch, raw.len) == 0;
+                    if (haveInput) {
+                        const SInt32 status =
+                            venturaRecordRequest(isSet ? 1 : 0, raw.type, scratch);
+                        ath10kVenturaProbeEntry(1, getProvider(), raw.type, raw.len, status);
+                        if (status == kIOReturnSuccess && !isSet)
+                            ath10kControllerCopyOut(this, scratch,
+                                                    reinterpret_cast<UInt64>(raw.data), raw.len);
+                        if (status == kIOReturnSuccess || raw.type == APPLE80211_IOC_SCAN_RESULT)
+                            return status;
+                        _venturaFallType = raw.type;
+                    }
+                } else if (raw.len == 0) {
+                    const SInt32 status = venturaRecordRequest(isSet ? 1 : 0, raw.type, nullptr);
+                    ath10kVenturaProbeEntry(1, getProvider(), raw.type, 0, status);
+                    if (status == kIOReturnSuccess)
+                        return kIOReturnSuccess;
+                    _venturaFallType = raw.type;
+                }
+            }
         }
     } else if (first == kSetCmd || first == kGetCmd) {
         const bool isSet = first == kSetCmd;
@@ -1393,9 +1495,10 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
     // which type falls through and what it answers is published here.
     const SInt32 appleStatus = IO80211Controller::apple80211_ioctl(iface, a, b, c);
     if (IOService *probe = getProvider()) {
-        char fall[64];
-        snprintf(fall, sizeof(fall), "type=%d st=%x", _venturaFallType,
-                 static_cast<unsigned>(appleStatus));
+        char fall[96];
+        snprintf(fall, sizeof(fall), "type=%d st=%x entry=%u cmd=%lx", _venturaFallType,
+                 static_cast<unsigned>(appleStatus), _venturaLastEntry,
+                 static_cast<unsigned long>(_venturaLastEntryCmd));
         probe->setProperty("Ath10kIoctlFall", fall);
     }
     return appleStatus;
@@ -1408,6 +1511,7 @@ SInt32 Ath10kPCIDevice::apple80211SkywalkRequest(UInt requestType, int requestNu
     // scan manager reaches this slot with 0x803069c8 / 0xc03069c9 exactly like the
     // ioctl path does (live 0x201342c for SCAN_REQ, 0x2013fba for SCAN_RESULT).
     const bool isSet = requestType == 0x803069c8UL;
+    venturaTraceRequest(2, requestType, static_cast<UInt32>(requestNumber), 0);
     if (requestNumber == APPLE80211_IOC_SCAN_RESULT && !isSet && data != nullptr) {
         // Results come back as a *pointer* here: the manager passes the address of
         // its own local and memcpy's sizeof(apple80211_scan_result) from whatever is
@@ -1786,6 +1890,21 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
     case APPLE80211_IOC_ANTENNA_DIVERSITY:
         return kIOReturnSuccess;
     default:
+        // Unknown request number. A getter has to fail loudly (the caller reads the
+        // buffer we never filled), but a setter is a different matter: airportd's
+        // join walked into APPLE80211_IOC_...=0xff here (measured dump: if_name
+        // "en1", type 0xff, len 0x38) and the refusal aborted the join with -3903
+        // before ASSOCIATE was ever sent. Accept unknown setters as no-ops and name
+        // them, instead of letting the whole flow die on a request this driver has
+        // no work to do for.
+        if (isSet) {
+            if (IOService *probe = getProvider()) {
+                char note[48];
+                snprintf(note, sizeof(note), "type=%d", requestNumber);
+                probe->setProperty("Ath10kUnknownSet", note);
+            }
+            return kIOReturnSuccess;
+        }
         return kIOReturnUnsupported;
     }
 }
@@ -2284,6 +2403,18 @@ extern "C" bool ath10kAttachSkywalkInterface(IO80211Controller *self, OSObject *
 // driver, so the bit stays 0 and the family keeps its supplicant switched off.
 extern "C" bool ath10kUseAppleRSN(IO80211Controller *self, IO80211VirtualInterface *iface)
     __asm("__ZN17IO80211Controller21useAppleRSNSupplicantEP23IO80211VirtualInterface");
+
+// The family's own request path copies the caller's apple80211req in itself, which
+// is why airportd's join reached this slot with a *user* address in the third
+// argument (measured Ath10kEntryTrace: 1:c03069c9:559930376:65535). Nothing here
+// can dereference that pointer, so the request has to be copied in first; both
+// helpers exist in the live bundle and return 0 on success.
+extern "C" int ath10kControllerCopyIn(IO80211Controller *self, UInt64 address, void *to,
+                                      size_t bytes)
+    __asm("__ZN17IO80211Controller6copyInEyPvm");
+extern "C" int ath10kControllerCopyOut(IO80211Controller *self, const void *from, UInt64 address,
+                                       size_t bytes)
+    __asm("__ZN17IO80211Controller7copyOutEPKvym");
 
 // IO80211VirtualInterface::start() is a tail call into
 // IO80211SkywalkInterface::start(); that body is the only code in the kernel
