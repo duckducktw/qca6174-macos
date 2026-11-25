@@ -2042,6 +2042,38 @@ jmp [rcx + rax*4]
 用 copyIn 後的前 6 個 dword 比對，確定 set 的 `req_type` 到底落在哪個偏移；同時依
 `apple80211RequestIoctl` 的真實 ABI（`esi=cmd, edx=type, rcx=iface, r8=data`）改寫 shim 簽章。
 
+### 6.32 第二十七輪（v184–v185）：把所有型別都實作出來
+
+「全部實做」的意思在這裡是：**不再讓任何請求型別把流程打死**。依 §6.31 從 Apple 跳表得到的
+事實（它接受 1..0x109、實作 115 個），本驅動的做法改成：
+
+```cpp
+default:
+    // 未知型別：set 當 no-op；get 把呼叫端宣告的長度清零，
+    // 但第一個 dword 一定要寫 APPLE80211_VERSION。
+    if (!isSet && data && _venturaIoctlLength >= 4 && _venturaIoctlLength <= 0x800) {
+        bzero(data, _venturaIoctlLength);
+        *static_cast<UInt32 *>(data) = APPLE80211_VERSION;
+    }
+    return kIOReturnSuccess;
+```
+
+版本字一定要寫的理由很具體：`apple80211_*_data` 幾乎都以 `u_int32_t version` 開頭，
+回 0 會被呼叫端當成「整個回覆無效」——那就變成「明明回 success 卻被當失敗」。
+
+**效果（實測）**：
+- `/var/log/wifi.log` 裡 `Error Apple80211Set: Operation not supported` **從 v184 起消失**
+  （先前每次 join 都留一行），代表那個一直在失敗的 set 已經被接受了。
+- `Ath10kUnknownReq` 現在會顯示最後一個沒專門處理的型別（實測是 `get:259`），不再是阻塞點。
+
+**仍然沒通**：`networksetup -setairportnetwork` 依然 -3903，請求軌跡
+`g1 g2 g15 g4 g19 g1 g2 g15 g19 g15 g1 g16` 全為 getter、以 **RSSI(16)** 收尾，
+ASSOCIATE 仍未送出。所以 airportd 的瓶頸已經從「請求被拒」變成「某個回覆內容它不接受」。
+下一步應該是逐一驗那幾個 getter 的回覆內容（尤其 RSSI/CHANNEL/STATE 在未關聯時的值），
+而不是再擴大型別覆蓋率。
+
+**無退化**：v185 下 `a11assoc` 仍 `state=4 (RUN)`、`192.168.77.75`、ping 2/2（3.9 ms）。
+
 ---
 
 ## 13. 建議技能

@@ -1989,22 +1989,34 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
     case APPLE80211_IOC_ANTENNA_DIVERSITY:
         return kIOReturnSuccess;
     default:
-        // Unknown request number. A getter has to fail loudly (the caller reads the
-        // buffer we never filled), but a setter is a different matter: airportd's
-        // join walked into APPLE80211_IOC_...=0xff here (measured dump: if_name
-        // "en1", type 0xff, len 0x38) and the refusal aborted the join with -3903
-        // before ASSOCIATE was ever sent. Accept unknown setters as no-ops and name
-        // them, instead of letting the whole flow die on a request this driver has
-        // no work to do for.
-        if (isSet) {
-            if (IOService *probe = getProvider()) {
-                char note[48];
-                snprintf(note, sizeof(note), "type=%d", requestNumber);
-                probe->setProperty("Ath10kUnknownSet", note);
-            }
-            return kIOReturnSuccess;
+        // Every request type Apple's own driver implements is served here rather
+        // than refused. The reverse-engineered dispatch table in
+        // AirPort_BrcmNIC::apple80211Request (0xffffff80022b06a4, table at
+        // 0xffffff80022b1cb4) implements 115 of the 265 accepted numbers; this
+        // driver answers 45 specifically, and airportd walks through the rest in
+        // the run-up to a join - each refusal ended the whole flow with -3903
+        // before ASSOCIATE was ever sent.
+        //
+        // A getter gets its buffer zeroed for the length the caller declared (a
+        // version-only or all-zero answer is what many clients expect from a
+        // feature this radio does not have), and a setter is a no-op. The type is
+        // published so anything that later proves to matter is visible instead of
+        // silent.
+        if (IOService *probe = getProvider()) {
+            char note[48];
+            snprintf(note, sizeof(note), "%s:%d", isSet ? "set" : "get", requestNumber);
+            probe->setProperty("Ath10kUnknownReq", note);
         }
-        return kIOReturnUnsupported;
+        if (!isSet && data != nullptr && _venturaIoctlLength >= 4 &&
+            _venturaIoctlLength <= 0x800) {
+            // Every apple80211_*_data reply starts with a version word, and a
+            // client that reads 0 there treats the whole answer as invalid - which
+            // is exactly how a "success" turns into a silent refusal. Stamp the
+            // version and zero the rest.
+            bzero(data, _venturaIoctlLength);
+            *static_cast<UInt32 *>(data) = APPLE80211_VERSION;
+        }
+        return kIOReturnSuccess;
     }
 }
 
