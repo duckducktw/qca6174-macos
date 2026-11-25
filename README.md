@@ -1,6 +1,6 @@
 # Ath10k-airport
 
-Experimental native Qualcomm Atheros QCA9377 Wi-Fi kext for OpenCore, targeting
+World's First experimental native Qualcomm Atheros QCA9377 Wi-Fi kext for OpenCore, targeting
 Lunnen LLL5DAW (`168c:0042 / 1a3b:2b51`) on x86_64 macOS Sequoia.
 Wi-Fi is controlled through macOS system settings and the Wi-Fi menu.
 There is no companion application, login agent or application bundle to install.
