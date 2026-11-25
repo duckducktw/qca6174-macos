@@ -1842,6 +1842,45 @@ tapped 給 bpf、並把 bpf 寫入的 EAPOL 送出去（介面已經有 `attachT
 
 ---
 
+### 6.28 第二十三輪（v168）：把「使用者真的能上網」缺的東西補起來
+
+§6.25.4 列的瑕疵動手補，並實測 airportd 自己的加入流程還差什麼。
+
+#### 6.28.1 補上的（v168）
+
+| 項目 | 之前 | 現在 |
+|---|---|---|
+| `APPLE80211_IOC_SSID` getter | 永遠 `ssid_len=0`（`networksetup -getairportnetwork` 印出 `\x01`、configd 記 `SSID ^A`） | 已連線時回傳 `_connection.ssid/ssidLength` |
+| `APPLE80211_IOC_BSSID` getter | 全 0 | 已連線時回傳 `_connection.bssid` |
+| `APPLE80211_IOC_RSSI` getter | 固定 0（選單列訊號永遠空的） | 回傳 `_connection.signalDbm`（`Ath10kWMI` 由 mgmt SNR−95 算出） |
+| `APPLE80211_IOC_POWER` set=off | 只翻旗標，關聯與 DHCP 全部留著 | 走 `connectionFailure(state,'radio-off')` + `networkLink(false)` + `state=INIT`，介面真的掉線 |
+
+電源 off 的修法是關鍵：airportd 每次 join 之前都會先關無線電，先前關不掉（en1 還掛著 192.168.77.75），
+接著的 ASSOCIATE 就被回 -3903。v168 實測 `networksetup -setairportpower en1 off` → 狀態真的變
+`Ath10kConnectionState="disabled"`、IP 消失。
+
+#### 6.28.2 還沒通：airportd 自己發起的 join（-3903）
+
+`networksetup -setairportnetwork en1 QCA-TEST <pw>` 仍然回
+`-3903 (com.apple.wifi.apple80211API.error)`。決定性證據是請求軌跡：
+
+```
+Ath10kRequestTrace = "g12=0 g19=0 g96=0 g12=0 g12=0 g19=0 g1=0 g1=0 g2=0 g15=0 g4=0 g19=0 g1=0 g1=0 g1=0 g2=0 "
+Ath10kApple80211Requests = 684
+```
+
+**整段只有 getter（g1/g2/g4/g12/g15/g19/g96），完全沒有 `s` 開頭的 ASSOCIATE/SSID set** —
+也就是 airportd 在「送出加入請求」之前就自己放棄了，不是驅動拒絕。我們自己的 `a11assoc`
+（直接 ioctl ASSOCIATE）一直都能成功，所以差別在 airportd 的前置檢查。
+
+下一個要補的（依序）：
+1. `APPLE80211_IOC_CURRENT_NETWORK(103)` 目前回 `e00002c7`（unsupported，見 §6.26 前的 trace）——
+   airportd/CoreWLAN 用它確認「介面現在掛在哪個網路」，缺了它會判定狀態不一致。
+2. `APPLE80211_IOC_STATE` 在未連線時的值、以及 family 快取的 link 狀態是否為 RUN。
+3. airportd 可能要求 `APPLE80211_IOC_SSID` 在 **scan 結果/family 快取**裡也對得上（它不只看驅動 getter）。
+
+---
+
 ## 13. 建議技能
 
 - `osx-kvm-headless-install`：VM 生命週期、qemu-nbd、SSH 進 guest。

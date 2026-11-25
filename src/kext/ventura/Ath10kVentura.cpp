@@ -1512,7 +1512,20 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
             return kIOReturnUnsupported;
         apple80211_ssid_data *ssid = static_cast<apple80211_ssid_data *>(data);
         ssid->version = APPLE80211_VERSION;
+        // Returning an empty SSID made `networksetup -getairportnetwork` print a
+        // stray 0x01 and made configd log "en1: SSID ^A BSSID 01:00:..". The
+        // associated BSS's SSID is already kept in the connection state, so
+        // publish it: the menu bar name, System Settings and every client that
+        // asks "which network am I on" read it from here.
         ssid->ssid_len = 0;
+        bzero(ssid->ssid_bytes, sizeof(ssid->ssid_bytes));
+        if (_connection.ssidLength && Ath10k::connectionAssociated(_connection)) {
+            const UInt32 bytes = _connection.ssidLength > APPLE80211_MAX_SSID_LEN
+                                     ? APPLE80211_MAX_SSID_LEN
+                                     : _connection.ssidLength;
+            bcopy(_connection.ssid, ssid->ssid_bytes, bytes);
+            ssid->ssid_len = bytes;
+        }
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_BSSID: {
@@ -1521,6 +1534,8 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         apple80211_bssid_data *bssid = static_cast<apple80211_bssid_data *>(data);
         bssid->version = APPLE80211_VERSION;
         memset(&bssid->bssid, 0, sizeof(bssid->bssid));
+        if (Ath10k::connectionAssociated(_connection))
+            bcopy(_connection.bssid, &bssid->bssid, 6);
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_CHANNEL:
@@ -1541,7 +1556,18 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         apple80211_rssi_data *rssi = static_cast<apple80211_rssi_data *>(data);
         rssi->version = APPLE80211_VERSION;
         rssi->num_radios = APPLE80211_MAX_RADIO;
-        rssi->rssi[0] = 0;
+        // The associated beacon's signal is already tracked; a constant 0 made the
+        // menu bar draw an empty signal meter even while connected.
+        const int32_t dbm = Ath10k::connectionAssociated(_connection) &&
+                                    _connection.signalDbm != INT32_MIN
+                                ? _connection.signalDbm
+                                : 0;
+        for (int i = 0; i < APPLE80211_MAX_RADIO; i++) {
+            rssi->rssi[i] = dbm;
+            rssi->rssi_ext[i] = 0;
+        }
+        rssi->aggregate_rssi = dbm;
+        rssi->aggregate_rssi_ext = 0;
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_CARD_CAPABILITIES:
@@ -1648,8 +1674,23 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
 
 IOReturn Ath10kPCIDevice::venturaPower(bool on)
 {
+    const bool changed = (_venturaPowerOn != on);
     _venturaPowerOn = on;
     venturaPublishState(APPLE80211_S_INIT);
+    if (!on && changed) {
+        // Power off has to take the link down, not just latch a flag: airportd
+        // turns the radio off before every join attempt, and with the association
+        // still standing (en1 kept its DHCP lease) the following ASSOCIATE was
+        // refused with -3903 "Failed to join network". Cancelling through the
+        // shared state machine is what actually stops the vdev, drops the peer and
+        // clears the BSD link, and clearing the security state makes the next join
+        // start from EAPOL instead of resuming a half-torn-down session.
+        _connection.cancelRequested = true;
+        _connection.portAuthorized = false;
+        Ath10k::connectionFailure(_connection, "radio-off");
+        _venturaState = APPLE80211_S_INIT;
+        networkLink(false);
+    }
     if (IOService *provider = getProvider())
         provider->setProperty("Ath10kPowerPhase", on ? "power-on-request" : "power-off-request");
     return kIOReturnSuccess;
