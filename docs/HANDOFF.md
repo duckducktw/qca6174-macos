@@ -7,7 +7,7 @@ userspace 白名單（`Apple80211Set` 對 type 20 直接記 log 回 `-3903`，�
 自動連上、`Current Wi-Fi Network: QCA-TEST`、DHCP 192.168.77.75、ping 1.1.1.1 3/3、https 200、
 DNS 正常；關/開 Wi-Fi 後 15 秒自動重連。）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v199**（`/tmp/vk199`，Acer 上，sha256 `75e46c62…` 之後的乾淨重建）— kext 載入、
+VM 現況：**v199**（`/tmp/vk199`，Acer 上，sha256 `75e46c62c14153de5f05d7ad54fba459a9ba7284b7a06a29466361f98a3854c3`）— kext 載入、
 en1 `UP,RUNNING`、驅動自連 `connected-wpa2`、SSID 正確回報、DHCP＋上網已通
 第十九輪：§6.23；第十七輪掃描：§6.21；§1 條件 D ✅ 的推導見 §6.25；第三十輪：§6.35
 
@@ -1063,10 +1063,12 @@ scan manager 裡，driver 不再「按需求送 SCAN_RESULT」，而是由 manag
   System Settings 都把 version 的低byte 當成網路名（`Current Wi-Fi Network: \u0001`）。
 - 改成平坦佈局：offset 0 起 32 bytes 放 SSID、offset 32 放長度 → 實測 `QCA-TEST` 正確顯示。
 
-### 6.35.4 驗證（v199）
+### 6.35.4 驗證（v199，含冷開機）
 `Ath10kConnectionState = connected-wpa2`、`Current Wi-Fi Network: QCA-TEST`、DHCP `192.168.77.75`、
 `ping 1.1.1.1` 3/3（6–19 ms）、`curl https://example.com` 200、DNS 解析正常；冷開機與電源循環後
-皆自動恢復。驗收表 A–D 仍成立；E（實機）依使用者指示暫緩。
+皆自動恢復。Wi-Fi 單獨可用也驗過：`ping -S 192.168.77.75 1.1.1.1` 3/3、`curl --interface en1`
+回 200（local_ip=192.168.77.75）、`nc -z 1.1.1.1 443` 成功。驗收表 A–D 仍成立；E（實機）依使用者
+指示暫緩。
 
 ---
 
