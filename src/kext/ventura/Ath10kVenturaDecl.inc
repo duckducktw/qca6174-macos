@@ -228,6 +228,12 @@ private:
     // the request that Apple's handler refused actually came from.
     UInt32 _venturaLastEntry = 0;
     UInt32 _venturaLastEntryCmd = 0;
+    // Raw dwords of every request block that reached the ioctl slot, so a block
+    // whose req_type reads as nonsense can be compared with one that parses.
+    static constexpr UInt32 kVenArgDumpSlots = 4;
+    UInt32 _venturaArgDump[kVenArgDumpSlots][7]{};
+    UInt32 _venturaArgDumpNext = 0;
+    UInt32 _venturaArgDumpCount = 0;
     UInt32 _venturaTraceNext = 0;
     UInt32 _venturaTraceCount = 0;
 

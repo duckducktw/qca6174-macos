@@ -1990,6 +1990,58 @@ speed=5111182 B/s  size=20000000  time=3.91 s   → 約 5.1 MB/s = 41 Mbit/s
 2. `VIRTUAL_IF_CREATE(94)` 只「承認」不夠：airportd 可能真的要一個**新的** vif（有自己的 BSD 名稱），
    我們回 success 卻沒建，導致它後面找不到介面而 -3903。
 
+### 6.31 第二十六輪（v180–v183）：照 Apple 自己的分派表反推，不再猜型別
+
+用戶要求「直接逆向抓真實行為」，所以這一輪全部以 Apple 的程式碼為準：
+
+#### 6.31.1 Apple 驅動接受哪些請求型別（實測，非推測）
+
+`AirPort_BrcmNIC::apple80211Request`（`0xffffff80022b06a6`）本體：
+
+```
+lea eax,[r14-1]        ; r14 = req_type
+cmp eax, 0x108
+ja  reject             ; 只接受 1..0x109(265)
+lea rcx,[jump table]   ; 0xffffff80022b1cb4，0x109 項
+jmp [rcx + rax*4]
+```
+
+把跳表全部解出來：**115 個型別有實作**，其餘落 `0xffffff80022b1c3a`（default）。
+其中 `0xff / 0x100 / 0x101 / 0x102 / 0x67(103) / 0xb1(177)` **全部指向 default** ——
+也就是說 255/256 這些數字根本不是協定型別，Apple 的驅動一樣不認。
+
+#### 6.31.2 我們少答了什麼（115 vs 41）
+
+比對「Apple 有實作」與「本驅動有 case」：我們只回 41 個，缺 72 個。跟 join／安全直接相關、
+而且只是資料填充的先補上（v182）：
+
+| 型別 | 名稱 | 實作 |
+|---|---|---|
+| 46 | `RSN_IE` | 已連線時回 `_connection.ap.rsn`（版本+長度+元素） |
+| 77 | `RSN_CONF` | 接受（本驅動由 WPA2 狀態機自行設定 RSN） |
+| 74 | `STA_AUTHORIZE` | 已授權才回 success，否則 `NotReady` |
+| 3 | `CIPHER_KEY` | set 視為 no-op（金鑰由核心內 supplicant 裝） |
+
+#### 6.31.3 呼叫端與參數約定（實測）
+
+- 那個「型別是垃圾」的 set，在驅動內抓到呼叫者：`pid=170 name=airportd`。
+- 新增 `Ath10kArgDump`（每個到達 ioctl slot 的請求區塊前 6 個 dword）後，
+  正常請求長這樣：`c03069c9:316e65,0,0,0,1,0` → `0x316e65` = `"en1"`，**type 在 +0x10 = 1（SSID）**。
+  也就確認 `req_type` 偏移正確，而 255/256/387 那幾筆的來源不是這條路徑（很可能是使用者指標那條，
+  或區塊已被釋放／重用）。
+- 反 `IO80211Controller::apple80211RequestIoctl`（`0xffffff8002183e5c`）看到它用
+  `call [rax+0x388]` 呼叫驅動，暫存器是 `esi=cmd, edx=type, rcx=interface, r8=data`
+  —— 與本驅動 4 參數 shim 的假設不同，這是下一輪要校正的地方。
+
+#### 6.31.4 現況
+
+`networksetup -setairportnetwork` 仍 -3903，`Ath10kRequestTrace` 全是 getter，ASSOCIATE 未送出。
+我們的 `a11assoc` 仍然 `state=4 (RUN)`、`192.168.77.75`、ping 正常（無退化）。
+
+**下一步（明確）**：把 `Ath10kArgDump` 也套用到 `third < 0xffffff0000000000`（使用者指標）那條，
+用 copyIn 後的前 6 個 dword 比對，確定 set 的 `req_type` 到底落在哪個偏移；同時依
+`apple80211RequestIoctl` 的真實 ABI（`esi=cmd, edx=type, rcx=iface, r8=data`）改寫 shim 簽章。
+
 ---
 
 ## 13. 建議技能

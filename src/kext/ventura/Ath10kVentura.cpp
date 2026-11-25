@@ -48,6 +48,8 @@ static apple80211_scan_result *gVenturaScanSlot = nullptr;
 static UInt32 venturaScanChannelFlags(UInt32 channel);
 // Declared up here because the ioctl entry below uses them; both are live
 // IO80211Controller exports and return 0 on success.
+extern "C" int proc_selfpid(void);
+extern "C" int proc_selfname(char *buf, size_t len);
 extern "C" int ath10kControllerCopyIn(IO80211Controller *self, UInt64 address, void *to,
                                       size_t bytes)
     __asm("__ZN17IO80211Controller6copyInEyPvm");
@@ -1378,6 +1380,35 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
     publishIoctlArgs(getProvider(), "skywalk", first, second, third, fourth);
     venturaTraceRequest(1, static_cast<UInt32>(second), static_cast<UInt32>(third),
                         static_cast<UInt32>(fourth));
+    // Record the first dwords of *every* request block that reaches this slot, not
+    // just the ones whose type looks wrong: comparing a call we answer correctly
+    // (type 96) with one that reads as 387 is the only way to learn where the
+    // caller really writes req_type.
+    if ((second == kGetCmd || second == kSetCmd) && third >= 0xffffff0000000000UL) {
+        const UInt32 *words = reinterpret_cast<const UInt32 *>(third);
+        _venturaArgDump[_venturaArgDumpNext][0] = static_cast<UInt32>(second);
+        for (UInt32 i = 0; i < 6; ++i)
+            _venturaArgDump[_venturaArgDumpNext][i + 1] = words[i];
+        _venturaArgDumpNext = (_venturaArgDumpNext + 1) % kVenArgDumpSlots;
+        if (_venturaArgDumpCount < kVenArgDumpSlots)
+            ++_venturaArgDumpCount;
+        if (IOService *probe = getProvider()) {
+            char trace[kVenArgDumpSlots * 48];
+            trace[0] = 0;
+            const UInt32 firstSlot =
+                (_venturaArgDumpCount == kVenArgDumpSlots) ? _venturaArgDumpNext : 0;
+            for (UInt32 i = 0; i < _venturaArgDumpCount; ++i) {
+                const UInt32 slot = (firstSlot + i) % kVenArgDumpSlots;
+                char item[48];
+                snprintf(item, sizeof(item), "%lx:%x,%x,%x,%x,%x,%x ", _venturaArgDump[slot][0],
+                         _venturaArgDump[slot][1], _venturaArgDump[slot][2],
+                         _venturaArgDump[slot][3], _venturaArgDump[slot][4],
+                         _venturaArgDump[slot][5], _venturaArgDump[slot][6]);
+                strlcat(trace, item, sizeof(trace));
+            }
+            probe->setProperty("Ath10kArgDump", trace);
+        }
+    }
 
     // Two conventions reach this slot (see IO80211Controller.h). Getter paths put the
     // cmd in the 2nd argument and the request block in the 3rd; setPower and
@@ -1407,6 +1438,32 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
                         }
                     }
                     probe->setProperty("Ath10kReqDump", dump);
+                    // Who is asking: the type reads as garbage, so identify the
+                    // caller instead of guessing what the number means. pid/name
+                    // come from the kernel's own helpers, the return address is the
+                    // live family function that dispatched into this slot.
+                    char who[128];
+                    char name[64];
+                    name[0] = 0;
+                    proc_selfname(name, sizeof(name));
+                    snprintf(who, sizeof(who), "pid=%d name=%s ret=%p type=%d len=%u",
+                             proc_selfpid(), name, __builtin_return_address(0),
+                             raw->type, static_cast<unsigned>(raw->len));
+                    probe->setProperty("Ath10kReqWho", who);
+                    // The request block alone says "which type"; the payload says
+                    // "what it wants". 0x38 bytes is what airportd sent here, so dump
+                    // it and read the answer instead of guessing at the type number.
+                    if (raw->data != nullptr && raw->len != 0 && raw->len <= 0x40) {
+                        const UInt8 *payload = reinterpret_cast<const UInt8 *>(raw->data);
+                        char hex[0x40 * 3 + 1];
+                        hex[0] = 0;
+                        for (UInt32 i = 0; i < raw->len; ++i) {
+                            char one[4];
+                            snprintf(one, sizeof(one), "%02x ", payload[i]);
+                            strlcat(hex, one, sizeof(hex));
+                        }
+                        probe->setProperty("Ath10kReqPayload", hex);
+                    }
                 }
             }
             // SCAN_REQ has to go through the manager: it owns the pending request node
@@ -1717,6 +1774,48 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
             result->asr_ie_len = static_cast<SInt16>(ieLen);
         }
         return kIOReturnSuccess;
+    }
+    case APPLE80211_IOC_RSN_IE: {
+        // What an Apple driver answers here is the RSN element of the *current*
+        // association; it is one of the 115 request types AirPort_BrcmNIC
+        // implements (its dispatch table at 0x22b1cb4) and this driver answered
+        // "unsupported", so any client asking for security details saw none.
+        if (isSet)
+            return kIOReturnSuccess;
+        struct RsnIeReply {
+            UInt32 version;
+            UInt32 length;
+            UInt8 element[257];
+        } *reply = static_cast<RsnIeReply *>(data);
+        if (reply == nullptr)
+            return kIOReturnBadArgument;
+        bzero(reply, sizeof(*reply));
+        reply->version = APPLE80211_VERSION;
+        if (Ath10k::connectionAssociated(_connection) && _connection.ap.rsnPresent &&
+            _connection.ap.rsnLength <= sizeof(reply->element)) {
+            bcopy(_connection.ap.rsn, reply->element, _connection.ap.rsnLength);
+            reply->length = _connection.ap.rsnLength;
+        }
+        return kIOReturnSuccess;
+    }
+    case APPLE80211_IOC_RSN_CONF:
+        // Accepted as a no-op: the driver installs its own RSN configuration from
+        // the WPA2 state machine, and refusing it made clients believe the
+        // interface cannot do RSN at all.
+        return kIOReturnSuccess;
+    case APPLE80211_IOC_STA_AUTHORIZE:
+        // Peer authorize request from the supplicant path; the connection state
+        // machine already authorizes the port itself once securityPhase reaches 5.
+        return (Ath10k::connectionAssociated(_connection) && _connection.portAuthorized)
+                   ? kIOReturnSuccess
+                   : kIOReturnNotReady;
+    case APPLE80211_IOC_CIPHER_KEY: {
+        // Keys are installed by the in-kernel supplicant through the firmware, so a
+        // client-issued key write has nothing to do. Acknowledge it rather than
+        // returning unsupported, which reads as "this interface has no key path".
+        if (isSet)
+            return kIOReturnSuccess;
+        return kIOReturnUnsupported;
     }
     case APPLE80211_IOC_RATE: {
         if (isSet)
