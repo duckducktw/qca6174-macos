@@ -1817,21 +1817,6 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
             *reinterpret_cast<UInt32 *>(flat + 32) = n;
             return kIOReturnSuccess;
         }
-        // Returning an empty SSID made `networksetup -getairportnetwork` print a
-        // stray 0x01 and made configd log "en1: SSID ^A BSSID 01:00:..". The
-        // associated BSS's SSID is already kept in the connection state, so
-        // publish it: the menu bar name, System Settings and every client that
-        // asks "which network am I on" read it from here.
-        ssid->ssid_len = 0;
-        bzero(ssid->ssid_bytes, sizeof(ssid->ssid_bytes));
-        if (_connection.ssidLength && Ath10k::connectionAssociated(_connection)) {
-            const UInt32 bytes = _connection.ssidLength > APPLE80211_MAX_SSID_LEN
-                                     ? APPLE80211_MAX_SSID_LEN
-                                     : _connection.ssidLength;
-            bcopy(_connection.ssid, ssid->ssid_bytes, bytes);
-            ssid->ssid_len = bytes;
-        }
-        return kIOReturnSuccess;
     }
     case APPLE80211_IOC_BSSID: {
         if (isSet) {
