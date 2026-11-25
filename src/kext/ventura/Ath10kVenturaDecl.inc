@@ -139,6 +139,14 @@ private:
     thread_call_t _vifPublishCall = nullptr;
     thread_call_t _venturaAutoJoinCall = nullptr;
     UInt32 _venturaAutoJoinTries = 0;
+    // Join list from boot-args (ath10kjoin="ssid:psk,ssid2:psk2"): lets the same
+    // binary follow a different network without a rebuild.
+    static constexpr UInt32 kVenJoinMax = 4;
+    char _venturaJoinSSID[kVenJoinMax][33]{};
+    char _venturaJoinPSK[kVenJoinMax][65]{};
+    UInt32 _venturaJoinCount = 0;
+    bool _venturaJoinParsed = false;
+    void venturaParseJoinList();
     UInt32 _vifPublishAttempts = 0;
     static void vifPublishCall(thread_call_param_t, thread_call_param_t);
     static void venturaAutoJoinCall(thread_call_param_t, thread_call_param_t);

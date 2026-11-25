@@ -22,6 +22,7 @@ extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifne
 #include <libkern/c++/OSCollectionIterator.h>
 #include <sys/_types/_size_t.h>
 #include <net/if_media.h>
+#include <pexpert/pexpert.h>
 
 // ---------------------------------------------------------------------------
 // Interface publication
@@ -688,6 +689,48 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
 // Ath10kAutoJoin.inc so a different test network only needs a rebuild.
 #include "Ath10kAutoJoin.inc"
 
+// Join list, in order of preference, from the boot-argument
+//   ath10kjoin="ssid:psk,ssid2:psk2"
+// so a different network only needs a config.plist edit (no rebuild). Falls back
+// to the compiled Ath10kAutoJoin.inc when the argument is absent.
+void Ath10kPCIDevice::venturaParseJoinList()
+{
+    if (_venturaJoinParsed)
+        return;
+    _venturaJoinParsed = true;
+    char arg[512];
+    bzero(arg, sizeof(arg));
+    if (!PE_parse_boot_argn("ath10kjoin", arg, sizeof(arg) - 1) || arg[0] == 0) {
+        return;
+    }
+    char *cursor = arg;
+    while (cursor != nullptr && *cursor != 0 && _venturaJoinCount < kVenJoinMax) {
+        char *entry = cursor;
+        char *comma = strchr(entry, ',');
+        if (comma != nullptr)
+            *comma = 0;
+        char *colon = strchr(entry, ':');
+        if (colon != nullptr) {
+            *colon = 0;
+            const size_t ssidLen = strlen(entry);
+            const size_t pskLen = strlen(colon + 1);
+            if (ssidLen > 0 && ssidLen <= 32 && pskLen <= 64) {
+                bcopy(entry, _venturaJoinSSID[_venturaJoinCount], ssidLen);
+                bcopy(colon + 1, _venturaJoinPSK[_venturaJoinCount], pskLen);
+                ++_venturaJoinCount;
+            }
+        }
+        cursor = (comma != nullptr) ? comma + 1 : nullptr;
+    }
+    if (IOService *probe = getProvider()) {
+        char note[96];
+        snprintf(note, sizeof(note), "boot-args entries=%u first=%s",
+                 static_cast<unsigned>(_venturaJoinCount),
+                 _venturaJoinCount ? _venturaJoinSSID[0] : "(none)");
+        probe->setProperty("Ath10kJoinList", note);
+    }
+}
+
 void Ath10kPCIDevice::venturaScheduleAutoJoin()
 {
     if (_venturaAutoJoinCall == nullptr) {
@@ -729,8 +772,16 @@ void Ath10kPCIDevice::runVenturaAutoJoin()
     if (!_venturaPowerOn)
         venturaPower(true);
 
+    venturaParseJoinList();
     const char *ssid = ATH10K_AUTOJOIN_SSID;
     const char *psk = ATH10K_AUTOJOIN_PSK;
+    if (_venturaJoinCount != 0) {
+        // Rotate through the configured networks: a wrong-out-of-range AP costs one
+        // tick, and the next one gets tried without any user action.
+        const UInt32 slot = (_venturaAutoJoinTries - 1) % _venturaJoinCount;
+        ssid = _venturaJoinSSID[slot];
+        psk = _venturaJoinPSK[slot];
+    }
     const UInt32 ssidLength = static_cast<UInt32>(strlen(ssid));
     const UInt32 keyLength = static_cast<UInt32>(strlen(psk));
 
