@@ -1,15 +1,15 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-25（**第二十九輪：join 流程逆向總圖**。新增 `docs/join-flow-reverse.md`，
-把 `CoreWLAN → airportd → family IO80211APIUserClient → apple80211RequestIoctl → 驅動四入口`
-整條鏈路連同每個位址／偏移／呼叫慣例寫成一份文件。本輪修掉兩個真 bug：`apple80211VirtualRequest`
-把 cmd 字當成 1/0 動詞（導致 **所有 set 被當成 get**）、以及 CARD_CAPABILITIES 的欄位偏移全錯
-（改用 Apple 驅動的實際佈局）。DHCP／上網在 v165 後一直是通的；系統發起的 join 仍卡在 airportd
-內部 `-3903`，且 `ASSOCIATE(20)` 從未送出。第二十六輪：§6.31；§6.30：入口軌跡。）
+最後更新：2026-11-26（**第三十輪：join 打通（驅動自連）**。`-3903` 追到源頭：framework 的
+userspace 白名單（`Apple80211Set` 對 type 20 直接記 log 回 `-3903`，位圖 `0x08089000` 只放行
+12/15/19/27），所以 airportd 不可能發起 join。改由驅動自己關聯：延遲 `thread_call` + 常駐看門狗
+呼叫 `venturaAssociate()`，憑證在產生的 `Ath10kAutoJoin.inc`（gitignore）。v199 實測：冷開機
+自動連上、`Current Wi-Fi Network: QCA-TEST`、DHCP 192.168.77.75、ping 1.1.1.1 3/3、https 200、
+DNS 正常；關/開 Wi-Fi 後 15 秒自動重連。）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v188**（`/tmp/vk188`，Acer 上，sha256 `43a1a9c9…`）— kext 載入、en1 `UP,RUNNING`、
-airportd 掃描 `error=0`、WPA2-PSK 關聯＋握手＋DHCP（192.168.77.75）＋加密鏈路上網（41 Mbit/s）
-第十九輪：§6.23；第十七輪掃描：§6.21；§1 條件 D ✅ 的推導見 §6.25。
+VM 現況：**v199**（`/tmp/vk199`，Acer 上，sha256 `75e46c62…` 之後的乾淨重建）— kext 載入、
+en1 `UP,RUNNING`、驅動自連 `connected-wpa2`、SSID 正確回報、DHCP＋上網已通
+第十九輪：§6.23；第十七輪掃描：§6.21；§1 條件 D ✅ 的推導見 §6.25；第三十輪：§6.35
 
 ---
 
@@ -1035,6 +1035,40 @@ scan manager 裡，driver 不再「按需求送 SCAN_RESULT」，而是由 manag
    否則這條不成立。
 
 判斷進度的斷點仍然是：`Ath10kLastApple80211Request` 變成 11、`Ath10kScanServed` 成長。
+
+## 6.35 第三十輪：join 打通（驅動自行關聯）
+
+### 6.35.1 `-3903` 的最終定位（userspace 白名單）
+- `Apple80211Set` 本體（entry 是 10-byte thunk，本輪開機在 `0x7ffb1eb0856e` → 本體 `0x7ffb1eb41df7`）
+  把 type 透過兩段式表分派：小 type（≤0x1b）先過位圖 `0x08089000`（只有 12/15/19/27 被放行），
+  其餘落到 `0x7ffb1eb43b11`：拿 `OS_os_log` 句柄（已用 `peek` 讀出是 `<OS_os_log: …>`）、記一條 log、
+  然後直接 `mov r15d, 0xfffff0c1` 回 `-3903`。**type 20 就是走這條**。
+- 另一條 service 路徑（dispatcher `cmp byte ptr [ref+0x5d],0` 非 0 時 `jmp …e8df7`）同樣不吃 type 20。
+- 因此 airportd 不可能送出 `ASSOCIATE(20)`；`-3903` 不是驅動回的，也不是 caps/AUTH_TYPE 的問題
+  （那兩個 bug 本輪仍修掉並保留）。`Apple80211BindToInterfaceWithService` 對非 airportd 程式回 `-3900`
+  （要 `com.apple.wlan.authentication`），所以也無法在自製程式裡重現 service 路徑。
+
+### 6.35.2 解法：驅動自己 join
+- `venturaScheduleAutoJoin()`：`thread_call_allocate_with_options(..., THREAD_CALL_OPTIONS_ONCE)`，
+  start 後 15 秒觸發；`runVenturaAutoJoin()` 必要時先 `venturaPower(true)`，組
+  `apple80211_assoc_data`（`ad_auth_lower=OPEN`、`ad_auth_upper=WPA2_PSK`、SSID、key）後呼叫
+  既有的 `venturaAssociate()`，把結果寫進 `Ath10kAutoJoinPhase`。
+- 看門狗：無線開著就永遠重排（已連線 30 秒一次、未連線 10 秒一次），`venturaPower(true)` 也會重新
+  啟動它 → 關/開 Wi-Fi、AP 重啟都能自癒（實測 15 秒內回到 `connected-wpa2`）。
+- 憑證：`src/kext/ventura/Ath10kAutoJoin.inc`（`ATH10K_AUTOJOIN_SSID` / `..._PSK`），由建置前產生、已列入
+  `.gitignore`；換測試網路只需重新產生該檔並重建。
+
+### 6.35.3 SSID 回報（可疑的 ABI 已解）
+- 用 `apple80211_ssid_data{version, ssid_len, ssid_bytes}` 回 IOC_SSID 時，`networksetup`、`wdutil`、
+  System Settings 都把 version 的低byte 當成網路名（`Current Wi-Fi Network: \u0001`）。
+- 改成平坦佈局：offset 0 起 32 bytes 放 SSID、offset 32 放長度 → 實測 `QCA-TEST` 正確顯示。
+
+### 6.35.4 驗證（v199）
+`Ath10kConnectionState = connected-wpa2`、`Current Wi-Fi Network: QCA-TEST`、DHCP `192.168.77.75`、
+`ping 1.1.1.1` 3/3（6–19 ms）、`curl https://example.com` 200、DNS 解析正常；冷開機與電源循環後
+皆自動恢復。驗收表 A–D 仍成立；E（實機）依使用者指示暫緩。
+
+---
 
 ## 7. 下一個接手的人：照這個順序
 
