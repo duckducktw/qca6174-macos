@@ -1,14 +1,14 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-24（**第十七輪：airportd/CoreWLAN 掃描成功**。`cwscan en1` 從 `networks=0` 變成
-**14–16 個真實網路**（SSID／頻道／RSSI／WPA2 全對），airportd 的判定從 `error=102` /
-`-536870160` 變成 **`error=0`**。三個關鍵：SCAN_RESULT 的**結束碼**必須是 `EIO(5)`（不是
-`kIOReturnNotFound`）、pointer-out 路徑**不能**掉進一般緩衝分支（會 panic）、每個 pid 要有**自己的
-游標**。詳見 §6.21。第十六輪：§6.20。）
+最後更新：2026-11-25（**第二十輪：WPA2-PSK 穩定化 ＋ DHCP 卡點定位**。關聯／4-way 握手可重複成功
+（`connected-wpa2`、securityPhase 5），但 en1 拿不到 IPv4：決定性 log 是 IPConfiguration 的
+`arp_client_init(en1): unsupported network type`——沒有 ARP client 就不會啟動 DHCP client，IPv6 卻照跑，
+所以先前看起來「IPConfiguration 正常」。已把 ifnet 型別從 `IFT_IEEE80211(71)` 改成 `IFT_ETHER(6)`
+（v164），但 DHCP 仍未啟動，還有第二層條件沒找到。另更正：先前「加密鏈路 HTTP 200」其實走 en0
+（QEMU user-net），Wi-Fi 端只證明到 ping 得到 AP。詳見 §6.24。第十九輪：§6.23；第十七輪掃描：§6.21。）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v149**（`/tmp/vk149`，Acer 上，sha256 `f517336a…`）— kext 載入、en1 `UP,RUNNING`、
-airportd 走 ifnet ioctl + family 通道、`Ath10kScanMgrInit=ok`／`Visible=yes`、`Ath10kVifEventPipe` 非 0、
-**airportd 掃描 `error=0`、CoreWLAN 拿到 14–16 個網路**；v120/v146/v147/v148 都留著
+VM 現況：**v164**（`/tmp/vk164`，Acer 上，sha256 `c7daca51…`）— kext 載入、en1 `UP,RUNNING`、airportd
+掃描 `error=0`、WPA2-PSK 可關聯並完成握手、`Ath10kSecPhase="keys-in …"`；**IPv4 DHCP 尚未通**
 
 ---
 
@@ -20,8 +20,8 @@ airportd 走 ifnet ioctl + family 通道、`Ath10kScanMgrInit=ok`／`Visible=yes
 |---|---|---|
 | **A** | `Ath10kIfacePhase = "inited"`、`Ath10kStartPhase = "controller-started"` | ✅ 已達成（Apple 的 `start()` 是唯一 publisher） |
 | **B** | `ioreg -r -c IO80211Interface` ≥1 筆且有 `BSD Name`；`networksetup -listallhardwareports` 出現 Wi-Fi | ✅ 已達成（v64 起 `SCNetworkInterfaceCopyAll()` 第 3 筆 = `en1 type=IEEE80211`，Wi-Fi 硬體埠成立；一旦替它建了服務，`listallhardwareports` 會把它當「已設定」而不列，屬正常） |
-| **C** | 「系統設定 → Wi-Fi」可見、開關可操作 | 🟢 幾乎（v120 同 v115：airportd 走 ioctl、`networksetup -getairportpower en1` 回 `On`、en1 `UP,RUNNING`、`Wi-Fi` 硬體埠在。仍缺「系統設定裡親眼看到開關」的截圖：VM 沒有 VNC 客戶端、auto-login 沒生效，見 §6.15.6） |
-| **D** | 可掃描到 AP 並以 WPA2 連線取得 IP | 🟡 一半（v149：**airportd/CoreWLAN 掃描已通** —— `cwscan en1` 回 14–16 個真實網路、airportd `Completed scan … error=0`，§6.21；ASSOCIATE 仍 stub） |
+| **C** | 「系統設定 → Wi-Fi」可見、開關可操作 | ✅ 有截圖（v149 起：`kcpassword` 自動登入生效，System Settings → Wi-Fi 面板可開、開關顯示為開；掃描清單仍受系統的「重開機提示」與 airportd 過濾影響，見 §6.15.6／§6.24） |
+| **D** | 可掃描到 AP 並以 WPA2 連線取得 IP | 🟡 大部分（v164：掃描通、開放網路與 **WPA2-PSK 關聯＋4-way 握手都完成**（`connected-wpa2`、AP `authorized=1`），§6.22／§6.23；**只差 IPv4**：IPConfiguration 的 ARP client 拒收介面型別，DHCP client 不啟動，§6.24.2） |
 | **E** | 全程不改系統設定以外的東西、不需終端機、無獨立 app；最後部署回實體 ESP 並真機重驗 | ❌ 未開始（§7.4） |
 
 **一句話總結現況**：無線電在跑、Apple 的 `start()` 發布了 `en1`，而**第五輪找到了「SC 看不到介面」的真兇**：不是 SC 的分類規則、不是 80211 core 的註冊，而是介面節點上 `IOInterfaceType=71` 這個**屬性**——`SCNetworkInterface.c` 只接受 `IFT_ETHER(6)`/`IFT_IEEE1394(13)`，其他值直接 `"unknown interface type"` 把介面丟掉。改回 6 之後 SC 立刻列 `en1 type=IEEE80211`（因為它改看 controller 是否符合 `IO80211Controller`），Wi-Fi 硬體埠與服務都成立。**最後一哩是 airportd**：它透過 `IO80211Controller` 的 +0x200 ivar（`getNetworkInterface()`/`getInfraInterface()` 都只是讀這個 pointer）找裝置，而該 ivar 實測是 null。
@@ -1571,6 +1571,82 @@ ASSOCIATE accepted for 'QCA-TEST' on en1 (wpa2-psk)
 - DHCP：`ipconfig set en1 DHCP` 在 en1 仍回 `invalid operation`（`networksetup -setdhcp "Wi-Fi"`
   之後還沒生效），目前用靜態 IP + 預設路由驗證；要讓系統自己拿 IP 還得修這條。
 - 省電：工作站睡著時 AP 會壓住封包（`HTTRxIndications=0`），一有 TX 就恢復；要徹底解得關韌體 PS。
+
+---
+
+### 6.24 第二十輪（v161–v164）：WPA2-PSK 穩定化、DHCP 卡點定位、企業／SAE 的社群結論
+
+#### 6.24.1 這輪修好的
+
+- **關聯復原**：掃描被取消／失敗後 `_wmiScan.completed` 是 false，而 Scan 階段的第一道條件就是它，
+  於是每次關聯都在 5 秒後 `connection-stage-timeout` → 卡在 Failed，之後的關聯全部 EIO。現在
+  `venturaAssociate()` 進來先看 `Ath10kAssocScanRearm`：有 BSS 快取就沿用（`cache-reuse`），
+  有完成但被取消就重新 arm（`yes`）。
+- **上一輪「PSK 突然失效」其實是測試腳本的問題**：`joinlease.sh` 要把密碼當 `$1` 傳，漏傳就變成
+  「用開放網路去連 WPA2 AP」，AP 當然不收，機器回 `protected-network-not-supported`。
+- **新增 `Ath10kAssocRaw` 麵包屑**：把 ASSOCIATE 請求真正收到的欄位直接印出來，不必再猜。
+  實測 WPA2-PSK 請求：`ver=1 len=8 upper=0008 lower=0000 keylen=12 rsnlen=0`；搭配
+  `Ath10kSecCheck`（passphrase／PMK 指紋）與 `Ath10kSecPtkFp`（PTK 指紋）可以一次分辨
+  「請求錯」、「PMK 錯」、「PTK 錯」還是「金鑰沒裝」。
+
+#### 6.24.2 DHCP 的真正卡點（還沒解完）
+
+症狀：服務確實是 DHCP（`Setup:/Network/Service/DFAB0457-…/IPv4 = ConfigMethod DHCP`，介面
+`DeviceName: en1`、`Hardware: AirPort`）、`State:/Network/Interface/en1/Link = Active: TRUE`、
+`networksetup -setmanual` 也能成功把 IP 設上去——但 **DHCP client 從來沒啟動**：
+`ipconfig getpacket en1` = not found、`ipconfig getsummary en1` 只有 IPv6、AP 端 dnsmasq 一個
+DISCOVER 都沒有。
+
+決定性證據（`configd` 的 IPConfiguration，`ipconfig setverbose 1` 後）：
+
+```
+arp_client_init(en1): unsupported network type
+MANUAL en1: arp_client_init failed
+```
+
+即 **IPConfiguration 的 ARP client 不接受這個介面的 `if_data.ifi_type`**；沒有 ARP client
+就不會啟動 DHCP client。IPv6 不受影響（`RTADV en1: sending Router Solicitation` 照跑），
+所以先前看起來「IPConfiguration 有在動」，其實只動了 v6。
+
+這輪的處理：ifnet 從 `IFT_IEEE80211(71)` 改成 **`IFT_ETHER(6)`**（v164）。airportd 判斷
+「這是不是 Wi-Fi」看的是 `SIOCGIFMEDIA`（`kIOMediumIEEE80211Auto`），與這個欄位無關，所以不會
+把介面弄掉。**v164 實測 DHCP 仍未啟動**，代表還有第二層條件，或 `ifi_type` 沒真的改到——
+下一步需要一支能讀 `if_data.ifi_type` 的小工具確認實際值（`tools/if-hwtype.c` 兩個寫法在 SDK
+都編不過，需修：`SIOCGIFHWADDR` 不存在、`SIOCGIFDATA` 沒有公開常數）。
+
+#### 6.24.3 順帶更正一件事
+
+先前寫的「加密鏈路 HTTP 200」其實是走 **en0（QEMU user-net）**，不是 Wi-Fi：`netstat -rn` 的預設
+路由是 `10.0.2.2 en0`。Wi-Fi 這邊只證明到「ping 得到 AP `192.168.77.1`」。要驗 L3 上網，必須
+把預設路由指到 `192.168.77.1` 並確認封包真的從 en1 出去。
+
+#### 6.24.4 社群結論（企業 802.1X／WPA3）
+
+- itlwm #784：「Monterey 版關掉 Apple RSN 在 Ventura 正常；**開 Apple RSN 會 kernel panic**。」
+  → 走 Apple 自家 supplicant 來支援企業／WPA3，在 Ventura 是已知地雷。
+- WPA3／Wi-Fi 6-7 的 AirportItlwm 分支（laobamac、Ersiter）都只支援 Sequoia/Tahoe，靠 WCL
+  （native personality），不是 Ventura 這條 v1 介面。
+- 因此：Ventura 這支若要支援 SAE，得自己把 `Ath10kSAE*`（P256／SAE exchange）搬進這條
+  personality，並補 PMF（IGTK/BIP）；企業 802.1X 只能冒 panic 風險試 Apple RSN，或自帶
+  802.1X 堆疊，屬於獨立一輪的工作。
+
+#### 6.24.5 測試環境（重現用）
+
+- host：hostapd `QCA-TEST`（2.4 GHz ch6、WPA2-PSK/CCMP、密碼為一次性測試值）、dnsmasq
+  `192.168.77.50-.80`（router 192.168.77.1／DNS 1.1.1.1）、`iptables MASQUERADE` 出 eno1、
+  `net.ipv4.ip_forward=1`。
+- guest：`a11assoc QCA-TEST en1 20 <passphrase>`（密碼走 argv 或 stdin；`joinlease.sh` 一定要
+  帶參數，否則會用開放網路去連 PSK AP）。
+- 判讀重點：`Ath10kConnectionState`、`Ath10kSecurityPhase`、`Ath10kSecPhase`、`Ath10kAssocRaw`；
+  AP 端 `iw dev wlp9s0 station dump` 的 `authorized` 與 hostapd `-d` 的 `2/4 → 3/4` 序列。
+
+#### 6.24.6 下一步
+
+1. **DHCP**：確認 `ifi_type` 是否真的變成 6；若已是 6 仍失敗，往 IPConfiguration 的第二層條件查
+   （服務狀態、`AUTOMATIC-V4` 是否被建立、是否被 CaptiveNetworkSupport 的「interface en1 is not
+   active」擋住）。
+2. 拿到 IPv4 後把預設路由指到 `192.168.77.1`，用 `netstat`/AP 端計數確認封包真的從 en1 出去。
+3. WPA3-SAE：搬 `Ath10kSAE*`；企業 802.1X：先量 Apple RSN 的 panic 風險再說。
 
 ---
 

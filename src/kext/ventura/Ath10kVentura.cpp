@@ -411,7 +411,13 @@ ifnet_t Ath10kPCIDevice::createVenturaVifIfnet(IOService *provider)
     params.name = "en";
     params.unit = kAth10kVifIfnetUnit;
     params.family = IFNET_FAMILY_ETHERNET;   // dlil protocol attach stays known-good
-    params.type = kAth10kIfTypeIeee80211;    // while if_data.ifi_type is 802.11
+    // IFT_ETHER, not IFT_IEEE80211: IPConfiguration's ARP client refuses any other
+    // if_data.ifi_type ("arp_client_init(en1): unsupported network type"), and
+    // without an ARP client it never starts the DHCP client - the interface then
+    // only ever gets a manual address. airportd still sees a Wi-Fi interface
+    // because that decision is made from SIOCGIFMEDIA (kIOMediumIEEE80211Auto),
+    // not from this field.
+    params.type = 6;                         // IFT_ETHER
     params.output = venturaVifOutput;
     params.demux = venturaVifDemux;
     params.add_proto = venturaVifAddProto;
@@ -1860,6 +1866,20 @@ IOReturn Ath10kPCIDevice::venturaScanResult(apple80211_scan_result *result)
 IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
 {
     IOService *probe = getProvider();
+    if (request != nullptr && probe != nullptr) {
+        // What the request actually carried, before any validation: an "open join"
+        // against a protected AP is indistinguishable from a wrong struct offset
+        // unless the three fields are published.
+        char raw[128];
+        snprintf(raw, sizeof(raw), "ver=%u len=%u upper=%04x lower=%04x keylen=%u rsnlen=%u",
+                 static_cast<unsigned>(request->version),
+                 static_cast<unsigned>(request->ad_ssid_len),
+                 static_cast<unsigned>(request->ad_auth_upper),
+                 static_cast<unsigned>(request->ad_auth_lower),
+                 static_cast<unsigned>(request->ad_key.key_len),
+                 static_cast<unsigned>(request->ad_rsn_ie_len));
+        probe->setProperty("Ath10kAssocRaw", raw);
+    }
     if (request == nullptr || !_wmiLive.active)
         return kIOReturnBadArgument;
     const UInt32 ssidLength = request->ad_ssid_len;
@@ -1952,6 +1972,23 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
     // OSSymbol::withCString(NULL) faults in strnlen (measured panic at Start).
     s.error = "none";
     s.disconnect = Ath10k::DisconnectStage::None;
+    // A cancelled/failed sweep blocks the Scan stage forever (`_wmiScan.completed`
+    // is its entry condition), which turned every join after a service bounce into
+    // a 5 s stage timeout. The beacon cache is still the last sweep, so reuse it
+    // instead of wiping it: selectOpenBSS() only needs `_wmiBSS`, and a join that
+    // targets a BSS we no longer hold fails with "configured-bss-not-found" anyway.
+    if (!_wmiScan.completed && _wmiBSS.count) {
+        _wmiScan.completed = true;
+        _wmiScan.failed = false;
+        _wmiScan.cancelRequested = false;
+        _wmiScan.status = "cache-reused-for-join";
+        if (probe != nullptr)
+            probe->setProperty("Ath10kAssocScanRearm", "cache-reuse");
+    } else if (_wmiScan.completed && (_wmiScan.failed || _wmiScan.cancelRequested)) {
+        (void)venturaScan(nullptr);
+        if (probe != nullptr)
+            probe->setProperty("Ath10kAssocScanRearm", "yes");
+    }
     s.stage = Ath10k::LinkStage::Scan;
     _venturaState = APPLE80211_S_SCAN;
     if (probe != nullptr) {
