@@ -8,3 +8,4 @@ __pycache__/
 /firmware/prepared/
 /artifacts-ci/
 /artifacts-ci-dev/
+src/kext/ventura/Ath10kAutoJoin.inc
