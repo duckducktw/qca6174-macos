@@ -1975,7 +1975,12 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         } *reply = static_cast<AuthTypeReply *>(data);
         if (reply == nullptr)
             return kIOReturnBadArgument;
-        UInt32 upper = APPLE80211_AUTHTYPE_NONE;
+        // Idle must NOT answer NONE: airportd reads AUTH_TYPE in the run-up to a
+        // join and treats "no upper auth" as "this interface cannot do WPA2-PSK",
+        // then returns -3903 without ever sending ASSOCIATE (measured: the request
+        // trace ends g1(SSID) g2(AUTH_TYPE) and nothing follows).
+        UInt32 upper = APPLE80211_AUTHTYPE_OPEN | APPLE80211_AUTHTYPE_WPA_PSK |
+                       APPLE80211_AUTHTYPE_WPA2_PSK | APPLE80211_AUTHTYPE_WPA3_SAE;
         if (_connection.ssidLength && Ath10k::connectionAssociated(_connection)) {
             switch (_connection.securityAKM) {
             case 2: upper = APPLE80211_AUTHTYPE_WPA2_PSK; break;
@@ -2461,23 +2466,21 @@ SInt32 Ath10kPCIDevice::venturaCapabilities(void *data)
     memset(capabilities, 0, sizeof(*capabilities));
     capabilities->version = APPLE80211_VERSION;
     UInt8 *bits = capabilities->capabilities;
-    bits[0] = 0x01;             // +0x04 low byte of the u16: 802.11b/g
-    bits[1] = 0xee;             // +0x04 high byte: what Apple publishes for QCA-class
-    bits[2] = 0x61;             // +0x06
-    bits[3] = 0x00;
-    bits[4] = 0x00;
-    bits[5] = 0x40;             // +0x09: required by the live scan manager
-    bits[6] = 0x01;
-    bits[7] = 0x02;             // +0x0c low/high byte of 0x201
-    bits[8] = 0x00;
-    bits[9] = 0x00;
+    bits[0] = 0x6f;             // buffer +0x04 low byte of u16 0xee6f (Apple's exact byte order)
+    bits[1] = 0xee;             // buffer +0x05 high byte
+    bits[2] = 0x61;             // buffer +0x06
+    bits[3] = 0x00;             // buffer +0x07
+    bits[4] = 0x00;             // buffer +0x08
+    bits[5] = 0x40;             // buffer +0x09: required by the live scan manager
+    bits[8] = 0x01;             // buffer +0x0c low byte of u16 0x0201
+    bits[9] = 0x02;             // buffer +0x0d high byte
     // 802.11n/ac and the WPA2/CCMP set the join path looks for.
-    bits[2] |= 0x10;            // +0x06 bit 4
-    bits[2] |= 0x02;            // +0x06 bit 1
-    bits[3] |= 0x20;            // +0x07 bit 5
-    bits[3] |= 0x80;            // +0x07 bit 7
-    bits[4] |= 0x04;            // +0x08 bit 2
-    bits[5] |= 0x01;            // +0x09 bit 0
+    bits[2] |= 0x10;            // buffer +0x06 bit 4
+    bits[2] |= 0x02;            // buffer +0x06 bit 1
+    bits[3] |= 0x20;            // buffer +0x07 bit 5
+    bits[3] |= 0x80;            // buffer +0x07 bit 7
+    bits[4] |= 0x04;            // buffer +0x08 bit 2
+    bits[5] |= 0x01;            // buffer +0x09 bit 0
     if (IOService *probe = getProvider()) {
         char caps[sizeof(capabilities->capabilities) * 3 + 1];
         caps[0] = 0;
