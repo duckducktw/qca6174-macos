@@ -1707,6 +1707,66 @@ ifnet 就是 `IFT_ETHER`（`IOEthernetInterface::initIfnetParams` 的 `cmp eax,6
 
 ---
 
+### 6.26 第二十一輪追加：WPA3-SAE 的加密底層能不能用（實測 KC 符號表，已定案）
+
+「剩下的驗證協議」只有三塊：**WPA3-SAE（個人）**、**PMF/IGTK**、**802.1X 企業**。先把最不確定的那塊
+釘死——SAE 需要核心內 P-256，而 `Ath10kP256KernelBinding.hpp` 一直是
+`#error "P256 kernel binding requires explicit diagnostic compilation"`，從沒在正常 kext 用過。
+
+**量測方式（不需要開機）**：解析 `/tmp/kc2`（KC）的 213 個 fileset 條目，逐個取 `LC_SYMTAB`，
+列出 `n_type & N_EXT` 的符號與所屬 bundle。
+
+**結論 1：P-256 符號存在，但屬於 `com.apple.kec.corecrypto`，不是 `com.apple.kernel`。**
+
+| 符號 | 提供者 | 位址 |
+|---|---|---|
+| `_ccec_cp_256` | `com.apple.kec.corecrypto` | `0xffffff800370ea68` |
+| `_ccec_mult_blinded` | 同上 | `0xffffff8003715fd1` |
+| `_ccec_x963_import_pub` / `_ccec_x963_export` | 同上 | `0xffffff800371887c` / `0xffffff8003718524` |
+| `_ccec_validate_pub` / `_ccec_projectify` / `_ccec_affinify` | 同上 | …`0x370f3f0` / `0x3716d3c` / `0x370e24f` |
+| `_ccec_full_add` / `_ccec_full_sub` | 同上 | `0x3710271` / `0x3710b71` |
+| `_cczp_mul` / `_cczp_inv` / `_cczp_add` / `_cczp_sub` | 同上 | `0x373e3fb` / `0x36fae80` / `0x373d303` / `0x373edd1` |
+| `_ccn_read_uint` / `_ccrng` | 同上 | `0x3729e70` / `0x373f02c` |
+| `_ccsha256_di` / `_ccsha1_di` | **`com.apple.kernel`**（所以 WPA2 的 HMAC 一直沒問題） | `0x58 5400` / `0x5fbd30` |
+
+`scripts/prepare-kext-info.py` 的 Ventura 分支**已經宣告** `com.apple.kec.corecrypto: 1.0`（跟
+`com.apple.iokit.IO80211Family`、`com.apple.driver.corecapture` 一起），所以按 §6.12.2 的解析規則
+（OpenCore 只查 `OSBundleLibraries` 的依賴）這批符號**可以被注入 kext 綁定**——不必再改 Info.plist。
+
+**結論 2：`P256FieldAPI` 目前綁的兩個名字根本不存在。**
+
+`Ath10kP256KernelBinding::field()` 綁 `cczp_n`、`cczp_prime`，但 KC 裡 **沒有這兩個符號**（它們是
+corecrypto 標頭裡的 inline/macro，直接讀 `cczp` 結構的欄位）。所以即使把 P256 binding 打開，SAE
+也會在 OpenCore 連結階段因未解析符號而**整個 kext 被靜默跳過**（§6.21.2 #4 的同型症狀）。
+修法二選一：
+1. 直接讀結構欄位（`((cczp *)cp)->n` / `->prime`，cczp 佈局在 13.7 是 `{di, n, prime, mod_minus_2, …}`）；
+2. 換成有匯出的等價函式：`_cczp_mod`、`_cczp_sqr`、`_cczp_sqrt`、`_cczp_power_fast`（都在同一份
+   `com.apple.kec.corecrypto`，實測有 EXP）。
+
+**結論 3：802.1X 企業驗證在 Ventura 這條 personality 仍無解**（維持 §6.24.4）：Apple RSN supplicant
+在 Ventura 開起來會 panic（itlwm #784），社群 WPA3/Wi-Fi6 分支（laobamac、Ersiter）全都只做
+Sequoia/Tahoe 的 WCL personality。要嘛自帶 802.1X，要嘛冒 panic 風險。
+
+**剩下的工程量（尚未動工，程式全部已有現成件）**：
+1. 修 `P256FieldAPI`（結論 2），並讓 `Ath10kSAESession.o`、`Ath10kSAEWorker.o`、`Ath10kPMFSession.o`
+   進 Ventura build（目前 Makefile line 73-79 只在 `NATIVE=1 && VENTURA!=1` 時才編，
+   注意 §6.13.4 的 stale-object：改動後必須 `rm -rf build/ventura`）。
+2. Ventura 版的「SAE 準備」：native 的 `Ath10kNativeSAEPreparation` 綁 `AirportWCL::JoinRequest`，
+   Ventura 要改吃 `apple80211_assoc_data` 的 `ad_key`/`ad_ssid`/`ad_bssid`，其餘
+   （`initH2E` / `initLegacyPassword`，H2E 與否看 AP 的 RSNXE）可以直接用 `Ath10kSAEPrepareJob`。
+3. `Ath10kNetwork.cpp` 的三個 `#ifdef ATH10K_NATIVE` 掛鉤（Auth 階段的 `serviceNativeSAE`、
+   Assoc 階段的 `buildNativeSAEAssociation`、授權前的 `nativePMFPortReady`）要各補一份 Ventura 版本；
+   auth 幀走既有的 `submitNetworkPacket(..., true, ...)`，RX 端要從 mgmt 事件把 auth（subtype 11）
+   餵進 `Ath10kSAERadio::receive`。
+4. `venturaAssociate()` 目前把 AKM 8 當不支援；要改成 `securityAKM=8`、`secure=true`、
+   `pmfRequired=true`（SAE 強制 PMF），並沿 `Ath10kSupplicant::copyAssociationRSN/RSNXE` 產生 assoc RSN。
+5. PMF/IGTK：`Ath10kPMFSession` 是軟體 BIP，`nativeStageManagementKey` / `nativeAcceptSecurityResult`
+   那套 IGTK 收受條件要搬進 `venturaSecurity*`。
+6. 測試 AP：hostapd 改成 `wpa_key_mgmt=SAE`、`ieee80211w=2`、`sae_password=…`（現有 `QCA-TEST`
+   是 WPA2-PSK，同一台機器換設定即可）。
+
+---
+
 ## 13. 建議技能
 
 - `osx-kvm-headless-install`：VM 生命週期、qemu-nbd、SSH 進 guest。
