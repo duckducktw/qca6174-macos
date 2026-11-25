@@ -191,6 +191,9 @@ private:
     // 102/EOPNOTSUPP from IO80211Family's setPower).
     bool _venturaPowerOn = true;
     UInt32 _venturaState = APPLE80211_S_INIT;
+    UInt32 _venturaPinnedChannel = 0;
+    UInt8 _venturaPinnedBSSID[6] = {0};
+    bool _venturaPinnedBSSIDValid = false;
     UInt8 _venturaScanIndex = 0;
     // SSID that airportd handed us with Apple80211Set(SSID) before its join. The
     // join itself re-sends it inside apple80211_assoc_data; this copy exists so a
@@ -206,7 +209,7 @@ private:
     SInt32 _venturaLastRequestStatus = 0;
     // Rolling window of the last requests, so a client that stops asking after a
     // particular getter can be told apart from one that was never talking to us.
-    static constexpr UInt32 kVenTraceSlots = 16;
+    static constexpr UInt32 kVenTraceSlots = 64;
     struct VenturaTraceEntry {
         UInt32 type = 0;
         UInt32 status = 0;
@@ -215,7 +218,7 @@ private:
     // Entry-point trace: entry id, ioctl cmd word, request number, length. The
     // dispatcher trace above cannot see a request that Apple's own handler kills
     // before it reaches us, which is exactly the case that refused the join.
-    static constexpr UInt32 kVenEntryTraceSlots = 12;
+    static constexpr UInt32 kVenEntryTraceSlots = 32;
     struct VenturaEntryTrace {
         UInt32 entry = 0;
         UInt32 cmd = 0;

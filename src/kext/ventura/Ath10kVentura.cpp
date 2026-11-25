@@ -1683,8 +1683,10 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_STATE: {
+        // A state write is how a client pins the machine it is walking through;
+        // refusing it surfaces as EOPNOTSUPP (-3903) inside airportd's join.
         if (isSet)
-            return kIOReturnUnsupported;
+            return kIOReturnSuccess;
         apple80211_state_data *state = static_cast<apple80211_state_data *>(data);
         state->version = APPLE80211_VERSION;
         // Link progress, not radio power: this is what the client's join loop polls
@@ -1735,8 +1737,18 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_BSSID: {
-        if (isSet)
-            return kIOReturnUnsupported;
+        if (isSet) {
+            // airportd pins the BSS it wants before associating; a refusal here is
+            // EOPNOTSUPP at the framework layer and aborts the join with -3903.
+            const apple80211_bssid_data *want = static_cast<const apple80211_bssid_data *>(data);
+            if (want == nullptr)
+                return kIOReturnBadArgument;
+            bcopy(&want->bssid, _venturaPinnedBSSID, 6);
+            _venturaPinnedBSSIDValid = true;
+            if (IOService *probe = getProvider())
+                probe->setProperty("Ath10kPinnedBSSID", _venturaPinnedBSSID, 6);
+            return kIOReturnSuccess;
+        }
         apple80211_bssid_data *bssid = static_cast<apple80211_bssid_data *>(data);
         bssid->version = APPLE80211_VERSION;
         memset(&bssid->bssid, 0, sizeof(bssid->bssid));
@@ -2438,8 +2450,19 @@ void Ath10kPCIDevice::venturaDisassociate(bool)
 SInt32 Ath10kPCIDevice::venturaChannel(void *data, bool isSet)
 {
     apple80211_channel_data *channel = static_cast<apple80211_channel_data *>(data);
-    if (isSet)
-        return kIOReturnUnsupported;
+    if (isSet) {
+        // airportd pins the target BSS's channel before it associates. Answering
+        // kIOReturnUnsupported here is what the framework turns into EOPNOTSUPP
+        // (= airportd's -3903) before ASSOCIATE is ever built, so remember the
+        // request instead of refusing it; the channel the link actually uses comes
+        // from the assoc data and the firmware.
+        if (channel == nullptr)
+            return kIOReturnBadArgument;
+        _venturaPinnedChannel = channel->channel.channel;
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kPinnedChannel", static_cast<UInt64>(_venturaPinnedChannel), 32);
+        return kIOReturnSuccess;
+    }
     channel->version = APPLE80211_VERSION;
     channel->channel.version = APPLE80211_VERSION;
     channel->channel.channel = 0;
