@@ -1498,9 +1498,23 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
             // copy the answer back out for getters.
             VenturaRawRequest raw{};
             if (ath10kControllerCopyIn(this, static_cast<UInt64>(third), &raw, sizeof(raw)) == 0) {
-                if (IOService *probe = getProvider())
+                if (IOService *probe = getProvider()) {
                     probe->setProperty("Ath10kIoctlReqType",
                                        static_cast<UInt64>(static_cast<UInt32>(raw.type)), 32);
+                    // This is the path airportd's own requests appear on (the third
+                    // argument is a ~1.1 GB user address). Copy in and publish the
+                    // whole block: the types read out of it (255/256/387) are not
+                    // apple80211 numbers, so the layout has to be seen, not assumed.
+                    const UInt8 *bytes = reinterpret_cast<const UInt8 *>(&raw);
+                    char hex[sizeof(raw) * 3 + 1];
+                    hex[0] = 0;
+                    for (UInt32 i = 0; i < sizeof(raw); ++i) {
+                        char one[4];
+                        snprintf(one, sizeof(one), "%02x ", bytes[i]);
+                        strlcat(hex, one, sizeof(hex));
+                    }
+                    probe->setProperty("Ath10kUserArgDump", hex);
+                }
                 if (raw.len != 0 && raw.len <= 0x800 && raw.data != nullptr) {
                     UInt8 scratch[0x800];
                     bzero(scratch, sizeof(scratch));

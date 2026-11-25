@@ -2074,6 +2074,29 @@ ASSOCIATE 仍未送出。所以 airportd 的瓶頸已經從「請求被拒」變
 
 **無退化**：v185 下 `a11assoc` 仍 `state=4 (RUN)`、`192.168.77.75`、ping 2/2（3.9 ms）。
 
+### 6.33 第二十八輪：把「誰沒拿到東西」量出來
+
+這一輪不再改行為，只驗事實，結論把問題範圍縮了一半：
+
+| 量測 | 值 | 意義 |
+|---|---|---|
+| `Ath10kScanServeTrace` | `168:9 168:10 168:12 …` | 掃描結果確實有被讀走；`/var/log/wifi.log` 的 `<airport[168]>` 說明 **pid 168 就是 airportd**，所以 airportd 拿得到掃描結果 |
+| `Ath10kScanCached` / `Served` / `MgrDones` | 20 / 174 / 7 | 快取、服務、manager 完成都正常 |
+| `Ath10kEntryTrace` | `1:c03069c9:1173117960:65535 …` | 進來的請求第三個參數是 **~1.1 GB 的小數值**，即**使用者空間指標**，不是核心結構 |
+| `Ath10kUnknownReq` | `get:259` | 最後一個沒專屬處理的型別已經被接受（不再擋流程） |
+| `/var/log/wifi.log` | `Apple80211Set: seqNum 1 Total 2 chg 1 en1`（**無 Error**） | v184 之後那個一直失敗的 set 已經通過 |
+
+也就是說：**airportd 的掃描與 set 都通了，但它始終沒有送出 ASSOCIATE(20)**，`Ath10kRequestTrace`
+裡只有 getter 且以 RSSI(16) 收尾。瓶頸已確認在 airportd／CoreWLAN 的**前置判斷**，
+不是驅動拒絕、也不是掃描空。
+
+`CoreWLAN.framework` 在本機只有 `Resources`（程式碼在 dyld shared cache 裡），所以下一步要嘛
+dump cache 反 CoreWLAN，要嘛直接對 airportd 下 XPC。兩條都比重複改驅動有效。
+
+**接下來最小可行的驗證**：在使用者指標那條路徑（`third < 0xffffff0000000000`）把 copyIn 後的
+前 8 個 dword 也印出來（目前 `Ath10kArgDump` 只涵蓋核心指標），確認 airportd 那批請求的
+`req_type` 到底落在哪個偏移、是不是我們讀成 255/256/387 的那批。
+
 ---
 
 ## 13. 建議技能
