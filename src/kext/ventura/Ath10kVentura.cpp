@@ -1509,8 +1509,28 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_SSID: {
-        if (isSet)
-            return kIOReturnUnsupported;
+        if (isSet) {
+            // airportd's join is "Apple80211Set(SSID) then Apple80211Set(AUTH_TYPE)
+            // then ASSOCIATE". Refusing the set was fatal and silent: /var/log/wifi.log
+            // shows `Error Apple80211Set: Operation not supported seqNum 1 Total 2
+            // chg 1 en1` on every `networksetup -setairportnetwork`, and airportd
+            // then reported -3903 without ever sending ASSOCIATE (Ath10kRequestTrace
+            // contained no `s20`). The SSID that matters for the join is re-sent
+            // inside apple80211_assoc_data, so accept and remember it for diagnostics.
+            const apple80211_ssid_data *ssid = static_cast<const apple80211_ssid_data *>(data);
+            if (ssid == nullptr || ssid->ssid_len > APPLE80211_MAX_SSID_LEN)
+                return kIOReturnBadArgument;
+            const UInt32 bytes = ssid->ssid_len;
+            bzero(_venturaPendingSSID, sizeof(_venturaPendingSSID));
+            bcopy(ssid->ssid_bytes, _venturaPendingSSID, bytes);
+            _venturaPendingSSIDLength = static_cast<UInt8>(bytes);
+            if (IOService *probe = getProvider()) {
+                probe->setProperty("Ath10kSetSSIDLength", static_cast<UInt64>(bytes), 32);
+                probe->setProperty("Ath10kSetSSID",
+                                   _venturaPendingSSID[0] ? (const char *)_venturaPendingSSID : "");
+            }
+            return kIOReturnSuccess;
+        }
         apple80211_ssid_data *ssid = static_cast<apple80211_ssid_data *>(data);
         ssid->version = APPLE80211_VERSION;
         // Returning an empty SSID made `networksetup -getairportnetwork` print a

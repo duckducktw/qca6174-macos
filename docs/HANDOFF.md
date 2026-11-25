@@ -1901,6 +1901,32 @@ OP_MODE(15) → POWER(19)**，一個 `s` 都沒有。也就是 airportd 在這�
 `CARD_CAPABILITIES(12)` 決定要不要顯示/允許 WPA2-PSK，若 WPA/WPA2 位元沒開就會直接放棄；
 其次是 `AUTH_TYPE(2)` 與 `OP_MODE(15)` 的回值。這兩個都是純資料填充，改完一次 build 就能驗。
 
+#### 6.28.4 v170：SSID set 已經接受，但那個失敗的 `Apple80211Set` 在驅動之上
+
+`/var/log/wifi.log`（airportd 自己寫的，比 unified log 可靠）在每次
+`networksetup -setairportnetwork` 後都會留一行：
+
+```
+Error Apple80211Set: Operation not supported seqNum 1 Total 2 chg 1 en1
+```
+
+v170 把 `APPLE80211_IOC_SSID` 的 **set** 從 `kIOReturnUnsupported` 改成接受並記到
+`_venturaPendingSSID`（另有 `Ath10kSetSSIDLength`/`Ath10kSetSSID` 兩個 breadcrumb）。結果：
+
+- `Ath10kSetSSIDLength` **完全沒出現** → SSID set 沒到驅動。
+- `Ath10kRequestTrace` 依舊全是 getter（`g12 g19 g96 g1 g2 g15 g4 …`），沒有任何 `s`。
+- `Ath10kIoctlType = 2`（`APPLE80211_IOC_AUTH_TYPE`）、`Ath10kIoctlCalls = 267`、
+  `Ath10kIoctlArgs = "skywalk a=… b=c03069c9 c=… d=ffff"` → 批次裡確實有一發是
+  AUTH_TYPE，而且 family 是把 **set 用 get 的 ioctl 碼**（`0xc03069c9`）丟進來的。
+
+所以 -3903 的否決發生在 **airportd 或 live family 內部**，不是我們的 dispatcher：
+`chg 1` 的那一發（批次第 2 個、型別未知）被 family 以 EOPNOTSUPP 回掉，airportd 就放棄。
+
+**下一步**：在介面/控制器的 ioctl 入口（`Ath10kVenturaInterface::apple80211_ioctl` 與
+`performCommand` 的 4 參數 shim，`Ath10kIoctlArgs*` 已在那裡）把**每一發**（含被抓走、
+沒進 dispatcher 的）型別記下來，找出 `chg 1` 是哪個 type；那一個補上回應後 airportd 才會真的
+送 ASSOCIATE（`s20`）。
+
 ---
 
 ## 13. 建議技能

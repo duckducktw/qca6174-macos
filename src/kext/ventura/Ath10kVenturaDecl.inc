@@ -187,6 +187,11 @@ private:
     bool _venturaPowerOn = true;
     UInt32 _venturaState = APPLE80211_S_INIT;
     UInt8 _venturaScanIndex = 0;
+    // SSID that airportd handed us with Apple80211Set(SSID) before its join. The
+    // join itself re-sends it inside apple80211_assoc_data; this copy exists so a
+    // missing/failed ASSOCIATE can be told apart from "the set never arrived".
+    UInt8 _venturaPendingSSID[APPLE80211_MAX_SSID_LEN + 1] = {};
+    UInt8 _venturaPendingSSIDLength = 0;
     // Request breadcrumbs: airportd reports "Off (forced)" when the power
     // request never reaches the driver, and there is no other channel to tell
     // "no request arrived" from "request refused".
