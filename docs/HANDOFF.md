@@ -2677,3 +2677,21 @@ RUNTIME STOP reason=protected-network-not-supported
 → `StartMonitoringEvent(ref, APPLE80211_M_ASSOC_DONE /*9*/)` 與 `M_LINK_CHANGED /*4*/`
 → `Associate2(...)`，再看回傳值是否為 0。這才是能真正量到「join 打通」的 harness；
 `a2join` 因為沒有監聽者，永遠會看到 -3905。
+
+#### 6.42.5 本輪結束時的實測狀態（v228）
+
+```
+./a2mon QCA-TEST        → eventinit rc=0（事件監聽初始化成功）
+                          StartMonitoringEvent 之後程式停住，沒有回到 assoc2 那一行
+./a2join QCA-TEST       → 每個變體都是 elapsed=10.2s rc=-3905（沒有監聽者，註定逾時）
+./cwjoin QCA-TEST en1   → assoc-ok=0 -3903，但 ssid-now=QCA-TEST rssi=-41（連線其實是通的）
+```
+
+- 驅動端：join 約 2 秒完成、事件也送得出去（`Ath10kLinkEvent = up=1 kev(link=0 assoc=0)`）。
+- `a2mon` 證明 `Apple80211EventMonitoringInit2(ref, port, 0, 0)` 會回 0，但接著呼叫
+  `StartMonitoringEvent` 就卡住 —— 第二個參數不能直接給 `mach_task_self()`，
+  下一個要試的是 airportd 用的那個 port／runloop 組合（`Apple80211EventMonitoringInit2` 的
+  `rdx/rcx` 在 §6.42.4 已反組譯出位置，但語意還沒確認）。
+
+工具：`tools/a2mon.c`（含事件監聽的呼叫端）、`tools/a2spy.c`（嘗試 interpose 字典查詢，於 shared cache
+的 direct bind 無效）、`tools/refflags.c`（量 ref+0x50 的能力鏡像佈局）、`tools/jointime2.sh`（量 join 延遲）。
