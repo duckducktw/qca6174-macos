@@ -7,7 +7,7 @@ userspace 白名單（`Apple80211Set` 對 type 20 直接記 log 回 `-3903`，�
 自動連上、`Current Wi-Fi Network: QCA-TEST`、DHCP 192.168.77.75、ping 1.1.1.1 3/3、https 200、
 DNS 正常；關/開 Wi-Fi 後 15 秒自動重連。）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v200**（`/tmp/vk200`，Acer 上，sha256 `75e46c62c14153de5f05d7ad54fba459a9ba7284b7a06a29466361f98a3854c3`；與 v199 同一個二進位）— kext 載入、
+VM 現況：**v208**（`/tmp/vk200`，Acer 上，sha256 `75e46c62c14153de5f05d7ad54fba459a9ba7284b7a06a29466361f98a3854c3`；與 v199 同一個二進位）— kext 載入、
 en1 `UP,RUNNING`、驅動自連 `connected-wpa2`、SSID 正確回報、DHCP＋上網已通
 第十九輪：§6.23；第十七輪掃描：§6.21；§1 條件 D ✅ 的推導見 §6.25；第三十輪：§6.35
 
@@ -1069,6 +1069,31 @@ scan manager 裡，driver 不再「按需求送 SCAN_RESULT」，而是由 manag
 皆自動恢復。Wi-Fi 單獨可用也驗過：`ping -S 192.168.77.75 1.1.1.1` 3/3、`curl --interface en1`
 回 200（local_ip=192.168.77.75）、`nc -z 1.1.1.1 443` 成功。驗收表 A–D 仍成立；E（實機）依使用者
 指示暫緩。
+
+---
+
+## 6.36 第三十一輪（同日）：P-256 在核心裡真的能算、SAE/PMF 進 Ventura、開機 panic 收斂
+
+- **P-256（SAE 的地基）已可用**：`Ath10kP256KernelBinding` 原本綁 `cczp_n`/`cczp_prime`，這兩個是 macro
+  不是符號（KC 裡不存在）。改成讀 `cczp` 欄位後仍失敗——實測 `ccec_cp_256()` 回傳的物件第一個 word
+  是 limb 數（4），接下來是 `0x100` 與一個 kernel pointer，**不是** header 描述的 `{di,n,prime}`。
+  由於 `P256FieldCandidate::run()` 只用 `units`/`prime` 做驗證（真正的運算走 `cczp_mul(curve,…)`），
+  直接回常數 `units=4`、`prime= P-256 modulus` 即可。`ccn_read_uint` 另需 adapter（真實原型吃
+  `const uint8_t*`，shared API 的欄位是 `const void*`）。**v208 實測 `Ath10kP256SelfTest = mul-ok`**
+  （2·3 mod p = 6），且 WPA2 連線不受影響。
+- **SAE/PMF 目標檔已進 Ventura**：`Ath10kSAEWorker/Ath10kSAESession/Ath10kPMFSession` 併入
+  `VENTURA_OBJECT`，定義 `-DATH10K_P256_DIAGNOSTIC_BINDING=1`；`strings` 可見到
+  `Ath10kSAESession`/`Ath10kSAEJob`/`Ath10kSAEPrepareJob`/`Ath10kPMFSession`/`Ath10kPMFJob`。
+  **尚未接線**：`venturaAssociate()` 仍把 `ad_auth_upper` bit12（SAE）當 PSK 處理，缺
+  commit/confirm 管理框交換與 `beginEAPOL`/`copyPMK` 流程。
+- **開機 panic 收斂**：三份 panic 都在 `publishVenturaVifBsdUnit +0x685` →
+  `IOSkywalkNetworkInterface::prepareBSDInterface +0x1a`（CR2=0x4c，vif 沒有 Skywalk extra）。
+  en1 不需這條接手即可運作，改成 `ath10kvifbsd=1` 診斷專用，平常回報
+  `Ath10kVifBsdPhase=skipped-guarded`；v204 起多次重啟未再 panic。
+- **多網路**：開機參數 `ath10kjoin=ssid:psk,ssid2:psk2`（≤4 組），改 config.plist 即可換網路；
+  VM 實測 `Ath10kJoinList = boot-args entries=2 first=QCA-TEST` 仍正常連線。
+- **真機 ESP 已部署**（`nvme0n1p3`）：kext v204、`Kernel/Add … Enabled=True`、boot-args 帶
+  `ath10kjoin=…`；備份在 `/root/ath10k-real-esp-backup-20261126-084903`。**尚未重開機驗證**。
 
 ---
 
