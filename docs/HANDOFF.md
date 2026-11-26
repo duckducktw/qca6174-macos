@@ -2656,3 +2656,24 @@ RUNTIME STOP reason=protected-network-not-supported
 2. airportd 的 `-3903`：已確認與金鑰無關（fallback 生效、連線成功），要往
    `setAssociateRequest` 之外的 userspace 分支查；§6.40.2 的出口 A（密碼 nil）用 `Airport keychain`
    已排除，剩下出口 B 之外的授權類檢查（`0xa46d` / `0xa62d` / `0xafe5` 那幾個 `-3903` 常量）。
+
+#### 6.42.4 下一步的實作細節（已反組譯，可直接照做）
+
+`Apple80211EventMonitoringInit2`（映像位移 `0x1d5f7`）的參數是
+`(ref, rsi≠0, rdx, rcx)`：
+
+```
+01d614  rbx = rdi (ref)
+01d611  r15 = rsi   ; 必須非 0（0x1d6ac: test r15,r15; je → -3900）
+01d60e  r13 = rdx
+01d60b  r12 = rcx
+01d6b5  cmp dword [ref], 0 ; js → 錯誤     ; ref 版本檢查
+01d6d0  cmp qword [ref+0x180], 0 / [ref+0x38], 0 / [ref+0x30]  ; 事件欄位必須為空（重複 init 會失敗）
+01d6e8  call 0x8dd33                       ; 內部初始化
+01d6f0  call 0x8de76(ref, rcx, 0)          ; 註冊
+```
+
+所以驗證程式要：`Apple80211Open` → `BindToInterface` → `EventMonitoringInit2(ref, <port/非0>, <runloop 或 0>, <mode>)`
+→ `StartMonitoringEvent(ref, APPLE80211_M_ASSOC_DONE /*9*/)` 與 `M_LINK_CHANGED /*4*/`
+→ `Associate2(...)`，再看回傳值是否為 0。這才是能真正量到「join 打通」的 harness；
+`a2join` 因為沒有監聽者，永遠會看到 -3905。
