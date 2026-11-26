@@ -762,6 +762,14 @@ void Ath10kPCIDevice::venturaP256SelfTest()
     }
 }
 
+static UInt64 ath10kNowMs()
+{
+    uint64_t now = 0, ns = 0;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now, &ns);
+    return ns / 1000000u;
+}
+
 void Ath10kPCIDevice::venturaParseJoinList()
 {
     if (_venturaJoinParsed)
@@ -876,6 +884,37 @@ void Ath10kPCIDevice::runVenturaAutoJoin()
     // Radio has to be on for the firmware to accept the vdev start.
     if (!_venturaPowerOn)
         venturaPower(true);
+
+    if (ath10kNowMs() < _venturaAutoJoinSuppressUntilMs) {
+        probe->setProperty("Ath10kAutoJoinPhase", "suppressed-for-airportd");
+        if (_venturaPowerOn) {
+            uint64_t deadline = 0;
+            clock_interval_to_deadline(5, kSecondScale, &deadline);
+            thread_call_enter_delayed(_venturaAutoJoinCall, deadline);
+        }
+        return;
+    }
+
+    // ath10knoauto=1 keeps the driver's own join out of airportd's way. Measured:
+    // with the driver auto-joining, airportd refuses the user's click with
+    // error 37 "Already associated, and network transition not permitted"
+    // (WIFI log: AUTO-JOIN: Auto-join aborted ... error=(37 ...)), which the API
+    // reports as -3903. The watchdog stays alive so the link still comes back if
+    // nothing else joins.
+    {
+        char knob[8];
+        bzero(knob, sizeof(knob));
+        if (PE_parse_boot_argn("ath10knoauto", knob, sizeof(knob) - 1) &&
+            knob[0] != '0') {
+            probe->setProperty("Ath10kAutoJoinPhase", "disabled-by-bootarg");
+            if (_venturaPowerOn) {
+                uint64_t deadline = 0;
+                clock_interval_to_deadline(10, kSecondScale, &deadline);
+                thread_call_enter_delayed(_venturaAutoJoinCall, deadline);
+            }
+            return;
+        }
+    }
 
     venturaParseJoinList();
     const char *ssid = ATH10K_AUTOJOIN_SSID;
@@ -1201,13 +1240,41 @@ SInt32 Ath10kPCIDevice::venturaRecordRequest(UInt requestType, int requestNumber
     // after request N" is only diagnosable from the sequence, not from the last
     // single request. airportd's scans begin with a batch of small getters, and a
     // refused one there aborts the scan without ever sending SCAN_REQ.
+    const UInt32 callerPid = static_cast<UInt32>(proc_selfpid());
     _venturaTrace[_venturaTraceNext].isSet = requestType == 1;
     _venturaTrace[_venturaTraceNext].type = static_cast<UInt32>(requestNumber);
     _venturaTrace[_venturaTraceNext].status = static_cast<UInt32>(status);
+    _venturaTrace[_venturaTraceNext].pid = callerPid;
     _venturaTraceNext = (_venturaTraceNext + 1) % kVenTraceSlots;
     if (_venturaTraceCount < kVenTraceSlots)
         ++_venturaTraceCount;
+    // Client-only history (see VenturaClientTraceEntry): published so the sequence
+    // airportd walks right before it refuses a join survives its own polling.
+    if (callerPid != 0) {
+        _venturaClientTrace[_venturaClientTraceNext].isSet = requestType == 1;
+        _venturaClientTrace[_venturaClientTraceNext].type = static_cast<UInt32>(requestNumber);
+        _venturaClientTrace[_venturaClientTraceNext].status = static_cast<UInt32>(status);
+        _venturaClientTrace[_venturaClientTraceNext].pid = callerPid;
+        _venturaClientTraceNext = (_venturaClientTraceNext + 1) % kVenClientTraceSlots;
+        if (_venturaClientTraceCount < kVenClientTraceSlots)
+            ++_venturaClientTraceCount;
+    }
     if (IOService *provider = getProvider()) {
+        char clientTrace[kVenClientTraceSlots * 32];
+        clientTrace[0] = 0;
+        const UInt32 firstClient = (_venturaClientTraceCount == kVenClientTraceSlots)
+                                       ? _venturaClientTraceNext : 0;
+        for (UInt32 i = 0; i < _venturaClientTraceCount; ++i) {
+            const UInt32 slot = (firstClient + i) % kVenClientTraceSlots;
+            char item[32];
+            snprintf(item, sizeof(item), "%s%u:%u:%x ",
+                     _venturaClientTrace[slot].isSet ? "s" : "g",
+                     _venturaClientTrace[slot].type,
+                     static_cast<unsigned>(_venturaClientTrace[slot].pid),
+                     _venturaClientTrace[slot].status);
+            strlcat(clientTrace, item, sizeof(clientTrace));
+        }
+        provider->setProperty("Ath10kClientTrace", clientTrace);
         char trace[kVenTraceSlots * 24];
         trace[0] = 0;
         const UInt32 first = (_venturaTraceCount == kVenTraceSlots) ? _venturaTraceNext : 0;
@@ -2022,7 +2089,8 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         state->version = APPLE80211_VERSION;
         // Link progress, not radio power: this is what the client's join loop polls
         // until it reaches APPLE80211_S_RUN.
-        _venturaState = venturaStageState(_connection);
+        _venturaState = _venturaDisassociated ? APPLE80211_S_INIT
+                                              : venturaStageState(_connection);
         state->state = _venturaState;
         return kIOReturnSuccess;
     }
@@ -2058,7 +2126,8 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         {
             UInt8 *flat = reinterpret_cast<UInt8 *>(data);
             bzero(flat, 40);
-            const UInt32 n = (_connection.ssidLength && Ath10k::connectionAssociated(_connection))
+            const UInt32 n = (!_venturaDisassociated && _connection.ssidLength &&
+                              Ath10k::connectionAssociated(_connection))
                                  ? (_connection.ssidLength > 32 ? 32 : _connection.ssidLength)
                                  : 0;
             if (n)
@@ -2083,7 +2152,7 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         apple80211_bssid_data *bssid = static_cast<apple80211_bssid_data *>(data);
         bssid->version = APPLE80211_VERSION;
         memset(&bssid->bssid, 0, sizeof(bssid->bssid));
-        if (Ath10k::connectionAssociated(_connection))
+        if (!_venturaDisassociated && Ath10k::connectionAssociated(_connection))
             bcopy(_connection.bssid, &bssid->bssid, 6);
         return kIOReturnSuccess;
     }
@@ -2107,7 +2176,7 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
             probe->setProperty("Ath10kCurrentNetReqLen",
                                static_cast<UInt64>(_venturaIoctlLength), 32);
         *reinterpret_cast<UInt32 *>(out) = APPLE80211_VERSION;
-        const bool associated = Ath10k::connectionAssociated(_connection);
+        const bool associated = !_venturaDisassociated && Ath10k::connectionAssociated(_connection);
         *reinterpret_cast<UInt32 *>(out + 4) = associated ? 1 : 0;
         if (!associated)
             return kIOReturnSuccess;
@@ -2706,14 +2775,6 @@ bool Ath10kPCIDevice::venturaBSSProtected(const UInt8 *ssid, UInt32 length,
     return false;
 }
 
-static UInt64 ath10kNowMs()
-{
-    uint64_t now = 0, ns = 0;
-    clock_get_uptime(&now);
-    absolutetime_to_nanoseconds(now, &ns);
-    return ns / 1000000u;
-}
-
 IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
 {
     IOService *probe = getProvider();
@@ -2914,6 +2975,7 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
         }
     }
 
+    _venturaDisassociated = false;
     auto &s = _connection;
     s.ssidLength = static_cast<UInt8>(ssidLength);
     for (UInt32 i = 0; i < sizeof(s.ssid); ++i)
@@ -2990,6 +3052,16 @@ void Ath10kPCIDevice::venturaDisassociate(bool)
     // as a connected/disabled flap every few seconds on v215-v226. The teardown a real
     // join needs is requested by venturaAssociate() through its defer path instead.
     _venturaPendingAssocValid = false;
+    _venturaDisassociated = true;
+    // Give airportd the idle interface it expects before it associates: tear the link
+    // down for real (its log says "Successfully disassociated" either way, but the
+    // firmware kept the vdev up, so its next join was refused with error 37), and keep
+    // this driver's own watchdog out of the way while it works.
+    _venturaAutoJoinSuppressUntilMs = ath10kNowMs() + 60000;
+    if (_connection.stage > Ath10k::LinkStage::Scan || _connection.vdevUp) {
+        _connection.error = "user-disassociate";
+        _connection.cancelRequested = true;
+    }
     venturaPublishState(APPLE80211_S_INIT);
 }
 
@@ -3085,6 +3157,13 @@ SInt32 Ath10kPCIDevice::venturaCapabilities(void *data)
     bits[3] |= 0x80;            // buffer +0x07 bit 7
     bits[4] |= 0x04;            // buffer +0x08 bit 2
     bits[5] |= 0x01;            // buffer +0x09 bit 0
+    // Apple80211Associate2's security dispatch (image offset 0x980a, the case for
+    // security type 8) refuses the join with 0xfffff0c1 (-3903) unless bit 3 of the
+    // byte at ref+0x59 is set. Measured with tools/refflags.c: the capability reply is
+    // mirrored at ref+0x54, so ref+0x59 == capabilities[5] - this byte. Without it the
+    // join dies in userspace: airportd's client trace shows its requests ending at
+    // s22 (Associate2's own cleanup disassociate) with no ASSOCIATE ever sent.
+    bits[5] |= 0x08;            // buffer +0x09 bit 3 -> ref+0x59 bit 3
     if (IOService *probe = getProvider()) {
         char caps[sizeof(capabilities->capabilities) * 3 + 1];
         caps[0] = 0;
@@ -3460,6 +3539,29 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
                            static_cast<UInt64>(reinterpret_cast<uintptr_t>(vif)), 64);
     }
     IOLog("Ath10kMac: infra attach vif %p -> %d\n", vif, (int)attached);
+    // setAssociateRequest() gates the forward on one predicate:
+    //     rcx = [[vif+0x110] ; ivars]  ->  rdi = [rcx+0x30]
+    //     call [rdi->vptr + 0x1e0]     ->  true ? return 16 : forward
+    // (live 0xffffff8001fe2606..0x1fe2639). Returning 16 is what airportd shows as
+    // -3903 with no ASSOCIATE ever reaching a driver, so measure it and publish the
+    // answer and the object it is asked of.
+    if (*ivarsSlot != nullptr) {
+        void *gate = *reinterpret_cast<void **>(reinterpret_cast<char *>(*ivarsSlot) + 0x30);
+        int gateResult = -1;
+        if (gate != nullptr) {
+            void **gateVtable = *reinterpret_cast<void ***>(gate);
+            if (gateVtable != nullptr && gateVtable[0x1e0 / 8] != nullptr) {
+                using GateFn = bool (*)(void *);
+                gateResult = reinterpret_cast<GateFn>(gateVtable[0x1e0 / 8])(gate) ? 1 : 0;
+            }
+        }
+        if (probe) {
+            char note[96];
+            snprintf(note, sizeof(note), "gate=%p result=%d", gate, gateResult);
+            probe->setProperty("Ath10kAssocGate", note);
+        }
+        IOLog("Ath10kMac: assoc gate obj=%p result=%d\n", gate, gateResult);
+    }
     // Live setAssociateRequest() (0xffffff8001fe2533) does not use
     // getPrimarySkywalkInterface() to find the station interface: it reads the
     // controller ivar at +0x1a0 directly, requires that object to be a virtual

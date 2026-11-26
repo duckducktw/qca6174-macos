@@ -125,6 +125,18 @@ private:
     // implementation: without them Apple80211Associate2 times out with -3905).
     void venturaPostLinkEvents(bool up);
     IO80211LinkState _venturaLinkState = kIO80211NetworkLinkUndefined;
+    // DISASSOCIATE(22) only publishes state (a real teardown made airportd's
+    // routine disassociates knock the link over). The link therefore stays up,
+    // so the getters have to *report* the interface as idle or a client that
+    // checks "is the SSID empty now?" concludes the disconnect failed and aborts
+    // its join - measured: airportd's last requests before -3903 were
+    // s22, g1 (SSID), g103 (CURRENT_NETWORK), g1 (SSID).
+    bool _venturaDisassociated = false;
+    // While airportd is driving a join it disassociates first. Our own auto-join
+    // must not race it: without this the link comes back up immediately and
+    // airportd aborts the user's join with error 37 "Already associated, and
+    // network transition not permitted" (measured in its WiFiManager log).
+    UInt64 _venturaAutoJoinSuppressUntilMs = 0;
     void venturaPendingJoinService(UInt64 nowMs);
     void venturaDisassociate(bool deauth);
     IOReturn venturaScanResult(apple80211_scan_result *result);
@@ -263,8 +275,21 @@ private:
     struct VenturaTraceEntry {
         UInt32 type = 0;
         UInt32 status = 0;
+        UInt32 pid = 0;
         bool isSet = false;
     } _venturaTrace[kVenTraceSlots]{};
+    // Same ring, but only the requests a *user-space* client made (pid != 0). The
+    // 64-slot window above is consumed by airportd's getter polling within a second,
+    // so "what did airportd ask right before it gave up" needs its own history.
+    static constexpr UInt32 kVenClientTraceSlots = 16;
+    struct VenturaClientTraceEntry {
+        UInt32 type = 0;
+        UInt32 status = 0;
+        UInt32 pid = 0;
+        bool isSet = false;
+    } _venturaClientTrace[kVenClientTraceSlots]{};
+    UInt32 _venturaClientTraceNext = 0;
+    UInt32 _venturaClientTraceCount = 0;
     // Entry-point trace: entry id, ioctl cmd word, request number, length. The
     // dispatcher trace above cannot see a request that Apple's own handler kills
     // before it reaches us, which is exactly the case that refused the join.

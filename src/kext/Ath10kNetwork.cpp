@@ -1255,6 +1255,13 @@ const char *Ath10kPCIDevice::serviceDisconnect(UInt64 nowMs)
         if(!_connectionEcho.replyReceived || _rxSetup.pendingMPDUs)return nullptr;
         Ath10k::resetDisconnected(s);_connectionEcho={};_controlOwner=nullptr;
         IOLog("Ath10kMac: DISCONNECT complete count=%u; runtime and RX ring retained, ready to reconnect\n",s.disconnectCount);
+#ifndef ATH10K_NATIVE
+        // Report the link as down. Without this the framework keeps the interface's
+        // link state at "up" and airportd refuses the user's next join with
+        // error 37 "Already associated, and network transition not permitted"
+        // (measured in its WiFiManager log while the driver itself said "disabled").
+        venturaPostLinkEvents(false);
+#endif
     }else{
         s.disconnect=static_cast<DisconnectStage>(static_cast<UInt32>(s.disconnect)+1);
         if(!s.secure && s.disconnect==DisconnectStage::ClearPair)s.disconnect=DisconnectStage::DeletePeer;

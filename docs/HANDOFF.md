@@ -1,5 +1,10 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
+**第三十九輪（§6.44）補記**：`-3903` 的真正來源是 **airportd 自己的 error 37「Already associated, and network
+transition not permitted」**（`log show --predicate 'process == "airportd"'` 直接寫出來），不是驅動回的。
+原因：驅動的 auto-join 先連上 + disassociate 沒真的拆鏈路。已加「拆鏈路 + 壓住 auto-join 60 秒」，
+並在斷線時補送 LINK_CHANGED。另一個線索：airportd 眼中的目標 BSS 是 `BSSID:01:00:00:00:00:00 channel:0`。
+
 **第三十七輪（§6.42）補記**：驅動端 join 只要 **約 2 秒**，但 `Apple80211Associate2` 每次都等 **10.2 秒**
 然後回 `-3905`（errno 60＝讀事件逾時）——缺的是**完成事件**，不是關聯失敗。
 已補 `M_LINK_CHANGED`/`M_ASSOC_DONE` 的 kern_event 發送（`Ath10kLinkEvent = up=1 kev(link=0 assoc=0)`）、
@@ -2717,3 +2722,53 @@ RUNTIME STOP reason=protected-network-not-supported
 （`setLinkStateGated` / `eventHandler`）、`AirportItlwm/AirportSTAIOCTL.cpp`
 （`setASSOCIATE` / `getASSOCIATE_RESULT` / `getLINK_CHANGED_EVENT_DATA`）、
 `include/Airport/IO80211SkywalkInterface.h`（`postMessage(UInt,void*,unsigned long,bool)`）。
+
+### 6.44 第三十九輪：airportd 自己的 log 講出了 -3903 的真相（error 37）
+
+#### 6.44.1 決定性證據
+
+`log show --predicate 'process == "airportd"'` 抓到的序列（`tools/whyfail.sh` 之後固定用這招）：
+
+```
+setJoinEvent: Joining QCA-TEST (details:NetworkName:QCA-TEST
+    BSSDetails:{BSSID:01:00:00:00:00:00,Channel:0((null) Ghz),RSSI:0})
+Successfully disassociated on interface en1
+AUTO-JOIN: Auto-join triggered (trigger=assoc_failure)
+AUTO-JOIN: Auto-join aborted (requeued=0, cancelled=0,
+    error=(37 'Already associated, and network transition not permitted'))
+```
+
+- **`-3903` 不是 driver 回的**，是 airportd 因為 **error 37「已經關聯，不允許切換網路」** 自己拒絕。
+- 原因有兩個，都是我們的行為造成的：
+  1. **驅動自己先把 link 連上（auto-join）**，airportd 看到 link up 就判定「已關聯」。
+  2. **disassociate 只發狀態、沒拆鏈路**（v227 的折衷），所以 airportd拆完再看仍然是 up。
+- 另外 `BSSDetails:{BSSID:01:00:00:00:00:00, Channel:0, RSSI:0}` 顯示
+  **airportd 眼中的目標 BSS 沒有有效 BSSID/頻道**（`cwscan` 也印 `bssid=(null)`），
+  這一項還沒修，可能是下一個 blocker。
+
+#### 6.44.2 這輪的修改（v230–v237）
+
+| 版本 | 內容 |
+|---|---|
+| v230 | 對齊 itlwm：`setLinkState`/`setRunningState`/`postMessage(NULL)`、`ASSOCIATE_RESULT` 改成 RUN 才成功、實作 `LINK_CHANGED_EVENT_DATA(156)` |
+| v231 | `Ath10kClientTrace`：只記使用者態 client 請求的環形緩衝（type + pid + status），airportd 的 getter 海嘯洗不掉 |
+| v232 | `DISASSOCIATE` 後 getter 回報「Idle」（SSID/BSSID/CURRENT_NETWORK/STATE），link 本身不動 |
+| v234 | 量到 `setAssociateRequest` 的轉發 predicate（`[vif ivars+0x30]` 物件的 `[vptr+0x1e0]`）＝ **false**（否證一個假設） |
+| v235 | `ath10knoauto=1` 開關（boot-arg），可暫時關掉驅動自己的 auto-join |
+| v236 | 真的拆鏈路 + **壓住自家 auto-join 60 秒**（`Ath10kAutoJoinPhase=suppressed-for-airportd`） |
+| v237 | 斷線時補送 `LINK_CHANGED`/`setLinkState(Down)`（`Ath10kLinkEvent = up=0 link=1`） |
+
+#### 6.44.3 官方 log 是最省力的一條路
+
+airportd 的 driver-message tracer 從沒初始化，但**它自己的 WiFiManager / WiFiPolicy / CoreWLAN 訊息都有進 unified log**，
+`log show --last 60s --predicate 'process == "airportd"'` 就能看到它每一步的判斷，
+比逆向 `Apple80211Associate2` 快得多。這一輪之後，診斷 join 一律先看這條 log。
+
+#### 6.44.4 下一步
+
+1. **修掉 `cwscan` 的 `bssid=(null)`**：airportd 說目標 BSS 的 BSSID 是 `01:00:00:00:00:00`、channel 0，
+   而我們的 `venturaScanResult()` 明明有寫 `asr_bssid`（offset 0x1c）。
+   很可能是 **live client 讀的 scan_result ABI 和 `MacKernelSDK` 標頭不同**，
+   要用 `tools/imgdump2.c` dump `Apple80211.framework` 的 `Apple80211Scan` 本體、比對它讀哪個位移。
+2. 在那之後再測一次 `cwjoin`：若 error 37 消失、ASSOCIATE 真的送到驅動（`Ath10kClientTrace` 出現 `s20`），
+   join 就通了。
