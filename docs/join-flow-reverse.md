@@ -299,3 +299,63 @@ printf '%s\n' "$PW" | ./cwjoin <SSID> en1           # 印完整 NSError
 5. **密碼永不進 argv／輸出**：`a11assoc`、`cwjoin` 都從 stdin 讀。
 6. **`apple80211VirtualRequest` 的第一個參數是 cmd 字**，不是 1/0（v187 的教訓）。
 7. **`apple80211VirtualRequestIoctl` 不是 virtual**，`override` 會編譯失敗；別再試。
+
+---
+
+## 11. 第三十三輪追加：`Apple80211Associate2` 才是 airportd 用的入口，而且它自己送 type 20
+
+`nm -u /usr/libexec/airportd` 匯入的 Apple80211 符號共 33 個，其中包含 **`_Apple80211Associate2`**。
+所以 §8 的「ASSOCIATE 從來沒送出」要修正成：**airportd 走 Associate2，不走 `Apple80211Set(20)`**。
+
+### 11.1 Associate2 的實際行為（反組譯＋實測）
+
+- 映像位移 `0x8b3a`（base 由 `dlsym("Apple80211Set")` 反推可得）。
+- 在堆疊建 **0x250-byte `apple80211_assoc_data`**，欄位由傳入的 CFDictionary 填。
+- 失敗善後呼叫 **`Apple80211Set(ref, 0x16 /*22 = DISASSOCIATE*/, 0, 0, 0)`** —— 這就是驅動 trace 裡的 `s22`。
+- 送出關聯用的是自己的 ioctl：
+
+```
+apple80211req { char if_name[16]; int type=20; int val; u32 len=0x250; void *data; }
+ioctl(fd, 0x802869c8, &req)
+```
+
+`apple80211_ref` 佈局（實測）：`+0x00 = fd`、`+0x04 = "en1"`、`+0x50 = 旗標字`（bind 前 1、bind 後 `0xa073ee6f`，bit 22 = `0x400000` 已設）。
+
+### 11.2 這條通道會到驅動（決定性）
+
+`tools/a2push.c`（open → bind en1 → 用 `ref+0x00` 的 fd 下 `type=20`、WPA2-PSK）：
+
+```
+ioctl(set 20) rc=-1 errno=5 (EIO)
+Ath10kAssocRaw   = "ver=1 len=8 upper=0008 lower=0000 keylen=12 rsnlen=0"
+Ath10kAssocPhase = "requested bssid=f0:68:e3:2d:40:22"
+```
+
+驅動收到且開始關聯，但 userspace 拿到 **EIO(5)**。→ **kernel 入口不是牆**，牆在「assoc 完成／結果」的回報，
+即 §8 的問題要改寫成「family 送出 assoc 之後等不到完成」，不是「assoc 送不出去」。
+
+### 11.3 Associate2 的字典 schema（實測）
+
+| 鍵 | 型別 | 備註 |
+|---|---|---|
+| `SSID` | **NSData（raw SSID bytes）** | 給 NSString 會 `-[__NSCFString getBytes:range:]` 爆掉 |
+| `SSID_STR`,`BSSID`,`CHANNEL`,`RSN_IE`,`passphrase`,`password`,`security` | — | 單獨給都回 `-3900`（沒有 SSID 就不動作） |
+| 全部一起給 | — | `-[__NSCFData objectForKey:]`：有一個鍵的值必須是**字典**（未定位） |
+
+只給 `SSID`：10.2 秒後 `-3905 (0xfffff0bf)`、errno=60(ETIMEDOUT)，並把既有連線打成 `failed`。
+
+### 11.4 重放工具（已進 repo `tools/`）
+
+| 工具 | 用途 |
+|---|---|
+| `a2fd.c` | 印 `apple80211_ref` 佈局、找出 fd、用 GET 驗證通道 |
+| `a2push.c` | 用 ref 的 fd 直接推 `ASSOCIATE(20)`（PSK 走 stdin） |
+| `a2join.c` | 直接呼叫 `Apple80211Associate2`（字典變體，fork 隔離） |
+| `a2schema.c` | 逐鍵探 Associate2 的字典型別 |
+| `dump_a2.c` / `imgdump.c` | 把 framework 的函式區段／`__TEXT` dump 出來離線反組譯 |
+
+### 11.5 下一輪的目標（改寫）
+
+量「family 在 assoc 之後等什麼」：`setAssociateRequest` → 之後的
+`ASSOCIATE_RESULT(21)`／`ASSOCIATION_STATUS(22)`／link-changed 事件路徑，
+找出它在哪一步判定失敗（EIO／-3905），而不是再碰 userspace 白名單。

@@ -1,5 +1,10 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
+**第三十三輪（§6.38）補記**：系統點選連線走的是 `Apple80211Associate2`（`nm -u airportd` 有這個 import），
+它自己用 `ioctl(ref+0x00 的 fd, 0x802869c8, {type=20,len=0x250})` 送 ASSOCIATE —— **繞過 `Apple80211Set` 的型別白名單**，
+而且這條通道實測會到我們的 dispatcher（`Ath10kAssocRaw=upper=0008 lower=0000 keylen=12`、`AssocPhase=requested`）。
+缺的是 assoc 之後的完成回報（userspace 拿 EIO／-3905）。所以「只能關 SIP 改 framework」的結論太強。
+
 最後更新：2026-11-26（**第三十二輪：把「不能隨點連線」定位到 framework 的 userspace 白名單**。
 `-3903` 的完整鏈路已釘死：`Apple80211Set` 本體以位圖 `0x08089000`（只放行 12/15/19/27）過濾型別，
 type 20 落到 `0x7ffb1eb43b11`：拿 `OS_os_log` 記一條 log、直接把 `r15d` 設成 `0xfffff0c1` 後返回。
@@ -2298,3 +2303,89 @@ family 的 `extRunDriverCommand` 最後呼叫的是 controller 上的 `apple8021
 - `osx-kvm-headless-install`：VM 生命週期、qemu-nbd、SSH 進 guest。
 - `macos-kext-hardware-bringup`：kext 建置/注入、OpenCore 設定、IO80211 ABI 陷阱（已收錄本輪所有教訓：ASPM 非致命、stack insert 弄壞網路、initIfnetParams 的 IFT_ETHER 硬檢查、**IO80211Family 與 IO80211FamilyLegacy 兩份 IO80211Controller 的 ABI 差異與離線 vtable 比對法**、`getWorkQueue()` 必須非 null、SC 不吃 `IOInterfaceType`/`ifi_type`、`SCNetworkInterfaceCopyAll()` 才是驗收基準、`ifnet_find_by_name` 在注入 kext 會回 ENXIO、vif 的 live vtable 索引、不能在 kext 內 `new` Apple 類別）。
 - `handoff`：下次交接沿用本文件結構。
+
+### 6.38 第三十三輪：點選連線走的是 `Apple80211Associate2`，而它自己送 type 20；kernel 這條通道是通的
+
+#### 6.38.1 先把「誰在送 ASSOCIATE」定死
+
+`nm -u /usr/libexec/airportd` 的 import 清單裡有 **`_Apple80211Associate2`**（共 33 個 Apple80211\* 符號）。
+所以系統點選連線不是走 `Apple80211Set(20)`（§6.37 的白名單那條），而是走 Associate2。
+
+反組譯 `Apple80211Associate2`（本次開機 base `0x7ffb19ac1000`、函式 offset **`0x8b3a`**）得到三件事：
+
+1. 它在堆疊上建 **0x250-byte `apple80211_assoc_data`**（先 `memset(0xaa)`，再從傳入的 CFDictionary 逐欄填）。
+2. 失敗善後時呼叫 `Apple80211Set(ref, 0x16, 0, 0, 0)` —— **0x16 = 22 = DISASSOCIATE**。
+   §6.37.3 量到的「s22 之後全是 getter、沒有 s20」因此有了正確解釋：**那個 `s22` 是 Associate2 的善後（association 已經失敗），不是 airportd 的第一步**。
+3. 真正送出關聯的方式是**自己組請求**：
+
+```
+apple80211req { char if_name[16]; int type = 20; int val; u32 len = 0x250; void *data; }
+ioctl(fd, 0x802869c8, &req)          ; SET，40-byte 編碼
+```
+
+→ 它**完全不經過 `Apple80211Set` 的型別分派**，所以 §6.37 的白名單擋不到它。
+
+#### 6.38.2 `apple80211_ref` 的佈局（實測，可以直接拿來重放）
+
+| 位移 | 值 | 意義 |
+|---|---|---|
+| `+0x00` | `3` | **socket fd** |
+| `+0x04` | `"en1"` | 綁定的介面名 |
+| `+0x50` | bind 前 `0x00000001`、bind 後 `0xa073ee6f` | 旗標字（bit 22 = `0x400000`「可以關聯」，bind 後已設） |
+
+用那個 fd 下 `ioctl(fd, 0xc02869c9, req{type=19})` → **rc=0**（POWER get 正常回），代表這就是 airportd 用的同一條 ioctl 通道。
+
+#### 6.38.3 用同一條通道推 type 20：驅動收到了
+
+以 `tools/a2push.c`（open ref → bind en1 → 用 `ref+0x00` 的 fd 送 `type=20`）送 WPA2-PSK 請求：
+
+```
+ioctl(set 20) rc=-1 errno=5 (EIO)
+Ath10kAssocRaw   = "ver=1 len=8 upper=0008 lower=0000 keylen=12 rsnlen=0"
+Ath10kAssocPhase = "requested bssid=f0:68:e3:2d:40:22"
+```
+
+**驅動端完全收到、而且開始關聯**（`AssocRaw` 與 airportd 真正的請求格式一字不差：`upper=0008 lower=0000 keylen=12`），
+但 userspace 拿到的是 **EIO(5)**。也就是說：
+
+- kernel 側的 assoc 入口**沒有被擋**（§6.37.2 的「只能關 SIP 改 framework」結論太強，這條路是可用的）；
+- 缺的是 **assoc 之後的完成回報**：family／userspace 收不到「關聯完成」，於是把這次 join 當失敗（EIO／-3905／-3903 各自出現在不同環節）。
+
+同一條通道送 open 請求（`lower=1 upper=0 keylen=0`）時 ioctl 回 `rc=0`，但因為 AP 是 WPA2，連線被打成 `failed`。
+
+#### 6.38.4 Associate2 的字典 schema（實測，不是猜的）
+
+一隻 20 行的小程式（`tools/a2schema.c`）逐鍵餵給 Associate2，結果：
+
+| 鍵 | 型別 | 實測 |
+|---|---|---|
+| **`SSID`** | **NSData（raw bytes）** | 給 NSString → `-[__NSCFString getBytes:range:]` NSException（未捕捉會讓整個程式死掉，所以要 fork） |
+| `SSID_STR`/`BSSID`/`CHANNEL`/`RSN_IE`/`passphrase`/`password`/`security` | — | 單獨餵都回 `-3900 (0xfffff0c4)`＝「沒有 SSID 就什麼都不做」 |
+| 全部一起餵 | — | crash 在 `-[__NSCFData objectForKey:]`：**某個鍵的值要是字典**（還沒定位是哪一個） |
+
+只餵 `SSID`（NSData）時：**10.2 秒後回 `-3905 (0xfffff0bf)`、errno=60(ETIMEDOUT)**，而且把既有連線打成 `failed`。
+（第二次、第三次呼叫因為介面已在 failed 狀態，立刻回 `5`。）
+
+airportd 內部字串裡同時有 `SSID`/`SSID_STR`/`BSSID`/`CHANNEL`/`RSN_IE`/`passphrase`/`password`/`security` 這組鍵名。
+
+#### 6.38.5 這一輪的結論與下一步
+
+1. **click-join 的 kernel 通道成立**：`ref+0x00` 的 fd + `ioctl(0x802869c8, type=20)` 會到我們的 dispatcher，
+   而且我們的 `venturaAssociate()` 會接手（`Ath10kAssocPhase=requested`）。
+2. **缺的是完成回報鏈**：ASSOCIATE 進來之後，family/userspace 收 EIO／-3905。下一輪該量的是
+   「family 在 `apple80211RequestIoctl` 回 success 之後等什麼」——`IO80211Controller::setAssociateRequest`
+   之後的完成／結果查詢（`ASSOCIATE_RESULT(21)`／`ASSOCIATION_STATUS(22)`／`LINK_CHANGED` 事件），
+   而不是再去改 userspace 白名單。
+3. **重放工具已經進 repo**：`tools/a2fd.c`（印 ref 佈局、找 fd）、`tools/a2push.c`（用 ref fd 推 type 20）、
+   `tools/a2join.c`（叫 Associate2）、`tools/a2schema.c`（探字典 schema）、`tools/dump_a2.c`＋`tools/imgdump.c`（把
+   framework 的函式／`__TEXT` dump 出來離線反組譯）。
+
+#### 6.38.6 這輪踩到的坑
+
+- **guest `/tmp` 每次重開清空**，工具要每次重傳；macOS 的 `base64` 一定要 `-i`（`base64 file` 會印 usage）。
+- **不要直接讀 framework `__DATA` 裡的 CFString 全域**（本輪試過）：那些槽在尚未綁定時全部讀到同一個值，靠它猜鍵名會誤判。
+- **叫 Associate2 一定要 fork**：未捕捉的 NSException 會直接終止行程（`libc++abi: terminating`）。
+- **一次失敗的 open assoc 會把 WPA2 連線打成 failed**，auto-join 看門狗下一次 tick 才接手（10 秒），
+  要乾淨狀態直接 `system_reset`。
+- framework 映像的 `__TEXT` 只有 `0x53ff6` bytes，rip-relative 目標算出來若是 `0x3xxxxxx` 級距，
+  代表那個位址在 shared cache 的另一個區段，不要當成映像內位移。
