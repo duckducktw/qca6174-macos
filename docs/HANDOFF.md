@@ -1,5 +1,10 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
+**第三十六輪（§6.41）補記**：自己呼叫 `Apple80211Associate2` 的請求**已經打到驅動**
+（`Ath10kAssocWho = pid=… name=a2join`），卡點收斂成一個：字典裡的金鑰材料沒被認出來，
+Associate2 送出的 `assoc_data` 是 `keylen=0`（開放式），驅動以 `protected-network-not-supported` 拒絕。
+它自己會把 32-byte PMK 塞進 `ad_key.key`（`0xa25c: key_len=0x20, cipher=6`），所以只要字典形狀對就能通。
+
 **第三十五輪（§6.40）補記**：`-3903` 在 `Apple80211Associate2` 內只有兩個出口，其中一個要求「密碼參數非 nil」
 （`[ref+0x51] & 0x40` 這一位實測是 1）；airportd 傳給 Associate2 的字典是 `[[profile scanRecord] mutableCopy]`，
 不是從零組的鍵值表 —— 這就是自己重組字典永遠對不上的原因。
@@ -2541,3 +2546,69 @@ bit63 代表 bind（外部符號），要另外查 `dyld_info -fixups`。
    （已知會出現 `capabilities`／`ASSOC_FLAGS`／`COLOCATED_NETWORK_SCOPE_ID`／`TRANS_DISABLED_FLAGS_ASSOC`）。
 2. 用同一份鍵組字典呼叫 `Apple80211Associate2`，看能不能讓 `Ath10kSetAssocSeen` 出現（pid = 我們自己）。
 3. 若成功，再回頭比對「airportd 的密碼為什麼是 nil」（`Apple80211Set(422)` 這個 4-byte set 很可能就是關鍵）。
+
+### 6.41 第三十六輪：自己呼叫 Associate2 已經打到驅動了，但金鑰沒帶進去（`keylen=0`）
+
+#### 6.41.1 決定性量測
+
+```
+./a2join QCA-TEST           (dict = {SSID: NSData, passphrase: NSString, password: NSString}, 密碼走 stdin)
+  elapsed=10.2s  rc=-3905 (0xfffff0bf) errno=60
+Ath10kAssocWho   = "pid=1250 name=a2join"        ← 這次是「我們自己」打的，不是 auto-join
+Ath10kAssocRaw   = "ver=1 len=8 upper=0000 lower=0001 keylen=0 rsnlen=0"
+Ath10kAssocDefer = "replayed"
+Ath10kConnectionError = "protected-network-not-supported"
+```
+
+序列（serial）：
+
+```
+DISCONNECT begin reason=join-deferred-teardown … DISCONNECT complete count=7
+replay deferred join ssid-len=8
+ASSOCIATE request ssid-len=8 …
+RUNTIME STOP reason=protected-network-not-supported
+```
+
+**結論**：userspace → family → driver 這條路**完全通了**（先前 `AssocWho` 一直是 `kernel_task` 是因為
+`a2join` 的請求被 defer 後由核心執行緒重放）。失敗點變成：
+`Apple80211Associate2` 送出的 `apple80211_assoc_data` **沒有金鑰**（`upper=0000 keylen=0`），
+而 AP 是 WPA2，驅動依設計以 `protected-network-not-supported` 拒絕。
+
+#### 6.41.2 Associate2 是怎麼填金鑰的（反組譯）
+
+`assoc_data` 基底是 `rbp-0x2a0`；`ad_key` 在 `+0x38`（version `+0x38`、key_len `+0x3c`、cipher `+0x40`、key[] `+0x48`）。
+
+```
+0xa246  movaps xmm0, [rbp-0x50]        ; 32 bytes（PMK）
+0xa24a  movaps xmm1, [rbp-0x40]
+0xa24e  movups [rbp-0x248], xmm1       ; → ad_key.key[16..31]
+0xa255  movups [rbp-0x258], xmm0       ; → ad_key.key[0..15]
+0xa25c  movabs rax, 0x600000020
+0xa266  mov    [rbp-0x264], rax        ; key_len = 0x20 (32)、cipher = 6 (CCMP)
+```
+
+也就是說它塞的是 **32-byte PMK**（不是密語），而這段只在 `r12b == 1` 且 `[rbp-0x430] != 0`
+時才會執行；`[rbp-0x430]` 就是「這次 join 有沒有拿到金鑰材料」的長度。
+我們給的字典（`passphrase`/`password` 字串）沒有被它採用 → 長度 0 → 走「無金鑰」分支。
+
+同理，airportd 之所以能成功填出 PMK，是因為它那份字典是 `[[profile scanRecord] mutableCopy]`
+（§6.40.1）且金鑰來自 keychain。
+
+#### 6.41.3 剩下要解的只有一件事：字典裡金鑰材料的正確形狀
+
+已知線索：
+
+- 有個鍵的值必須是 **字典**（餵 NSData 會 `-[__NSCFData objectForKey:]`）——很可能是 `security`。
+- airportd 內部字串：`SSID / SSID_STR / BSSID / CHANNEL / RSN_IE / passphrase / password / security`。
+- Associate2 會把 32-byte PMK 塞進 `ad_key.key`，因此它自己也做 PBKDF2（`sub 0x8889` 的回呼），
+  只要字典裡找得到密語。
+
+下一步就是把 `a2schema.c` 擴成「巢狀字典」掃描：`{SSID: data, security: {<候選鍵>: passphrase}}`，
+候選鍵至少試 `passphrase / password / PSK / wpa_passphrase / WPA_PSK / psk`，
+每次跑完看 `Ath10kAssocRaw` 的 `keylen` 是否變成 32——變成 32 就代表形狀對了。
+
+#### 6.41.4 這輪的結論
+
+- kernel 側、family 側、defer/replay、teardown 全部可用（`a2push` 可以走完 4-way 到 `connected-wpa2`）。
+- 唯一缺口是 **Associate2 的字典 schema**：金鑰材料沒被認出來，於是它送出「開放式」關聯，
+  驅動以 `protected-network-not-supported` 拒絕，airportd 最終報 `-3903`。
