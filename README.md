@@ -10,6 +10,7 @@ No companion app · No OpenCore Legacy Patcher · No system-volume changes · Wi
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%20Ventura%20%C2%B7%20x86__64-lightgrey.svg)](#compatibility)
 [![PCI](https://img.shields.io/badge/PCI-168c%3A003e%20%C2%B7%20168c%3A0042-informational.svg)](#compatibility)
 [![Kext](https://img.shields.io/badge/kext-Ath10kMac.kext-success.svg)](#install)
+[![First](https://img.shields.io/badge/first-QCA6174%20scans%20in%20the%20native%20Wi--Fi%20UI-critical.svg)](#what-is-new-here)
 [![Docs](https://img.shields.io/badge/docs-Apple%20join%20admission%20conditions-orange.svg)](docs/handoff-apple-join-conditions.md)
 
 [English](#english) · [正體中文](#正體中文)
@@ -30,16 +31,40 @@ reference. It ships as one kext injected by OpenCore; macOS talks to it through 
 Association, the WPA2 four-way handshake and key installation run **inside the kernel**. There is no
 user-space supplicant, no login agent and no privileged helper to install.
 
+### What is new here
+
+**First public driver to put QCA6174 scan results into macOS's own Wi-Fi UI.**
+Not "a list the driver prints" — the real thing: the scan sweeps that this kext performs are served
+through Apple's `IO80211ScanManager` to `airportd`, and `airportd` hands them to CoreWLAN, so the
+networks appear in the menu-bar list and in System Settings, with SSID, BSSID, channel, band, RSSI,
+security and RSN element. No other public QCA6174 kext has been shown to do this; it is reproducible
+with `tools/cwscan.m` (15–21 BSS per sweep) and `tools/apple80211-scan.c` (raw records:
+`QCA-TEST bssid=f0:68:e3:2d:40:22 ch=6 ie=22`).
+
+Getting there meant satisfying the scan half of Apple's contract, which is documented rather than
+guessed: one `apple80211_scan_result` per call with a non-zero end-of-list marker, the scan-manager
+request validated against `validateScanData`, results served on the slot the manager actually reads
+(`(controller, cmd, type, interface, out)`), and `M_SCAN_DONE` posted on both the Skywalk path and the
+`kern_event` bridge airportd's reader thread consumes.
+
+**The join flow is the open problem.** Clicking a network — the step after scanning — still fails:
+`airportd` refuses before any request reaches the driver, so no `Set(SSID)` and no `ASSOCIATE(20)` is
+ever sent. Everything on the driver side of that boundary is aligned and measured; where exactly the
+refusal happens, and what Apple requires at each layer, is written down in
+**[Apple's join admission conditions](docs/handoff-apple-join-conditions.md)**. This README does not
+claim a working click-to-join anywhere.
+
 ### Project status
 
 | Area | State | Evidence |
 |---|---|---|
 | firmware boot (BMI → WMI), PCIe, CE/IRQ runtime | **working** | `Ath10kWmiLive=active`, boot ladder on the serial port |
 | scan, 2.4 / 5 GHz, RSN elements | **working** — 15–21 BSS per sweep | `tools/apple80211-scan.c`, `tools/cwscan.m` |
+| **scan results in the native Wi-Fi UI** (menu bar, System Settings) | **working — first for this chip** | `cwscan.m` returns 15–21 networks through CoreWLAN → airportd; `Ath10kScanMgrStart=ok`; records served one per call with the end-of-list marker |
 | WPA2-PSK connect, in-kernel 4-way, DHCP | **working** | `Ath10kConnectionState=connected-wpa2`, `WPA2 port authorized` |
 | reconnect after drop / radio cycle | **working** | auto-join watchdog, `Ath10kAutoJoinPhase` |
 | driver-initiated join (boot-arg join list) | **working** | `ath10kjoin=<ssid>:<psk>` |
-| **click-to-join from the UI** | **blocked** — airportd refuses before any request reaches the driver | [admission conditions](docs/handoff-apple-join-conditions.md), [apple-vs-ours](docs/apple-vs-ours.md) |
+| **click-to-join — the join flow** | **blocked** — airportd refuses before any request reaches the driver (no `Set(SSID)`, no `ASSOCIATE(20)`) | [admission conditions](docs/handoff-apple-join-conditions.md), [apple-vs-ours](docs/apple-vs-ours.md) |
 | WPA3 / SAE | **partial** — in-kernel P-256 verified (`Ath10kP256SelfTest=mul-ok`), SAE frame exchange not wired | [WPA3-CONTRACT.md](WPA3-CONTRACT.md) |
 | PMF / 802.11w | **partial** — linked and gated, not exercised against a PMF-required AP | [WPA3-CONTRACT.md](WPA3-CONTRACT.md) |
 | AWDL / AirDrop | **unsupported** | [COMPATIBILITY.md](COMPATIBILITY.md) |
@@ -208,16 +233,39 @@ Ath10kMac 是一個以 IOKit 重寫的 Wi-Fi 驅動，讓 **Qualcomm Atheros QCA
 802.11 關聯、WPA2 四次握手、金鑰安裝**全部在核心內完成**：不需安裝任何使用者態 supplicant、
 沒有登入代理、沒有特權 helper。
 
+### 首創：QCA6174 的掃描結果進到 macOS 原生 Wi-Fi 介面
+
+**全球第一個讓 QCA6174 的掃描結果出現在 macOS 自己 Wi-Fi 介面上的公開驅動** ——
+不是「驅動自己印一份清單」，而是真的走完整條鏈：本 kext 掃到的 BSS 交給 Apple 的
+`IO80211ScanManager`，再由 `airportd` 遞給 CoreWLAN，於是選單列網路列表與「系統設定」裡就看得到
+SSID、BSSID、頻道、頻段、RSSI、安全性與 RSN 元素。目前沒有其他公開的 QCA6174 kext 被證明做到這件事；
+它可以用 `tools/cwscan.m`（每次 15–21 個 BSS）與 `tools/apple80211-scan.c`（原始紀錄：
+`QCA-TEST bssid=f0:68:e3:2d:40:22 ch=6 ie=22`）複驗。
+
+能做到是因為把「掃描那一半」的契約逐條滿足（不是猜的、都有文件）：每次呼叫回一筆
+`apple80211_scan_result`、以非 0 回傳當結束標記、scan manager 的請求先過 `validateScanData`、
+結果走 manager 真正會讀的那個 slot（`(controller, cmd, type, interface, out)`）、
+`M_SCAN_DONE` 同時走 Skywalk 與 airportd 讀者執行緒吃的 `kern_event` 橋。
+
+### 目前唯一的缺口：join 流程不通
+
+掃描之後的下一步 —— **點選網路連線 —— 仍然失敗**：拒絕發生在 `airportd`，任何請求都還沒到驅動，
+所以 `Set(SSID)` 與 `ASSOCIATE(20)` 從來沒送出。驅動這一側的契約已全部對齊並有量測；
+每一層到底要求什麼、拒絕在哪一層產生，寫在
+**[蘋果放行 join 的四層條件](docs/handoff-apple-join-conditions.md)**。
+這份 README 不會在任何地方宣稱「點選連線可用」。
+
 ### 目前狀態
 
 | 功能 | 狀態 | 證據 |
 |---|---|---|
 | 韌體啟動（BMI → WMI）、PCIe、CE/IRQ | **可用** | `Ath10kWmiLive=active` |
 | 掃描（2.4G / 5G、含 RSN IE） | **可用**，每次 15–21 個 BSS | `tools/cwscan.m` |
+| **掃描結果出現在原生 Wi-Fi 介面**（選單列、系統設定） | **可用 —— 這張卡的首例** | `cwscan.m` 經 CoreWLAN → airportd 取回 15–21 個網路；`Ath10kScanMgrStart=ok` |
 | WPA2-PSK 連線（核心內 4-way）＋ DHCP | **可用** | `connected-wpa2`、`WPA2 port authorized` |
 | 斷線重連 / 無線重啟 | **可用** | auto-join watchdog |
 | 驅動自行連線（boot-arg 清單） | **可用** | `ath10kjoin=<ssid>:<psk>` |
-| **從 UI 點選連線** | **受阻**：拒絕發生在 airportd，請求沒到驅動 | [放行條件](docs/handoff-apple-join-conditions.md) |
+| **點選連線（join 流程）** | **受阻**：拒絕發生在 airportd，`Set(SSID)`／`ASSOCIATE(20)` 從未送出 | [放行條件](docs/handoff-apple-join-conditions.md) |
 | WPA3 / SAE | **部分**：核心內 P-256 已驗證，SAE 訊框交換未接線 | [WPA3-CONTRACT.md](WPA3-CONTRACT.md) |
 | PMF / 802.11w | **部分**：已串接，未對強制 PMF 的 AP 實測 | 同上 |
 | AWDL / AirDrop | **不支援** | [COMPATIBILITY.md](COMPATIBILITY.md) |
