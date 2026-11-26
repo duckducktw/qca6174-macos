@@ -1,57 +1,256 @@
-# Ath10k-airport
+<div align="center">
 
-World's First experimental native Qualcomm Atheros QCA9377 Wi-Fi kext for OpenCore, targeting
-Lunnen LLL5DAW (`168c:0042 / 1a3b:2b51`) on x86_64 macOS Sequoia.
-Wi-Fi is controlled through macOS system settings and the Wi-Fi menu.
-There is no companion application, login agent or application bundle to install.
-The driver does not require OpenCore Legacy Patcher or changes to system volumes.
+# Ath10kMac
 
-## Status
+**Native Qualcomm Atheros QCA6174 / QCA9377 Wi-Fi for macOS on x86_64 — as a plain kext.**
 
-Native discovery, scanning and WPA2 traffic have worked on the development laptop;
-connection stability, reconnect and power transitions remain under investigation.
-The current fixes have host-test/build evidence and await hardware verification.
-WPA3/SAE and PMF are not implemented. AWDL/AirDrop are unsupported. Compatibility
-with macOS 11–26 is planned; Sequoia ABI declarations are not proof of compatibility
-with other releases. See [the connection audit](NATIVE-CONNECTION-AUDIT.md),
-[the native contract](NATIVE-CONTRACT.md), [compatibility](COMPATIBILITY.md) and
-[WPA3 requirements](WPA3-CONTRACT.md).
+No companion app · No OpenCore Legacy Patcher · No system-volume changes · Wi-Fi from the menu bar and System Settings
 
-## Build
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%2013%20Ventura%20%C2%B7%20x86__64-lightgrey.svg)](#compatibility)
+[![PCI](https://img.shields.io/badge/PCI-168c%3A003e%20%C2%B7%20168c%3A0042-informational.svg)](#compatibility)
+[![Kext](https://img.shields.io/badge/kext-Ath10kMac.kext-success.svg)](#install)
+[![Docs](https://img.shields.io/badge/docs-Apple%20join%20admission%20conditions-orange.svg)](docs/handoff-apple-join-conditions.md)
+
+[English](#english) · [正體中文](#正體中文)
+
+</div>
+
+---
+
+## English
+
+### What this is
+
+Ath10kMac is a clean-room IOKit driver that makes a **Qualcomm Atheros QCA6174 / QCA9377** work as the
+primary Wi-Fi interface of macOS, using the firmware protocol of the Linux `ath10k` driver as its
+reference. It ships as one kext injected by OpenCore; macOS talks to it through Apple's own
+`IO80211Family`, so the join UI, the menu-bar network list and `networksetup` all behave natively.
+
+Association, the WPA2 four-way handshake and key installation run **inside the kernel**. There is no
+user-space supplicant, no login agent and no privileged helper to install.
+
+### Project status
+
+| Area | State | Evidence |
+|---|---|---|
+| firmware boot (BMI → WMI), PCIe, CE/IRQ runtime | **working** | `Ath10kWmiLive=active`, boot ladder on the serial port |
+| scan, 2.4 / 5 GHz, RSN elements | **working** — 15–21 BSS per sweep | `tools/apple80211-scan.c`, `tools/cwscan.m` |
+| WPA2-PSK connect, in-kernel 4-way, DHCP | **working** | `Ath10kConnectionState=connected-wpa2`, `WPA2 port authorized` |
+| reconnect after drop / radio cycle | **working** | auto-join watchdog, `Ath10kAutoJoinPhase` |
+| driver-initiated join (boot-arg join list) | **working** | `ath10kjoin=<ssid>:<psk>` |
+| **click-to-join from the UI** | **blocked** — airportd refuses before any request reaches the driver | [admission conditions](docs/handoff-apple-join-conditions.md), [apple-vs-ours](docs/apple-vs-ours.md) |
+| WPA3 / SAE | **partial** — in-kernel P-256 verified (`Ath10kP256SelfTest=mul-ok`), SAE frame exchange not wired | [WPA3-CONTRACT.md](WPA3-CONTRACT.md) |
+| PMF / 802.11w | **partial** — linked and gated, not exercised against a PMF-required AP | [WPA3-CONTRACT.md](WPA3-CONTRACT.md) |
+| AWDL / AirDrop | **unsupported** | [COMPATIBILITY.md](COMPATIBILITY.md) |
+| QCA9377 (`168c:0042`) | **experimental** — code paths exist, hardware verification pending | [COMPATIBILITY.md](COMPATIBILITY.md) |
+
+Every result above was measured on a **macOS 13.7 Ventura VM with a VFIO-passthrough QCA6174** against a
+local `hostapd` AP. Real-hardware verification is the next milestone and is tracked in
+[docs/hardware-verification.md](docs/hardware-verification.md). Nothing here is a stability promise for
+your machine.
+
+### How it works
+
+```
+        System Settings / menu bar / networksetup
+                        │  CoreWLAN · XPC
+                    airportd
+                        │  Apple80211 / IO80211 requests
+              IO80211Family  (Apple, unmodified)
+                        │  vtable slots: apple80211_ioctl, apple80211SkywalkRequest,
+                        │                setAssociateRequest, scan manager
+                  Ath10kMac.kext            <- this repository
+        ┌───────────────┴───────────────┐
+        │ IO80211 personality           │  scan cache, association state machine,
+        │                               │  in-kernel WPA2 supplicant (PBKDF2,
+        │                               │  4-way, CCMP key install)
+        │ ath10k core                   │  BMI/WMI bring-up, CE rings, HTT RX/TX
+        └───────────────┬───────────────┘
+                QCA6174 firmware
+```
+
+The interesting half of this project is not the radio — it is the **admission contract** of Apple's
+stack: which requests airportd sends in which order, which of the driver's answers make it continue or
+give up, and where each refusal is produced. That reverse engineering is written down:
+
+- **[Apple's join admission conditions](docs/handoff-apple-join-conditions.md)** — the four layers a
+  click-to-join must pass, each with its disassembly address and measured value.
+- **[Apple vs. ours](docs/apple-vs-ours.md)** — per-API comparison of what the live stack expects and
+  what this driver answers.
+- **[Reverse-engineering playbook](docs/reverse-engineering-playbook.md)** — toolchain (dyld shared
+  cache dumping, chained-fixup decoding, cfstring/selref resolution) and method.
+- **[Join flow reversal](docs/join-flow-reverse.md)** — the userspace call chain down to
+  `Apple80211Associate2` and its own two `-3903` exits.
+
+### Compatibility
+
+| Chip | PCI ID | macOS | State |
+|---|---|---|---|
+| QCA6174 hw3.x | `168c:003e` | 13 Ventura (13.7 tested) | scan, WPA2, reconnect working in the test VM; hardware pending |
+| QCA9377 hw1.x | `168c:0042` | 13 Ventura | experimental, unverified |
+| other Ath10k | — | — | out of scope |
+
+Per-release matrix and ABI caveats: [COMPATIBILITY.md](COMPATIBILITY.md).
+
+### Install
+
+1. Build or download `Ath10kMac.kext`.
+2. Copy it to `EFI/OC/Kexts/` and add it under `Kernel → Add` in `config.plist`
+   (`BundlePath=Ath10kMac.kext`, `ExecutablePath=Contents/MacOS/Ath10kMac`,
+   `PlistPath=Contents/Info.plist`, `MinKernel=22.0.0`).
+3. Reboot. The interface appears as `en1`; join it from the menu bar, System Settings or
+   `networksetup -setairportnetwork en1 <ssid> <passphrase>`.
+
+For unattended bring-up a join list can be supplied as a boot argument
+(`ath10kjoin=<ssid>:<psk>[,<ssid>:<psk>]`). Boot arguments live in NVRAM in clear text — prefer the UI
+once click-to-join lands.
+
+### Build
 
 ```sh
-make -j2 kext
-# Explicit equivalent:
+make -j2 kext                     # → build/native/out/Ath10kMac.kext
 make NATIVE=1 DIAGNOSTIC_STAGE=0 -j2 kext
 ```
 
-Output: `build/native/out/Ath10kMac.kext`. Only this kext is the driver deliverable;
-release archives also include documentation, licenses and checksums.
-`DIAGNOSTIC_STAGE=3` explicitly selects the controller-only diagnostic, which stops
-before radio startup. It is not the functional Wi-Fi driver.
-`NATIVE=0` retains the historical Ethernet-backed implementation for development;
-it is not the default or release configuration.
-
-Build commands do not install into EFI or reboot the computer. For Windows
-cross-compilation, see [the Windows guide](docs/windows-build.md).
-Generated firmware headers and `firmware/prepared/` stay outside source control.
-
-## Checks
+`DIAGNOSTIC_STAGE=3` builds the controller-only diagnostic, which stops before radio start-up; it is
+not a Wi-Fi driver. `NATIVE=0` keeps the historical Ethernet-backed implementation for development.
+Windows cross-compilation: [docs/windows-build.md](docs/windows-build.md).
 
 ```sh
 python3 scripts/audit-native-callbacks.py --check
 python3 tests/run-development-tests.py
 ```
 
-Host models and successful compilation do not prove hardware stability. Offline
-kernel binding requires exact candidate inclusion checks; see
-[validation limits](OFFLINE-VALIDATION-ERRATUM.md).
-The optional `Collect-macOS-diagnostics.command` reads diagnostics; it is not an
-application or a requirement for native Wi-Fi operation.
+### Verify a running system
 
-## Provenance and licenses
+```sh
+ioreg -l -w0 | grep -E 'Ath10k(ConnectionState|AutoJoinPhase|SecurityPhase)'   # link state
+ioreg -l -w0 | grep -o 'Ath10kClientTrace" = "[^"]*"'                          # client request trace
+networksetup -getairportnetwork en1
+ifconfig en1 | grep -E 'status|inet '
+```
 
-Based on jonasw8/Ath10kMac and thekunalthakur/Ath10kMac. Private declarations and
-local ABI amendments are recorded in `vendor/itlwm/SOURCE.json`. MacKernelSDK,
-firmware and regulatory data retain their own notices. See `LICENSE`, `firmware/`,
-`regulatory/` and `vendor/itlwm/`.
+The driver publishes ~120 `Ath10k*` properties. They are this project's instrumentation, and the reason
+most of the reverse engineering above could be measured instead of guessed.
+
+### Documentation
+
+| Document | What it answers |
+|---|---|
+| [docs/handoff-apple-join-conditions.md](docs/handoff-apple-join-conditions.md) | **start here** — every condition Apple requires before admitting a join, per layer, with evidence |
+| [docs/apple-vs-ours.md](docs/apple-vs-ours.md) | per-API diff between the live stack's expectations and this driver |
+| [docs/reverse-engineering-playbook.md](docs/reverse-engineering-playbook.md) | toolchain, method, pitfalls, community prior art |
+| [docs/join-flow-reverse.md](docs/join-flow-reverse.md) | userspace → family → driver call chain of a join |
+| [docs/HANDOFF.md](docs/HANDOFF.md) | full engineering log, round by round, with measurements |
+| [COMPATIBILITY.md](COMPATIBILITY.md) | macOS release matrix and ABI caveats |
+| [NATIVE-CONTRACT.md](NATIVE-CONTRACT.md) | the contract this driver implements towards IO80211Family |
+| [WPA3-CONTRACT.md](WPA3-CONTRACT.md) · [SAE-CRYPTO-BACKEND.md](SAE-CRYPTO-BACKEND.md) | WPA3/PMF state, SAE crypto backend investigation |
+| [INITIAL-POWER-CONTRACT.md](INITIAL-POWER-CONTRACT.md) | power-on ordering and recovery |
+| [NATIVE-CONNECTION-AUDIT.md](NATIVE-CONNECTION-AUDIT.md) · [OFFLINE-VALIDATION-ERRATUM.md](OFFLINE-VALIDATION-ERRATUM.md) | connection audit, limits of offline validation |
+| [docs/hardware-verification.md](docs/hardware-verification.md) | what was verified on which machine, and how |
+| [docs/legacy-background.md](docs/legacy-background.md) · [docs/native-sequoia.md](docs/native-sequoia.md) | project history, the Sequoia line |
+
+### Limitations we do not hide
+
+- **Click-to-join does not work yet.** The refusal is inside `airportd`, before any request reaches the
+  driver. Every driver-side contract we could find is aligned and documented; the remaining layer is
+  being narrowed with `Ath10kClientTrace`.
+- **Association budget.** Apple's `Apple80211Associate2` waits 10.2 s; a teardown + rejoin here measures
+  9–11 s, so a join that must switch networks can miss the window.
+- **Unverified hardware.** Everything is measured in a VM. The development laptop still needs the same
+  measurements before any stability claim.
+- No WPA3/SAE join, no AWDL/AirDrop, no SoftAP.
+
+### Contributing
+
+Measurements beat opinions here. A useful bug report carries:
+
+```sh
+ioreg -l -w0 | grep Ath10k > ioreg.txt
+sudo dmesg | grep Ath10kMac > serial.txt      # or the serial console log
+log show --last 2m --predicate 'process == "airportd"' --style compact | grep -iE 'join|assoc|error=\('
+```
+
+plus the chip ID (`ioreg -l | grep -m1 compatible`) and the macOS build. A new `Ath10k*` breadcrumb is
+usually the right first patch — see [docs/reverse-engineering-playbook.md](docs/reverse-engineering-playbook.md) §3.
+
+### Credits
+
+- Apple's `IO80211Family` — the interface this driver implements. No Apple binary is modified or
+  redistributed.
+- [OpenIntelWireless/itlwm](https://github.com/OpenIntelWireless/itlwm) — prior art for this class of
+  driver; its AirportItlwm showed which parts of the IO80211 contract matter for a working join
+  (comparison: [docs/handoff-apple-join-conditions.md](docs/handoff-apple-join-conditions.md) §5).
+- The Linux `ath10k` driver — firmware protocol reference.
+- [jonasw8/Ath10kMac](https://github.com/jonasw8/Ath10kMac),
+  [thekunalthakur/Ath10kMac](https://github.com/thekunalthakur/Ath10kMac) and
+  SadFrozz/Ath10k-airport — earlier trees this work derives from. Private declarations and local ABI
+  amendments are recorded in `vendor/itlwm/SOURCE.json`.
+- MacKernelSDK, firmware and regulatory data retain their own notices (`MacKernelSDK/`, `firmware/`,
+  `regulatory/`).
+
+### License
+
+GPL-3.0 — see [LICENSE](LICENSE). Kernel extensions run with kernel privileges: a broken kext can
+prevent a machine from booting, and there is no warranty of fitness.
+
+---
+
+## 正體中文
+
+### 這是什麼
+
+Ath10kMac 是一個以 IOKit 重寫的 Wi-Fi 驅動，讓 **Qualcomm Atheros QCA6174 / QCA9377** 成為 macOS 的
+主要無線網卡，韌體協議參考 Linux 的 `ath10k`。整個驅動只有一個 kext，由 OpenCore 注入，透過 Apple
+自己的 `IO80211Family` 與系統溝通 —— 連線介面、選單列網路列表、`networksetup` 都是原生行為。
+
+802.11 關聯、WPA2 四次握手、金鑰安裝**全部在核心內完成**：不需安裝任何使用者態 supplicant、
+沒有登入代理、沒有特權 helper。
+
+### 目前狀態
+
+| 功能 | 狀態 | 證據 |
+|---|---|---|
+| 韌體啟動（BMI → WMI）、PCIe、CE/IRQ | **可用** | `Ath10kWmiLive=active` |
+| 掃描（2.4G / 5G、含 RSN IE） | **可用**，每次 15–21 個 BSS | `tools/cwscan.m` |
+| WPA2-PSK 連線（核心內 4-way）＋ DHCP | **可用** | `connected-wpa2`、`WPA2 port authorized` |
+| 斷線重連 / 無線重啟 | **可用** | auto-join watchdog |
+| 驅動自行連線（boot-arg 清單） | **可用** | `ath10kjoin=<ssid>:<psk>` |
+| **從 UI 點選連線** | **受阻**：拒絕發生在 airportd，請求沒到驅動 | [放行條件](docs/handoff-apple-join-conditions.md) |
+| WPA3 / SAE | **部分**：核心內 P-256 已驗證，SAE 訊框交換未接線 | [WPA3-CONTRACT.md](WPA3-CONTRACT.md) |
+| PMF / 802.11w | **部分**：已串接，未對強制 PMF 的 AP 實測 | 同上 |
+| AWDL / AirDrop | **不支援** | [COMPATIBILITY.md](COMPATIBILITY.md) |
+| QCA9377 (`168c:0042`) | **實驗性**，尚未硬體驗證 | 同上 |
+
+所有數據來自 **macOS 13.7 Ventura VM + VFIO 直通 QCA6174** 與本機 `hostapd` AP；
+實機驗證是下一個里程碑（[hardware-verification](docs/hardware-verification.md)）。
+
+### 這個專案真正有價值的地方
+
+不是無線電，而是**蘋果 stack 的「放行契約」**：airportd 依什麼順序問哪些請求、驅動的哪個回答
+讓它繼續或放棄、每個拒絕在哪一層產生。這些逆向結果都寫成文件：
+
+- **[蘋果放行 join 的四層條件](docs/handoff-apple-join-conditions.md)**（新接手先讀這份）
+- **[AirportItlwm 等社群做法對照](docs/handoff-apple-join-conditions.md)**（§5）
+- **[逆向工具鏈與流程](docs/reverse-engineering-playbook.md)**、**[逐 API 對照](docs/apple-vs-ours.md)**
+
+### 建置與安裝
+
+```sh
+make -j2 kext        # → build/native/out/Ath10kMac.kext
+```
+
+把 kext 放進 `EFI/OC/Kexts/`，在 `config.plist` 的 `Kernel → Add` 加一筆（`MinKernel=22.0.0`），
+重開機後介面會以 `en1` 出現。
+
+### 已知限制（不粉飾）
+
+- **點選連線還沒通**：拒絕在 `airportd`，不是驅動回錯值；驅動側可對齊的契約都已對齊並記錄。
+- **關聯時間窗**：Apple 等 10.2 秒，我們的 teardown+rejoin 實測 9–11 秒，換網路時可能超窗。
+- **實機尚未驗證**：所有量測都在 VM；在開發筆電重跑同一組量測前，不做穩定性宣稱。
+- 沒有 WPA3/SAE 連線、沒有 AWDL/AirDrop、沒有 SoftAP。
+
+### 授權
+
+GPL-3.0，見 [LICENSE](LICENSE)。kext 以核心權限執行，壞掉的 kext 可能讓機器無法開機，請自行承擔風險。
