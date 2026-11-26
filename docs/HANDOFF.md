@@ -2849,3 +2849,36 @@ Ath10kIfaceLink = iface-link=0 ok=1
 剩下的差異（對照表 §4.3）：scan manager 需要 **`apple80211scan_req_node`** 才能把掃描結果
 交給後續查詢（`getCachedScanResults`），我們只服務 type 11 的讀取、沒有維護 request node，
 所以 `GET CURR SCAN RESULT` 仍會出現 `err=2`。
+
+### 6.47 第四十二輪：Apple 預期的 request-node 契約，以及「Set(SSID) 直接開 join」的嘗試
+
+#### 6.47.1 逆向到的事實
+
+`IO80211ScanManager::getCachedScanResults`（`0x201150a`）一進來就在**驗證 `apple80211_scan_data`**：
+
+```
+[scan_data+0x04] - 1  > 2  → 回 0x16 (22)      ; ap mode 必須 1..3
+[scan_data+0x10]      > 0x20 → 回 0x16          ; ssid_len ≤ 32
+[scan_data+0x34]      > 9 或 !bt(0x38e, …) → 0x16 ; scan type 必須在白名單
+[scan_data+0x44]      > 0x190 → 0x16            ; dwell ≤ 400
+```
+
+也就是說 scan manager 對「快取查詢」這條路**先驗請求參數**，不符就直接失敗（airportd 記成 `GET CURR SCAN RESULT err=2`）。
+我們目前的 `venturaScan()` 送出的 scan_data 沒有照這個白名單填（`ad_mode` 常是 0、`scan type` 也沒設），
+所以 manager 端的快取查詢永遠失敗。
+
+#### 6.47.2 這輪的修改（v244）
+
+在 `Set(SSID)` 的處理裡加了一條「拿到 SSID 就自己開 join」的路徑（`Ath10kJoinOnSSID` breadcrumb）：
+airportd 在 join 時一定會送 `Set(SSID)`，即使它的 `Associate2` 在 userspace 就放棄，
+驅動也能用自家憑證把連線建起來。
+
+結果：`networksetup -setairportnetwork` 這條路**機場根本沒送 `s1`(Set SSID)**，
+`Ath10kClientTrace` 只有 `g2 g1 g1 g1 g1 g2 g1 g2 g1 g1 g1 g14 …`，
+所以這條 fallback 沒有機會觸發 —— 失敗點比我們以為的更前面（airportd 在送 Set(SSID) 之前就拒絕）。
+
+#### 6.47.3 現在的狀態
+
+- VM 保持在可用狀態：`connected-wpa2` / `status: active` / 舊 IP 正常。
+- 點選連線（`cwjoin`、`networksetup`）仍是 `-3903`，且**沒有 `s1`／`s20`**。
+- 對照表（`docs/apple-vs-ours.md`）裡 §4.3 的 request-node 差異已定位到具體參數白名單，是下一輪最明確的著力點。
