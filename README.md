@@ -17,6 +17,10 @@ No companion app · No OpenCore Legacy Patcher · No system-volume changes · Wi
 
 </div>
 
+> **Branch: `ventura-io80211`** — the active development line (macOS 13 Ventura, QCA6174 hw3.x).
+> Everything in this README describes **this branch**. The repository's default branch is `main`,
+> which is an older, staged milestone tree — see [Branches](#branches) before you clone.
+
 ---
 
 ## English
@@ -30,6 +34,28 @@ reference. It ships as one kext injected by OpenCore; macOS talks to it through 
 
 Association, the WPA2 four-way handshake and key installation run **inside the kernel**. There is no
 user-space supplicant, no login agent and no privileged helper to install.
+
+### Branches
+
+There is more than one tree in this repository, and they are at very different stages. Pick the branch
+by what you want, not by what the default branch happens to be.
+
+| Branch | What it is | State | Last activity |
+|---|---|---|---|
+| **`ventura-io80211`** ← *you are here* | Active line: QCA6174 on macOS 13 Ventura. Native UI scanning, in-kernel WPA2, the reverse engineering in [`docs/`](docs/README.md), the `tools/` measurement suite. | **most advanced** — scan + WPA2 + reconnect working in the test VM; click-to-join blocked in airportd | 2026-11-27 |
+| `main` *(default)* | Earlier staged-milestone tree (M0/M1: PCI probe, firmware/board parsing, host-side models). Kept for history; its README describes that stage, not this one. | superseded by `ventura-io80211` | 2026-10-29 |
+| `native-qca6174-dev` | Pre-Ventura development line for the native adapter. | historical | 2026-10-29 |
+| `native-qca6174-11ad-0807` | Same line pinned to the Lite-On `11ad:0807` subsystem, packaged as a deployable bundle. | historical | 2026-10-29 |
+| `full-driver-11ad-0807` | Full-driver snapshot for that subsystem (ASPM/Link-Control work). | historical | 2026-10-29 |
+
+Clone the active line explicitly — a plain `git clone` lands on `main`:
+
+```sh
+git clone -b ventura-io80211 https://github.com/duckducktw/qca6174-macos.git
+```
+
+`upstream-sadfrozz/main` and `upstream-sadfrozz/native-sequoia-development` are the upstream remotes
+this work derives from; they are not maintained here.
 
 ### What is new here
 
@@ -232,6 +258,24 @@ Ath10kMac 是一個以 IOKit 重寫的 Wi-Fi 驅動，讓 **Qualcomm Atheros QCA
 
 802.11 關聯、WPA2 四次握手、金鑰安裝**全部在核心內完成**：不需安裝任何使用者態 supplicant、
 沒有登入代理、沒有特權 helper。
+
+### 分支說明（先看這個）
+
+這個 repo 有不只一條樹，進度差很多。請依「你要什麼」選分支，而不是依「預設分支是哪一條」。
+
+| 分支 | 這是什麼 | 狀態 | 最後活動 |
+|---|---|---|---|
+| **`ventura-io80211`** ← *你在這裡* | 主開發線：macOS 13 Ventura + QCA6174。原生介面掃描、核心內 WPA2、[`docs/`](docs/README.md) 的逆向文件、`tools/` 量測工具都在這。 | **最新** — 掃描／WPA2／重連在測試 VM 可用；點選連線受阻於 airportd | 2026-11-27 |
+| `main` *（預設）* | 較早的階段性里程碑樹（M0/M1：PCI probe、firmware/board 解析、host 端模型），只為保留歷史；它的 README 描述的是那個階段。 | 已被 `ventura-io80211` 取代 | 2026-10-29 |
+| `native-qca6174-dev` | Ventura 之前的 native adapter 開發線。 | 歷史 | 2026-10-29 |
+| `native-qca6174-11ad-0807` | 同上，鎖定 Lite-On `11ad:0807` 子系統、打包成可部署 bundle。 | 歷史 | 2026-10-29 |
+| `full-driver-11ad-0807` | 該子系統的 full-driver 快照（ASPM/Link-Control）。 | 歷史 | 2026-10-29 |
+
+直接 clone 主開發線（`git clone` 預設會落在 `main`）：
+
+```sh
+git clone -b ventura-io80211 https://github.com/duckducktw/qca6174-macos.git
+```
 
 ### 首創：QCA6174 的掃描結果進到 macOS 原生 Wi-Fi 介面
 
