@@ -3060,7 +3060,14 @@ void Ath10kPCIDevice::venturaDisassociate(bool)
     // down for real (its log says "Successfully disassociated" either way, but the
     // firmware kept the vdev up, so its next join was refused with error 37), and keep
     // this driver's own watchdog out of the way while it works.
-    _venturaAutoJoinSuppressUntilMs = ath10kNowMs() + 60000;
+    // Bounded: a client that disassociates once must not lock this driver out of its
+    // own reconnect forever, but airportd disassociates again before every join, so
+    // the window restarts only when the previous one has already expired.
+    {
+        const UInt64 now = ath10kNowMs();
+        if (now >= _venturaAutoJoinSuppressUntilMs)
+            _venturaAutoJoinSuppressUntilMs = now + 15000;
+    }
     if (_connection.stage > Ath10k::LinkStage::Scan || _connection.vdevUp) {
         _connection.error = "user-disassociate";
         _connection.cancelRequested = true;
