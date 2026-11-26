@@ -2832,3 +2832,20 @@ Ath10kIfaceLink = iface-link=0 ok=1
   引用它会讓 kext 載入失敗，而且失敗得很安靜（只有 serial 少了 log、介面消失）。
 - 每次 deploy 之後**先確認 kext 真的載入**（`ioreg -c Ath10kPCIDevice` 或 serial 第一行），
   再開始看行為，否則會把「沒載入」誤讀成「行為改變」。
+
+### 6.46 第四十一輪：蘋果預期 vs 我們實際（逐項對照表）+ 兩個契約修正
+
+新增 `docs/apple-vs-ours.md`：把 join 路徑上「Apple 的預期（反組譯／log 證據）」與
+「本驅動實際行為（breadcrumb 證據）」逐項對照，分成
+①userspace→family 的入口契約 ②assoc 本身 ③link 狀態回報 ④掃描結果 ⑤目前唯一剩下的差異。
+
+這輪照著表補掉兩個真差異：
+
+| 版本 | 差異 | 修法 | 證據 |
+|---|---|---|---|
+| **v242** | `IO80211ScanManager::queryScanResult`（`0x2013f80`）用 `(controller, cmd, type=11, vif, r8=out)` 呼叫 slot 406；我們把第三個參數（`11`）當使用者位址 copyIn → 失敗 → 落到 Apple 實作回 `0x66` | slot 406 增加「第三個是 type（<0x10000）」的分支，type 11 直接寫進 r8 指向的緩衝區；type 20 也走這條（含 copyIn） | `Ath10kScanServeTrace` 開始出現多筆成功；airportd 的 `GET CURR SCAN RESULT` 從每次都 `err=2` 變成部分 `err=0` |
+| **v243** | `ASSOCIATE_RESULT(21)` 在未連線時回 `kIOReturnError`（v230 的過度修正）→ framework 轉成 `0x66`，client 報 **102** | ioctl 一律成功，改用 `result` 欄位表達狀態（`UNAVAILABLE(0)` / `SUCCESS(1)`，Apple enum 本來就這樣定義） | `Ath10kIoctlFall="type=21 st=66"` 消失，錯誤碼回到 `-3903` 且 airportd 已走到 `setJoinEvent: Joining QCA-TEST` |
+
+剩下的差異（對照表 §4.3）：scan manager 需要 **`apple80211scan_req_node`** 才能把掃描結果
+交給後續查詢（`getCachedScanResults`），我們只服務 type 11 的讀取、沒有維護 request node，
+所以 `GET CURR SCAN RESULT` 仍會出現 `err=2`。

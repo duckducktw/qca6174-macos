@@ -1780,6 +1780,52 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
     // setScanRequest put the cmd in the 1st, the type in the 2nd, the interface in the
     // 3rd and the payload in the 4th. Serving both is what makes a POWER/SCAN_REQ from
     // the family land in this driver instead of coming back as 102/EOPNOTSUPP.
+    if ((second == kGetCmd || second == kSetCmd) && third < 0x10000UL) {
+        // The family has a second shape for this slot:
+        //     (controller, cmd, type, interface, payload)
+        // which is what IO80211ScanManager::queryScanResult (0xffffff8002013f80) and
+        // setAssociateRequest use - the type arrives in the *third* register, not as a
+        // request block. Serving it as a pointer ("copy in from address 11") made every
+        // SCAN_RESULT come back 0x66, which airportd logs as "GET CURR SCAN RESULT
+        // err=2": its scan cache stayed empty and the join had nothing to target.
+        const bool isSet = second == kSetCmd;
+        const int directType = static_cast<int>(third);
+        void *payload = e;
+        if (isSet && directType == APPLE80211_IOC_ASSOCIATE && payload != nullptr) {
+            const UInt64 src = reinterpret_cast<UInt64>(payload);
+            void *dst = &_venturaAssocScratch;
+            bool ok = true;
+            if (src < 0xffffff0000000000UL)
+                ok = ath10kControllerCopyIn(this, src, dst, sizeof(apple80211_assoc_data)) == 0;
+            else
+                bcopy(payload, dst, sizeof(apple80211_assoc_data));
+            if (ok) {
+                const SInt32 st = venturaAssociate(
+                    static_cast<const apple80211_assoc_data *>(dst));
+                ath10kVenturaProbeEntry(1, getProvider(), APPLE80211_IOC_ASSOCIATE, 0, st);
+                return st;
+            }
+        }
+        if (directType == APPLE80211_IOC_SCAN_RESULT && payload != nullptr) {
+            // One record per call, written straight into the caller's buffer; the
+            // non-zero return is the end-of-list marker the client expects.
+            const SInt32 st = venturaScanResult(static_cast<apple80211_scan_result *>(payload));
+            ath10kVenturaProbeEntry(1, getProvider(), APPLE80211_IOC_SCAN_RESULT, 0, st);
+            return st;
+        }
+        const SInt32 st = venturaRecordRequest(isSet ? 1 : 0, directType, payload);
+        ath10kVenturaProbeEntry(1, getProvider(), static_cast<UInt32>(directType), 0, st);
+        if (IOService *probe = getProvider()) {
+            char note[96];
+            snprintf(note, sizeof(note), "direct type=%d st=%x payload=%p", directType,
+                     static_cast<unsigned>(st), payload);
+            probe->setProperty("Ath10kDirectReq", note);
+        }
+        if (st == kIOReturnSuccess || directType == APPLE80211_IOC_SCAN_RESULT)
+            return st;
+        _venturaFallType = directType;
+        goto fallthrough_to_apple;
+    }
     if (second == kGetCmd || second == kSetCmd) {
         const bool isSet = second == kSetCmd;
         if (third >= 0xffffff0000000000UL) {
@@ -1972,6 +2018,7 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
     // is what answered the housekeeping gets before this shim existed. Its 0x66
     // (EOPNOTSUPP) is exactly the 102 airportd reports when a scan comes back empty, so
     // which type falls through and what it answers is published here.
+fallthrough_to_apple:
     const SInt32 appleStatus = IO80211Controller::apple80211_ioctl(iface, a, b, c, e);
     if (IOService *probe = getProvider()) {
         char fall[96];
@@ -2370,10 +2417,16 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
             static_cast<apple80211_assoc_result_data *>(data);
         if (result == nullptr)
             return kIOReturnBadArgument;
-        if (!Ath10k::connectionAssociated(_connection))
-            return kIOReturnError;
+        // The ioctl itself must succeed: returning an error here is EOPNOTSUPP at the
+        // framework layer, and the client reports that as error 102 instead of reading
+        // the "not ready yet" state this struct exists to carry
+        // (measured Ath10kIoctlFall="type=21 st=66"). Availability is expressed by the
+        // result field: UNAVAILABLE(0) while the join is in flight, SUCCESS(1) once the
+        // link is up - which is also what Apple's enum says.
         result->version = APPLE80211_VERSION;
-        result->result = 0;                 // APPLE80211_RESULT_SUCCESS
+        result->result = Ath10k::connectionAssociated(_connection)
+                             ? APPLE80211_RESULT_SUCCESS
+                             : APPLE80211_RESULT_UNAVAILABLE;
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_LINK_CHANGED_EVENT_DATA: {
