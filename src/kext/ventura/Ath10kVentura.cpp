@@ -493,6 +493,20 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
 {
     if (vif == nullptr)
         return false;
+    // Crash guard: handing this ifnet to the vif's prepareBSDInterface() faults
+    // inside IOSkywalkNetworkInterface (+0x1a, CR2=0x4c) whenever the vif's
+    // Skywalk extra is absent - measured twice as a boot panic whose backtrace
+    // was runVifPublish -> publishVenturaVifBsdUnit -> prepareBSDInterface.
+    // en1 is published and working without this handoff, so the path is now
+    // diagnostic-only: enable it with the ath10kvifbsd=1 boot argument when
+    // someone needs to re-measure it.
+    {
+        int diag = 0;
+        if (!PE_parse_boot_argn("ath10kvifbsd", &diag, sizeof(diag)) || diag == 0) {
+            provider->setProperty("Ath10kVifBsdPhase", "skipped-guarded");
+            return false;
+        }
+    }
     if (_venturaVifBsdDone) {
         provider->setProperty("Ath10kVifBsdPhase", "already-published");
         return true;
