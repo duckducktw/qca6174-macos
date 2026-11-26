@@ -1229,6 +1229,38 @@ void Ath10kPCIDevice::venturaTraceRequest(UInt32 entry, UInt32 cmd, UInt32 type,
     probe->setProperty("Ath10kEntryTrace", trace);
 }
 
+// A set is the only request that can start a join, and it is also the one request
+// type that gets buried instantly: measured after a failed cwjoin, the last 16
+// client requests were all getters and Ath10kSetSeen held a single stale record, so
+// "which set did airportd send and what did we answer" could not be read back.
+// Keep the sets alone, with the entry point that carried them.
+void Ath10kPCIDevice::venturaTraceSet(UInt32 entry, UInt32 type, SInt32 status)
+{
+    _venturaSetTrace[_venturaSetTraceNext].type = type;
+    _venturaSetTrace[_venturaSetTraceNext].status = static_cast<UInt32>(status);
+    _venturaSetTrace[_venturaSetTraceNext].pid = static_cast<UInt32>(proc_selfpid());
+    _venturaSetTrace[_venturaSetTraceNext].entry = entry;
+    _venturaSetTraceNext = (_venturaSetTraceNext + 1) % kVenSetTraceSlots;
+    if (_venturaSetTraceCount < kVenSetTraceSlots)
+        ++_venturaSetTraceCount;
+    IOService *probe = getProvider();
+    if (probe == nullptr)
+        return;
+    char setTrace[kVenSetTraceSlots * 32];
+    setTrace[0] = 0;
+    const UInt32 firstSet = (_venturaSetTraceCount == kVenSetTraceSlots) ? _venturaSetTraceNext : 0;
+    for (UInt32 i = 0; i < _venturaSetTraceCount; ++i) {
+        const UInt32 slot = (firstSet + i) % kVenSetTraceSlots;
+        char item[32];
+        snprintf(item, sizeof(item), "%u:%u:%x:e%u ", _venturaSetTrace[slot].type,
+                 static_cast<unsigned>(_venturaSetTrace[slot].pid),
+                 static_cast<unsigned>(_venturaSetTrace[slot].status),
+                 static_cast<unsigned>(_venturaSetTrace[slot].entry));
+        strlcat(setTrace, item, sizeof(setTrace));
+    }
+    probe->setProperty("Ath10kSetTrace", setTrace);
+}
+
 SInt32 Ath10kPCIDevice::venturaRecordRequest(UInt requestType, int requestNumber, void *data)
 {
     ++_venturaRequestCount;
@@ -1241,6 +1273,8 @@ SInt32 Ath10kPCIDevice::venturaRecordRequest(UInt requestType, int requestNumber
     // single request. airportd's scans begin with a batch of small getters, and a
     // refused one there aborts the scan without ever sending SCAN_REQ.
     const UInt32 callerPid = static_cast<UInt32>(proc_selfpid());
+    if (requestType == 1)
+        venturaTraceSet(_venturaLastEntry, static_cast<UInt32>(requestNumber), status);
     _venturaTrace[_venturaTraceNext].isSet = requestType == 1;
     _venturaTrace[_venturaTraceNext].type = static_cast<UInt32>(requestNumber);
     _venturaTrace[_venturaTraceNext].status = static_cast<UInt32>(status);
@@ -1803,6 +1837,7 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
                 const SInt32 st = venturaAssociate(
                     static_cast<const apple80211_assoc_data *>(dst));
                 ath10kVenturaProbeEntry(1, getProvider(), APPLE80211_IOC_ASSOCIATE, 0, st);
+                venturaTraceSet(1, APPLE80211_IOC_ASSOCIATE, st);
                 return st;
             }
         }
@@ -1830,6 +1865,61 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
         const bool isSet = second == kSetCmd;
         if (third >= 0xffffff0000000000UL) {
             const auto *raw = reinterpret_cast<const VenturaRawRequest *>(third);
+            // Only the sets whose type does not read as an apple80211 number are kept:
+            // the join's seven SCAN_REQ(10) and DISASSOCIATE(22) writes flush every
+            // recency ring within a second, and those two already parse correctly.
+            if (isSet && (raw->type < 0 || raw->type > 200)) {
+                // Keep the whole block for the puzzling sets: the type field alone is
+                // ambiguous (0x100/0x16b/0x185/0xff show up), and the payload pointer is
+                // what says whether this is an SSID write or something the family
+                // synthesised.
+                const UInt32 *words = reinterpret_cast<const UInt32 *>(raw);
+                VenturaSetBlockEntry &slotEntry = _venturaSetBlock[_venturaSetBlockNext];
+                slotEntry.pid = static_cast<UInt32>(proc_selfpid());
+                for (UInt32 i = 0; i < kVenSetBlockWords; ++i)
+                    slotEntry.words[i] = words[i];
+                _venturaSetBlockNext = (_venturaSetBlockNext + 1) % kVenSetBlockSlots;
+                if (_venturaSetBlockCount < kVenSetBlockSlots)
+                    ++_venturaSetBlockCount;
+                if (IOService *probe2 = getProvider()) {
+                    // Type, length, value and the payload's first bytes: the SSID text
+                    // shows up verbatim in a payload, so one dump says whether this
+                    // write carries the network name or something else entirely.
+                    {
+                        const UInt8 *rawBytes = reinterpret_cast<const UInt8 *>(raw);
+                        char detail[0x40 * 3 + 0x40 * 3 + 96];
+                        int used = snprintf(detail, sizeof(detail), "type=%x val=%x len=%u blk=",
+                                            raw->type, static_cast<unsigned>(raw->val),
+                                            static_cast<unsigned>(raw->len));
+                        for (UInt32 i = 0; i < 0x40 && used > 0 && used + 4 < (int)sizeof(detail); ++i)
+                            used += snprintf(detail + used, sizeof(detail) - used, "%02x", rawBytes[i]);
+                        strlcat(detail, " pay=", sizeof(detail));
+                        if (raw->data != nullptr && raw->len != 0 && raw->len <= 0x40) {
+                            const UInt8 *pay = static_cast<const UInt8 *>(raw->data);
+                            for (UInt32 i = 0; i < raw->len && used + 4 < (int)sizeof(detail); ++i)
+                                used += snprintf(detail + used, sizeof(detail) - used, "%02x", pay[i]);
+                        }
+                        probe2->setProperty("Ath10kSetWeird", detail);
+                    }
+                    char blocks[kVenSetBlockSlots * (kVenSetBlockWords * 9 + 12)];
+                    blocks[0] = 0;
+                    const UInt32 firstBlock = (_venturaSetBlockCount == kVenSetBlockSlots)
+                                                  ? _venturaSetBlockNext : 0;
+                    for (UInt32 i = 0; i < _venturaSetBlockCount; ++i) {
+                        const UInt32 slot = (firstBlock + i) % kVenSetBlockSlots;
+                        char item[kVenSetBlockWords * 9 + 12];
+                        int used = snprintf(item, sizeof(item), "[%u]", static_cast<unsigned>(
+                                                                       _venturaSetBlock[slot].pid));
+                        for (UInt32 w = 0; w < kVenSetBlockWords && used > 0 &&
+                                          static_cast<UInt32>(used) < sizeof(item);
+                             ++w)
+                            used += snprintf(item + used, sizeof(item) - used, " %x",
+                                             _venturaSetBlock[slot].words[w]);
+                        strlcat(blocks, item, sizeof(blocks));
+                    }
+                    probe2->setProperty("Ath10kSetBlock", blocks);
+                }
+            }
             if (IOService *probe = getProvider()) {
                 probe->setProperty("Ath10kIoctlReqType", static_cast<UInt64>(
                                        static_cast<UInt32>(raw->type)), 32);
@@ -1985,6 +2075,7 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
                 const SInt32 status = venturaAssociate(
                     static_cast<const apple80211_assoc_data *>(dst));
                 ath10kVenturaProbeEntry(1, getProvider(), APPLE80211_IOC_ASSOCIATE, 0, status);
+                venturaTraceSet(1, APPLE80211_IOC_ASSOCIATE, status);
                 return status;
             }
         }

@@ -79,6 +79,10 @@ private:
     // request that dies above it (Apple's own handler answering 0x66) has to be
     // caught here - entry id 1 = interface ioctl, 2 = skywalk slot.
     void venturaTraceRequest(UInt32 entry, UInt32 cmd, UInt32 type, UInt32 len);
+    // Sets-only history: airportd's getter polling flushes every shared ring in
+    // under a second, so the join's Set(SSID)/Set(AUTH_TYPE) vanish before the
+    // failure can be read back. This ring survives that.
+    void venturaTraceSet(UInt32 entry, UInt32 type, SInt32 status);
     bool alignVenturaVtable();
     bool createVenturaMediumTables(const IONetworkMedium **primary, bool forcePublish = false);
     // Dumps the controller's published medium keys plus the current medium type,
@@ -292,6 +296,27 @@ private:
     } _venturaClientTrace[kVenClientTraceSlots]{};
     UInt32 _venturaClientTraceNext = 0;
     UInt32 _venturaClientTraceCount = 0;
+    static constexpr UInt32 kVenSetTraceSlots = 12;
+    struct VenturaSetTraceEntry {
+        UInt32 type = 0;
+        UInt32 status = 0;
+        UInt32 pid = 0;
+        UInt32 entry = 0;
+    } _venturaSetTrace[kVenSetTraceSlots]{};
+    UInt32 _venturaSetTraceNext = 0;
+    UInt32 _venturaSetTraceCount = 0;
+    // Raw dwords of the last few *set* request blocks. The set types airportd sends
+    // do not all read as apple80211 numbers (measured 0x100/0x16b/0x185/0xff next
+    // to a clean 22), so the block itself has to be seen: either the layout differs
+    // per call site or the numbers are type|flag.
+    static constexpr UInt32 kVenSetBlockSlots = 4;
+    static constexpr UInt32 kVenSetBlockWords = 12;
+    struct VenturaSetBlockEntry {
+        UInt32 pid = 0;
+        UInt32 words[kVenSetBlockWords] = {};
+    } _venturaSetBlock[kVenSetBlockSlots]{};
+    UInt32 _venturaSetBlockNext = 0;
+    UInt32 _venturaSetBlockCount = 0;
     // Entry-point trace: entry id, ioctl cmd word, request number, length. The
     // dispatcher trace above cannot see a request that Apple's own handler kills
     // before it reaches us, which is exactly the case that refused the join.

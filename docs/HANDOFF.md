@@ -1,5 +1,15 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
+**第四十五輪（§6.50）補記**：加了 **set 專用軌跡**（`Ath10kSetTrace`／`Ath10kSetBlock`／
+`Ath10kSetWeird`），因為舊的共用環形緩衝一秒內就被 airportd 的 getter 洗掉。
+結論有二：① airportd 一次 `cwjoin` 只送 **UCM coex(255/256) ＋ 7×SCAN_REQ(10) ＋ 3×DISASSOCIATE(22)**，
+`Set(SSID)`／`Set(AUTH_TYPE)`／`ASSOCIATE` 仍然完全沒有（第 1 層卡點成立，現在有 set-only 證據）；
+② 過去當成「解析壞掉」的 type 255／256／363／389 **是蘋果真的有的型別**
+（live `_gSetHandlerTable` 解析：`setUCMCoexProfile`／`setUCMCoexProfileActive`／
+`setUSBHostNotification`／`setUserspaceP2POptions`），以後不要再當 ABI 壞掉查。
+另外 `tools/a2join` 這輪實測 **ASSOCIATE(20) 進得了驅動**，但 `keylen=0`（金鑰沒被認出）＋
+`-3905/errno 60`（等不到完成事件）——兩條路卡的位置不同，下一輪從這兩點分頭下手。
+
 > **新接手先讀這份**：[`docs/handoff-apple-join-conditions.md`](handoff-apple-join-conditions.md)
 > —— 蘋果「放行 join」的四層條件（airportd／Associate2／IO80211Family／驅動回報）、
 > 每一條的反組譯位址與實測證據、目前卡在第 1 層（airportd 連 `Set(SSID)` 都不送），
@@ -2950,3 +2960,126 @@ Ath10kScanMgrStart  = "ok"
 **本輪最後量測**：`cwjoin` 仍 `-3903`，`Ath10kClientTrace` 只有 getter
 （`g12 g19 g96 g1 g1 g2 g15 g4 …`，**沒有任何 set**），`Ath10kChannelReply = 0`
 （證明 airportd 沒有 pin 頻道，即沒進入寫入階段）。
+
+### 6.50 第四十五輪（v248–v251）：set 專用軌跡上線 —— 「奇怪的 type 255/256/387」其實是蘋果真有的型別
+
+#### 6.50.1 為什麼需要新儀器
+
+第四十四輪留下的判讀是「airportd 連 `Set(SSID)` 都不送」，但這個結論建立在兩份共用環形緩衝
+（`Ath10kClientTrace` 16 格、`Ath10kRequestTrace` 64 格）上，而 airportd 的 getter 輪詢
+**不到一秒就把兩圈洗掉**。實測：一次失敗的 `cwjoin` 之後，兩個環裡清一色是 `g`，只有
+`Ath10kSetSeen` 一顆（而且是舊的）。所以「沒有 set」可能只是「set 被洗掉了」。
+
+新增（全部是 driver 端，`src/kext/ventura/`）：
+
+| 斷點 | 內容 |
+|---|---|
+| `Ath10kSetTrace` | **只看 set** 的環形緩衝（12 格）：`type:pid:status:entry`。entry 1 = 介面 ioctl slot，2 = skywalk request slot |
+| `Ath10kSetBlock` | 最近 4 個「type 讀起來不像 apple80211 號碼」的 set 請求區塊，12 個 dword 原樣（pid 帶著） |
+| `Ath10kSetWeird` | 同上的 `type/val/len` ＋ 區塊前 0x40 bytes ＋ payload 前 0x40 bytes |
+
+寫法上刻意**只留「type 不在 1..200」的區塊**：join 期間的 7 個 `SCAN_REQ(10)` 與
+`DISASSOCIATE(22)` 本身解析正確，留它們只會把真正可疑的那幾筆擠掉（v250 的教訓）。
+
+#### 6.50.2 量測結果一：airportd 的 set 清單（`cwjoin QCA-TEST en1`，v251）
+
+```
+Ath10kSetTrace = "255:172:0:e1 256:172:0:e1 10:172:0:e2 10:172:0:e2 10:172:0:e2
+                  10:172:0:e2 10:172:0:e2 10:172:0:e2 10:172:0:e2 22:172:0:e1 22:172:0:e1 22:172:0:e1"
+```
+
+也就是：**UCM coex 設定兩個 → 七次掃描 → 三次拆線**。仍然**沒有 `Set(SSID)`(1)、
+沒有 `Set(AUTH_TYPE)`(2)、沒有 `ASSOCIATE`(20)**。所以「airportd 在寫入階段之前就停」
+這個結論**成立**，只是現在有 set-only 證據，不再依賴會被洗掉的環。
+
+#### 6.50.3 量測結果二：那些「奇怪的 type」是蘋果自己的型別（本輪最大收穫）
+
+`Ath10kSetWeird` 原始區塊（airportd）：
+
+```
+type=100 val=0 len=0 blk=656e3100…00010000000000000000000000000000
+                          0820901fc3ffffff 00000000 01000000 …
+```
+
+`if_name="en1"`、`req_type=0x100`、`val=0`、`len=0`、`+0x20` 是 kernel 指標、`+0x2c=1`。
+過去三輪把 255／256／387 當成「解析壞掉」，實際上是**蘋果家族的 set handler 表真的有這些號碼**：
+
+`IO80211Controller::_apple80211_ioctl_setForIOUCE`（live `0x1fecb3c`）一進來就
+`ecx = [req+0x10]`、`lea edx,[rcx+0xfffffe57]; cmp edx,0xfffffe57`（型別上界 0x1a9）、
+再 `r14 = _gSetHandlerTable[type-1]`、`call r14(controller, vif, infra, req, flag)`。
+
+解析 live `_gSetHandlerTable`（`0xffffff80020d79b0`，第 `type-1` 格）：
+
+| type | handler | 意義 |
+|---|---|---|
+| 1 | `setSSID` | ⬅ 真正的 Set(SSID) |
+| 2 | `setAuthType` | |
+| 9 | `setBSSID` | |
+| 10 | `setScanRequest` | |
+| 20 | `setAssociateRequest` | |
+| 22 | `setDisassociate` | |
+| **255 (0xff)** | `setUCMCoexProfile` | 不是壞值 |
+| **256 (0x100)** | `setUCMCoexProfileActive` | 不是壞值 |
+| **363 (0x16b)** | `setUSBHostNotification` | |
+| **389 (0x185)** | `setUserspaceP2POptions` | |
+
+（取法：`an.py ptr 0xffffff80020d79b0+8*(type-1)`；getter 表在 `0xffffff80020d6c70`，
+legacy 版 `0x20e2d10`／`0x20dd360`。）
+
+**結論**：`vendor/itlwm-v1/Airport/apple80211_ioctl.h` 只列到 102，Ventura 的 live family
+多了一大段（到 0x1a9）。以後看到 `Ath10kUnknownReq` 是 255/256/363/389 這類號碼，
+先查這張表再決定要不要管，不要當成 ABI 壞掉。
+
+#### 6.50.4 量測結果三：我們自己的 `Apple80211Associate2` harness 仍走得比 airportd 遠，但缺金鑰
+
+`tools/a2join`（直接呼叫 `Apple80211Associate2(ref, dict, password, out)`，v251）：
+
+```
+ssid+pass    bind ok → elapsed=10.2s rc=-3905 (0xfffff0bf) errno=60
+ssid+pass+ch → 同上；ssid+pass+ch2 → 同上
+Ath10kSetTrace  = … 20:783:0:e1 20:785:0:e1 20:788:0:e1        ← ASSOCIATE 真的到驅動了
+Ath10kAssocRaw  = ver=1 len=8 upper=0000 lower=0001 keylen=0
+```
+
+兩件事同時成立：
+1. **ASSOCIATE(20) 到得了驅動**（entry 1，pid 是 harness 的子行程），所以第 2/3 層是通的。
+2. 但 `keylen=0`、`auth_upper=0`（開放式）——字典沒讓 Associate2 認出金鑰材料，
+   而 `-3905/errno 60` 是**等不到完成事件**（10.2 秒窗），與 §6.42 一致。
+
+airportd 完全沒有 type 20，代表它**沒有呼叫到 `Apple80211Associate2` 的送出段**
+（或呼叫了但在 userspace 就返回 -3903）。所以兩條路目前卡在不同地方：
+airportd 卡在更前面（第 1 層），我們的 harness 卡在金鑰＋完成事件（第 2／4 層的交界）。
+
+#### 6.50.5 下一輪的兩個明確入口
+
+1. **修 `a2join` 的字典形狀讓 `keylen=32`（PMK）**：§6.35 已證明 Associate2 會自己把
+   32-byte PMK 寫進 `ad_key.key`（`0xa25c: key_len=0x20, cipher=6`）。目前 `ch2` 變體仍
+   `keylen=0`，下一步是把 dict 的 security/auth 鍵補到它認得（比對 `0x97cc` 的跳表入口，
+   `0x980a` 需要 `[ref+0x59] & 8`）。
+2. **airportd 端加一顆「它到底有沒有進 Associate2」的證據**：airportd 若呼叫了 Associate2，
+   驅動會看到 type 20 且 `proc_selfpid()` = airportd。目前沒有，所以只剩兩種可能：
+   (a) 它根本沒呼叫，(b) 呼叫後在 userspace 出口 A/B 返回。下次在 userspace 攔
+   （`tools/a2mon.c` 已有事件監聽骨架）或直接反組譯
+   `-[CWXPCSubsystem __associateToWiFiNetwork:…]_block_invoke` 裡 call Associate2 的那一段。
+
+#### 6.50.6 部署備忘（Acer `/tmp` 會被清掉）
+
+`/tmp/pull_v.sh`、`/tmp/deploy_arg.sh` 這輪開機後已不存在；**工具的正本在 `~/qca-tools/`**
+（`pull_v.sh`、`deploy.sh`、`with_esp.sh`、`oc_enable.py`）。本輪流程：
+
+```bash
+bash ~/.hermes/cache/scratch/build_v.sh                       # 本機 → Acer → guest 內編譯
+ssh 100.64.0.152 'bash ~/qca-tools/pull_v.sh 251'
+cat ~/sudo.pwd | ssh 100.64.0.152 'bash ~/qca-tools/deploy.sh /tmp/vk251'
+```
+
+`deploy.sh` 不吃 boot-args（`ath10kjoin=` 留在 config.plist 裡），開機後 60–90 秒回到
+`connected-wpa2`；`vk248` 起連續四版都如此，沒有 panic。
+
+#### 6.50.7 本輪檔案變更
+
+- `src/kext/ventura/Ath10kVenturaDecl.inc`：`kVenSetTraceSlots`／`VenturaSetTraceEntry`、
+  `kVenSetBlockSlots`／`VenturaSetBlockEntry`、`venturaTraceSet()` 宣告。
+- `src/kext/ventura/Ath10kVentura.cpp`：`venturaTraceSet()`（含 `Ath10kSetTrace` 發佈）、
+  `venturaRecordRequest()` 與兩個 ASSOCIATE 早退分支都會記錄；kernel 區塊分支對
+  「type 不在 1..200」的 set 留 `Ath10kSetBlock` 與 `Ath10kSetWeird`。
