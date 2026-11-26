@@ -2695,3 +2695,25 @@ RUNTIME STOP reason=protected-network-not-supported
 
 工具：`tools/a2mon.c`（含事件監聽的呼叫端）、`tools/a2spy.c`（嘗試 interpose 字典查詢，於 shared cache
 的 direct bind 無效）、`tools/refflags.c`（量 ref+0x50 的能力鏡像佈局）、`tools/jointime2.sh`（量 join 延遲）。
+
+### 6.43 第三十八輪：逆向流程文件化 + 對齊社群實作（itlwm）
+
+新增 `docs/reverse-engineering-playbook.md`：工具鏈、標準流程、陷阱清單，以及
+**OpenIntelWireless AirportItlwm 的做法對照**（它是同樣用 Apple IO80211 家族而且能用的實作）。
+
+照著它補掉三處差異（v229→v230）：
+
+| 項目 | itlwm | 我們（v230） |
+|---|---|---|
+| 關聯完成 | `setLinkState` + `setRunningState` + `postMessage(LINK_CHANGED/BSSID_CHANGED/SSID_CHANGED/ASSOC_DONE, NULL,0)` | ✅ 同樣（實測 `Ath10kLinkEvent = up=1 link=2`＝`kIO80211NetworkLinkUp`） |
+| `ASSOCIATE_RESULT(21)` | 只有 RUN 才回 success，否則 `kIOReturnError` | ✅ 已改（原本無條件 success） |
+| `LINK_CHANGED_EVENT_DATA(156)` | 填 `isLinkDown`/`voluntary`/`reason`/`rssi` | ✅ 已實作（原本落到 default 回全零） |
+| `M_RSN_HANDSHAKE_DONE` | 4-way 完成後送 | ✅ 已加 |
+
+實測（v230）：`a2push` 仍 rc=0 → connected-wpa2（約 2 秒）；`cwjoin` 仍 `-3903`，
+但 `ssid-now=QCA-TEST rssi=-42` —— 連線是通的，`-3903` 在 airportd 的 userspace 決策。
+
+**參考來源**：`OpenIntelWireless/itlwm`（master）的 `AirportItlwm/AirportItlwmV2.cpp`
+（`setLinkStateGated` / `eventHandler`）、`AirportItlwm/AirportSTAIOCTL.cpp`
+（`setASSOCIATE` / `getASSOCIATE_RESULT` / `getLINK_CHANGED_EVENT_DATA`）、
+`include/Airport/IO80211SkywalkInterface.h`（`postMessage(UInt,void*,unsigned long,bool)`）。

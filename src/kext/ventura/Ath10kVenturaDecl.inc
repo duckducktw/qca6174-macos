@@ -124,6 +124,7 @@ private:
     // Association completion events for the client's join loop (see the
     // implementation: without them Apple80211Associate2 times out with -3905).
     void venturaPostLinkEvents(bool up);
+    IO80211LinkState _venturaLinkState = kIO80211NetworkLinkUndefined;
     void venturaPendingJoinService(UInt64 nowMs);
     void venturaDisassociate(bool deauth);
     IOReturn venturaScanResult(apple80211_scan_result *result);

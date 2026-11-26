@@ -2292,10 +2292,36 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         venturaDisassociate(requestNumber == APPLE80211_IOC_DEAUTH);
         return kIOReturnSuccess;
     case APPLE80211_IOC_ASSOCIATE_RESULT: {
+        // Reference implementation (OpenIntelWireless AirportItlwm,
+        // AirportSTAIOCTL.cpp getASSOCIATE_RESULT): answer success *only* once the
+        // link is really running, and an error while the join is still in flight.
+        // Answering success unconditionally told the client the join was done while
+        // the driver was still associating.
         apple80211_assoc_result_data *result =
             static_cast<apple80211_assoc_result_data *>(data);
+        if (result == nullptr)
+            return kIOReturnBadArgument;
+        if (!Ath10k::connectionAssociated(_connection))
+            return kIOReturnError;
         result->version = APPLE80211_VERSION;
-        result->result = 0;
+        result->result = 0;                 // APPLE80211_RESULT_SUCCESS
+        return kIOReturnSuccess;
+    }
+    case APPLE80211_IOC_LINK_CHANGED_EVENT_DATA: {
+        // Same reference driver fills this instead of letting it fall through to the
+        // zero-filled default (which reported "link up, rssi 0" at all times).
+        apple80211_link_changed_event_data *event =
+            static_cast<apple80211_link_changed_event_data *>(data);
+        if (event == nullptr)
+            return kIOReturnBadArgument;
+        bzero(event, sizeof(*event));
+        event->isLinkDown = Ath10k::connectionAssociated(_connection) ? 0 : 1;
+        if (event->isLinkDown) {
+            event->voluntary = 0;
+            event->reason = APPLE80211_LINK_DOWN_REASON_DEAUTH;
+        } else {
+            event->rssi = _connection.portAuthorized ? -50 : 0;
+        }
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_ASSOCIATION_STATUS: {
@@ -3498,6 +3524,17 @@ extern "C" int ath10kInterfacePostMessage(const char *ifname, UInt32 msg, void *
 // only then caches it at ivars+1, so a virtual interface that never got an ifnet
 // reports null - and postMessageIOUC then has nothing to match. Both calls are
 // exported, so the outcome is measured instead of assumed.
+// Live Skywalk symbols the MacKernelSDK headers do not declare (mangled names taken
+// from the kernel cache): setRunningState(bool) and the three-argument postMessage.
+extern "C" SInt32 ath10kVifSetRunningState(IO80211VirtualInterface *self, bool running)
+    __asm("__ZN23IO80211SkywalkInterface15setRunningStateEb");
+extern "C" void ath10kVifPostMessage(IO80211VirtualInterface *self, UInt msg, void *data,
+                                     unsigned long len)
+    __asm("__ZN23IO80211SkywalkInterface11postMessageEjPvm");
+extern "C" SInt32 ath10kVifLinkStateReporter(IO80211VirtualInterface *self, IO80211LinkState s,
+                                             UInt c, bool debounce, UInt code)
+    __asm("__ZN23IO80211SkywalkInterface12setLinkStateE16IO80211LinkStatejbj");
+
 extern "C" const char *ath10kVifGetBSDName(IO80211VirtualInterface *self)
     __asm("__ZN23IO80211SkywalkInterface10getBSDNameEv");
 extern "C" IOReturn ath10kVifPostMessageIOUC(IO80211VirtualInterface *self, const char *name,
@@ -3516,6 +3553,27 @@ void Ath10kPCIDevice::venturaPostLinkEvents(bool up)
     IOService *probe = getProvider();
     if (_venturaVif == nullptr)
         return;
+    // Follow what the working community driver (OpenIntelWireless AirportItlwm,
+    // AirportItlwmV2.cpp setLinkStateGated / eventHandler) does, because that is the
+    // shape the live client actually observes:
+    //   setLinkState(kIO80211NetworkLinkUp/Down) -> setRunningState(bool)
+    //   -> postMessage(M_LINK_CHANGED / M_BSSID_CHANGED / M_SSID_CHANGED, NULL, 0, false)
+    // and M_ASSOC_DONE with a NULL payload as well. Publishing ioreg properties alone
+    // left Apple80211Associate2 waiting until its 10.2 s deadline (-3905).
+    _venturaLinkState = up ? kIO80211NetworkLinkUp : kIO80211NetworkLinkDown;
+    ath10kVifLinkStateReporter(_venturaVif, _venturaLinkState, 0, false, 0);
+    ath10kVifSetRunningState(_venturaVif, up);
+    void *nil = nullptr;
+    ath10kVifPostMessage(_venturaVif, APPLE80211_M_LINK_CHANGED, nil, 0);
+    ath10kVifPostMessage(_venturaVif, APPLE80211_M_BSSID_CHANGED, nil, 0);
+    ath10kVifPostMessage(_venturaVif, APPLE80211_M_SSID_CHANGED, nil, 0);
+    if (up) {
+        // The association result and the handshake completion are two different
+        // notifications in the live family; itlwm posts both.
+        ath10kVifPostMessage(_venturaVif, APPLE80211_M_ASSOC_DONE, nil, 0);
+        ath10kVifPostMessage(_venturaVif, APPLE80211_M_RSN_HANDSHAKE_DONE, nil, 0);
+    }
+    // The kern_event bridge airportd's own reader thread consumes.
     char ifname[16] = {};
     const char *unit = nullptr;
     if (_venturaInterface != nullptr) {
@@ -3523,27 +3581,15 @@ void Ath10kPCIDevice::venturaPostLinkEvents(bool up)
             unit = n->getCStringNoCopy();
     }
     strlcpy(ifname, unit != nullptr ? unit : "en1", sizeof(ifname));
-    // Payload shape Apple's own driver sends for M_LINK_CHANGED: two u32 (link up, rssi).
-    struct { UInt32 up; UInt32 rssi; } linkPayload{up ? 1u : 0u, 0u};
-    const int linkStatus = ath10kInterfacePostMessage(ifname, APPLE80211_M_LINK_CHANGED,
-                                                      &linkPayload, sizeof(linkPayload), this);
-    int assocStatus = 0;
-    if (up) {
-        struct { UInt32 status; UInt32 bssidOk; } assocPayload{0, 1};
-        assocStatus = ath10kInterfacePostMessage(ifname, APPLE80211_M_ASSOC_DONE,
-                                                 &assocPayload, sizeof(assocPayload), this);
-        // Skywalk fan-out for clients that hold an IOUC pipe instead.
-        if (_venturaVif != nullptr) {
-            _venturaVif->postMessage(APPLE80211_M_ASSOC_DONE, &assocPayload, sizeof(assocPayload));
-            _venturaVif->postMessage(APPLE80211_M_LINK_CHANGED, &linkPayload, sizeof(linkPayload));
-        }
-    }
+    const int kevLink = ath10kInterfacePostMessage(ifname, APPLE80211_M_LINK_CHANGED, nullptr, 0, this);
+    const int kevAssoc = up ? ath10kInterfacePostMessage(ifname, APPLE80211_M_ASSOC_DONE, nullptr, 0, this) : 0;
     if (probe != nullptr) {
-        char note[96];
-        snprintf(note, sizeof(note), "up=%d kev(link=%d assoc=%d) name=%s",
-                 up ? 1 : 0, linkStatus, assocStatus, ifname);
+        char note[128];
+        snprintf(note, sizeof(note), "up=%d link=%d assoc=%d kev=%d/%d name=%s",
+                 up ? 1 : 0, static_cast<int>(_venturaLinkState), 0, kevLink, kevAssoc, ifname);
         probe->setProperty("Ath10kLinkEvent", note);
     }
+    IOLog("Ath10kMac: link event up=%d (%s)\n", up ? 1 : 0, ifname);
 }
 
 void Ath10kPCIDevice::scanNotifyCall(thread_call_param_t param0, thread_call_param_t)
