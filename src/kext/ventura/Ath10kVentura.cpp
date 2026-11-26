@@ -336,6 +336,23 @@ UInt32 Ath10kPCIDevice::hardwareOutputQueueDepth()
     return 1024;
 }
 
+// Live setAssociateRequest() (0xffffff8001fe2533) does this right after the driver
+// returns success for ASSOCIATE(20):
+//     mov esi,[assoc_data+8]        ; ad_auth_upper
+//     bt  0x116, esi                ; WEP/WPA/WPA2-PSK/WPA2-SHA256 style AKMs
+//     call [vptr+0xc78]             ; = this predicate (ZTV slot 401)
+//     ...  [vif ivars+0x118]+0x20 = now+15 ; return 6
+// i.e. a true answer means "Apple's supplicant will finish the handshake" and the
+// caller is told to wait — but that supplicant lives in IO80211FamilyLegacy only,
+// so nothing ever completes and airportd reports -3903. Answering false keeps the
+// whole join inside this driver's own four-way handshake.
+bool Ath10kPCIDevice::useAppleRSNSupplicant(IO80211VirtualInterface *)
+{
+    if (IOService *probe = getProvider())
+        probe->setProperty("Ath10kAppleRSNGate", "forced-off");
+    return false;
+}
+
 // IO80211Controller stores its IO80211CommandGate on the queue this returns and
 // IO80211VirtualInterface::init() dereferences it through
 // apple80211VirtualRequestIoctl(), so a null answer faults inside the family.
@@ -1144,6 +1161,21 @@ void Ath10kPCIDevice::venturaTraceRequest(UInt32 entry, UInt32 cmd, UInt32 type,
     IOService *probe = getProvider();
     if (probe == nullptr)
         return;
+    // Sets are rare and instantly buried by airportd's getter polling in the ring
+    // above, so keep a dedicated "last set seen" record: without it there is no way
+    // to tell "airportd never sent ASSOCIATE" from "the ring already rolled over".
+    if (cmd == 0x803069c8UL || cmd == 0x802869c8UL) {
+        char name[64];
+        name[0] = 0;
+        proc_selfname(name, sizeof(name));
+        char seen[128];
+        snprintf(seen, sizeof(seen), "entry=%u cmd=%lx type=0x%x len=%u pid=%d name=%s",
+                 static_cast<unsigned>(entry), static_cast<unsigned long>(cmd),
+                 static_cast<unsigned>(type), static_cast<unsigned>(len), proc_selfpid(), name);
+        probe->setProperty("Ath10kSetSeen", seen);
+        if (type == 20)
+            probe->setProperty("Ath10kSetAssocSeen", seen);
+    }
     char trace[kVenEntryTraceSlots * 32];
     trace[0] = 0;
     const UInt32 first = (_venturaEntryTraceCount == kVenEntryTraceSlots) ? _venturaEntryTraceNext : 0;
@@ -1224,12 +1256,12 @@ SInt32 Ath10kPCIDevice::apple80211VirtualRequest(UInt requestType, int requestNu
 // tells us which slot and which argument order that really is, and the Apple
 // implementation still runs afterwards so nothing regresses in the meantime.
 static void publishIoctlArgs(IOService *probe, const char *slot, unsigned long a, unsigned long b,
-                             unsigned long c, unsigned long d)
+                             unsigned long c, unsigned long d, unsigned long e = 0)
 {
     if (probe == nullptr)
         return;
-    char value[160];
-    snprintf(value, sizeof(value), "%s a=%lx b=%lx c=%lx d=%lx", slot, a, b, c, d);
+    char value[200];
+    snprintf(value, sizeof(value), "%s a=%lx b=%lx c=%lx d=%lx e=%lx", slot, a, b, c, d, e);
     probe->setProperty("Ath10kIoctlArgs", value);
     probe->setProperty("Ath10kIoctlArgsSlot", slot);
 }
@@ -1632,7 +1664,7 @@ struct VenturaRawRequest {
 };
 
 SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigned long a,
-                                         void *b, void *c)
+                                         void *b, void *c, void *e)
 {
     const unsigned long kGetCmd = 0xc03069c9UL;   // _IOWR('i', 201, 48) - getter
     const unsigned long kSetCmd = 0x803069c8UL;   // _IOW('i', 200, 48) - setter
@@ -1640,7 +1672,10 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
     const unsigned long third = reinterpret_cast<unsigned long>(b);
     const unsigned long fourth = reinterpret_cast<unsigned long>(c);
     const unsigned long first = reinterpret_cast<unsigned long>(iface);
-    publishIoctlArgs(getProvider(), "skywalk", first, second, third, fourth);
+    // All five raw arguments, because the family uses more than one calling
+    // convention on this slot and the only way to tell them apart is the tuple.
+    publishIoctlArgs(getProvider(), "skywalk", first, second, third, fourth,
+                     reinterpret_cast<unsigned long>(e));
     venturaTraceRequest(1, static_cast<UInt32>(second), static_cast<UInt32>(third),
                         static_cast<UInt32>(fourth));
     // Record the first dwords of *every* request block that reaches this slot, not
@@ -1805,16 +1840,59 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
                 }
             }
         }
-    } else if (first == kSetCmd || first == kGetCmd) {
-        const bool isSet = first == kSetCmd;
+    } else if (third == kSetCmd || third == kGetCmd) {
+        // The setPower/setScanRequest/setAssociateRequest convention calls this slot
+        // with rdi unused-ish, rsi=cmd, rdx=type, rcx=iface/controller, r8=payload.
+        // Reading the payload from the 4th argument instead (which is the interface)
+        // is why a forwarded ASSOCIATE never produced a usable request.
+        const bool isSet = third == kSetCmd;
         const int type = static_cast<int>(second);
+        if (isSet && type == APPLE80211_IOC_ASSOCIATE && e != nullptr) {
+            if (IOService *probe = getProvider()) {
+                char note[96];
+                snprintf(note, sizeof(note), "entry=skywalk-5arg upper-ptr=%p", e);
+                probe->setProperty("Ath10kAssocEntry", note);
+            }
+            VenturaRawRequest assoc;
+            bzero(&assoc, sizeof(assoc));
+            assoc.type = APPLE80211_IOC_ASSOCIATE;
+            assoc.len = sizeof(apple80211_assoc_data);
+            const UInt64 src = reinterpret_cast<UInt64>(e);
+            // Payload may be a kernel or a user address; try the user copy first when
+            // it is below the kernel range, otherwise read it directly.
+            void *dst = &_venturaAssocScratch;
+            bool ok;
+            if (src >= 0xffffff0000000000UL) {
+                bcopy(e, dst, sizeof(apple80211_assoc_data));
+                ok = true;
+            } else {
+                ok = ath10kControllerCopyIn(this, src, dst, sizeof(apple80211_assoc_data)) == 0;
+            }
+            if (ok) {
+                const SInt32 status = venturaAssociate(
+                    static_cast<const apple80211_assoc_data *>(dst));
+                ath10kVenturaProbeEntry(1, getProvider(), APPLE80211_IOC_ASSOCIATE, 0, status);
+                return status;
+            }
+        }
         if (IOService *probe = getProvider())
             probe->setProperty("Ath10kIoctlReqType", static_cast<UInt64>(
                                    static_cast<UInt32>(type)), 32);
         // Both verbs carry the payload directly here. Getters have to be served too:
         // airportd's SCAN_RESULT arrives this way, and leaving it to Apple's
         // implementation is what returned 0x66 (= the error 102 it reports).
-        const SInt32 status = venturaRecordRequest(isSet ? 1 : 0, type, c);
+        void *payload = (e != nullptr) ? e : c;
+        if (payload != nullptr && reinterpret_cast<unsigned long>(payload) < 0xffffff0000000000UL) {
+            // User-space payload: copy a bounded window in before dispatch.
+            UInt64 len = 0x800;
+            static_assert(sizeof(_venturaAssocScratch) >= 0x800, "scratch too small");
+            if (ath10kControllerCopyIn(this, reinterpret_cast<UInt64>(payload), &_venturaAssocScratch,
+                                       len) == 0)
+                payload = &_venturaAssocScratch;
+            else
+                payload = nullptr;
+        }
+        const SInt32 status = venturaRecordRequest(isSet ? 1 : 0, type, payload);
         ath10kVenturaProbeEntry(1, getProvider(), static_cast<UInt32>(type), 0, status);
         if (status == kIOReturnSuccess)
             return kIOReturnSuccess;
@@ -1827,7 +1905,7 @@ SInt32 Ath10kPCIDevice::apple80211_ioctl(IO80211SkywalkInterface *iface, unsigne
     // is what answered the housekeeping gets before this shim existed. Its 0x66
     // (EOPNOTSUPP) is exactly the 102 airportd reports when a scan comes back empty, so
     // which type falls through and what it answers is published here.
-    const SInt32 appleStatus = IO80211Controller::apple80211_ioctl(iface, a, b, c);
+    const SInt32 appleStatus = IO80211Controller::apple80211_ioctl(iface, a, b, c, e);
     if (IOService *probe = getProvider()) {
         char fall[96];
         snprintf(fall, sizeof(fall), "type=%d st=%x entry=%u cmd=%lx", _venturaFallType,
@@ -2554,6 +2632,14 @@ IOReturn Ath10kPCIDevice::venturaScanResult(apple80211_scan_result *result)
     return kIOReturnSuccess;
 }
 
+static UInt64 ath10kNowMs()
+{
+    uint64_t now = 0, ns = 0;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now, &ns);
+    return ns / 1000000u;
+}
+
 IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
 {
     IOService *probe = getProvider();
@@ -2570,9 +2656,52 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
                  static_cast<unsigned>(request->ad_key.key_len),
                  static_cast<unsigned>(request->ad_rsn_ie_len));
         probe->setProperty("Ath10kAssocRaw", raw);
+        // Auto-join and airportd send byte-identical assoc_data, so the request alone
+        // cannot tell who asked. The kernel's own pid helper can.
+        {
+            char name[64];
+            name[0] = 0;
+            proc_selfname(name, sizeof(name));
+            char who[96];
+            snprintf(who, sizeof(who), "pid=%d name=%s", proc_selfpid(), name);
+            probe->setProperty("Ath10kAssocWho", who);
+        }
     }
     if (request == nullptr)
         return kIOReturnBadArgument;
+    // A second join cannot start a vdev while the first link is still up (or still
+    // draining): the firmware rejects the VDEV_START with
+    // "WMI RUNTIME RX REJECT … error=vdev-start-unsolicited" and the runtime stops,
+    // which is exactly what the replay of airportd's click-to-join produced. Park the
+    // request, ask the state machine for a real teardown, and replay it once idle.
+    {
+        auto &s = _connection;
+        // "Busy" means a vdev is up or its teardown is in flight. A bare
+        // cancelRequested with the state machine already idle is not busy: that is
+        // the state a previous defer leaves behind, and treating it as busy made
+        // every retry defer again until the 12 s timeout (measured on v215).
+        const bool busy = (_venturaPowerOn &&
+                           (s.stage == Ath10k::LinkStage::Connected || s.vdevUp ||
+                            s.disconnect != Ath10k::DisconnectStage::None ||
+                            s.wmiOwned || s.txOwned));
+        if (busy) {
+            _venturaPendingAssoc = *request;
+            _venturaPendingAssocValid = true;
+            _venturaPendingSinceMs = ath10kNowMs();
+            ++_venturaAssocDefers;
+            s.error = "join-deferred-teardown";
+            s.cancelRequested = true;
+            if (probe != nullptr) {
+                char note[96];
+                snprintf(note, sizeof(note), "defers=%u stage=%u disconnect=%u",
+                         static_cast<unsigned>(_venturaAssocDefers),
+                         static_cast<unsigned>(s.stage),
+                         static_cast<unsigned>(s.disconnect));
+                probe->setProperty("Ath10kAssocDefer", note);
+            }
+            return kIOReturnSuccess;
+        }
+    }
     if (!_wmiLive.active) {
         // Distinguish "no firmware session yet" from a bad request shape: both used
         // to surface as kIOReturnBadArgument, which made the SAE work look like a
@@ -2727,7 +2856,56 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
 
 void Ath10kPCIDevice::venturaDisassociate(bool)
 {
+    // This used to only publish APPLE80211_S_INIT, so the vdev stayed up while
+    // userspace believed the link was gone; the ASSOCIATE that airportd sends right
+    // after then failed the firmware's VDEV_START ("vdev-start-unsolicited") and the
+    // whole click-to-join died. Ask the state machine for a real teardown instead.
+    _venturaPendingAssocValid = false;
+    if (_connection.stage > Ath10k::LinkStage::Scan || _connection.vdevUp) {
+        _connection.error = "user-disassociate";
+        _connection.cancelRequested = true;
+    } else {
+        // Nothing is up: asking for a drain here would set cancelRequested on a
+        // state machine that never services it again (stage Disabled returns early),
+        // which blocked every later join.
+        _connection.cancelRequested = false;
+    }
     venturaPublishState(APPLE80211_S_INIT);
+}
+
+// Called on every service tick (from venturaSecurityService, which serviceConnection
+// runs before its own stages): replay a parked join as soon as the teardown finished.
+void Ath10kPCIDevice::venturaPendingJoinService(UInt64 nowMs)
+{
+    if (!_venturaPendingAssocValid)
+        return;
+    auto &s = _connection;
+    IOService *probe = getProvider();
+    if (s.disconnect == Ath10k::DisconnectStage::None && s.stage <= Ath10k::LinkStage::Scan &&
+        !s.vdevUp && s.cancelRequested) {
+        // Left over from a defer that never had anything to drain: clear it, or the
+        // replay below would push a join into a state machine that refuses to start.
+        s.cancelRequested = false;
+    }
+    if (s.disconnect != Ath10k::DisconnectStage::None || s.cancelRequested || s.vdevUp ||
+        s.stage == Ath10k::LinkStage::Connected) {
+        // Give the drain 12 s, then drop the parked request with a breadcrumb rather
+        // than replaying it into a state machine that never went idle.
+        if (nowMs - _venturaPendingSinceMs > 12000) {
+            _venturaPendingAssocValid = false;
+            if (probe != nullptr)
+                probe->setProperty("Ath10kAssocDefer", "dropped-timeout");
+        }
+        return;
+    }
+    if (!_venturaPowerOn)
+        return;
+    const apple80211_assoc_data request = _venturaPendingAssoc;
+    _venturaPendingAssocValid = false;
+    if (probe != nullptr)
+        probe->setProperty("Ath10kAssocDefer", "replayed");
+    IOLog("Ath10kMac: replay deferred join ssid-len=%u\n", static_cast<unsigned>(request.ad_ssid_len));
+    (void)venturaAssociate(&request);
 }
 
 SInt32 Ath10kPCIDevice::venturaChannel(void *data, bool isSet)
@@ -3162,6 +3340,34 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
                            static_cast<UInt64>(reinterpret_cast<uintptr_t>(vif)), 64);
     }
     IOLog("Ath10kMac: infra attach vif %p -> %d\n", vif, (int)attached);
+    // Live setAssociateRequest() (0xffffff8001fe2533) does not use
+    // getPrimarySkywalkInterface() to find the station interface: it reads the
+    // controller ivar at +0x1a0 directly, requires that object to be a virtual
+    // interface with role 6, and bails out to its error path when the ivar is null
+    // (the ASSOCIATE it was given is then never forwarded to any driver). Nothing in
+    // this personality filled that ivar, so record it and fill it with the vif we
+    // already have - the same object attachInterface() parked at +0x198, but with the
+    // station role setAssociateRequest checks for.
+    {
+        char *ctrlIvars = *reinterpret_cast<char **>(reinterpret_cast<char *>(this) + 0x120);
+        void *primaryBefore = nullptr;
+        if (ctrlIvars != nullptr)
+            primaryBefore = *reinterpret_cast<void **>(ctrlIvars + 0x1a0);
+        if (probe)
+            probe->setProperty("Ath10kCtrlPrimaryBefore",
+                               primaryBefore != nullptr ? "non-null" : "null");
+        if (ctrlIvars != nullptr && primaryBefore == nullptr && *ivarsSlot != nullptr) {
+            // Role 6 is what the station path in the family accepts (6 and 7 are the
+            // only values IO80211VirtualInterface::newUserClient takes as well).
+            *reinterpret_cast<UInt32 *>(reinterpret_cast<char *>(*ivarsSlot) + 0x50) = 6;
+            *reinterpret_cast<void **>(ctrlIvars + 0x1a0) = vif;
+            void *primaryAfter = *reinterpret_cast<void **>(ctrlIvars + 0x1a0);
+            if (probe)
+                probe->setProperty("Ath10kCtrlPrimaryAfter",
+                                   primaryAfter != nullptr ? "set" : "failed");
+            IOLog("Ath10kMac: controller ivar +0x1a0 <- vif %p (role 6)\n", vif);
+        }
+    }
     // Only after the attach: the manager's init calls back into this driver for
     // CARD_CAPABILITIES through the Skywalk request slot, and getScanManager is
     // only ever asked for through the vif that attachInterface() parks in the

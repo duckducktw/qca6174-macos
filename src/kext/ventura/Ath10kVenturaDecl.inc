@@ -11,9 +11,21 @@ public:
     // so the arguments can be measured instead of guessed: they publish the raw
     // registers and then run Apple's own implementation unchanged.
     SInt32 apple80211_ioctl(IO80211VirtualInterface *, ifnet_t, unsigned long, void *) override;
-    SInt32 apple80211_ioctl(IO80211SkywalkInterface *, unsigned long, void *, void *) override;
+    // Five arguments: the family passes (cmd, type, iface, payload) in rsi/rdx/rcx/r8,
+    // so a four-argument shim never sees the payload of a forwarded ASSOCIATE.
+    SInt32 apple80211_ioctl(IO80211SkywalkInterface *, unsigned long, void *, void *,
+                            void *) override;
     SInt32 apple80211SkywalkRequest(UInt, int, IO80211SkywalkInterface *, void *) override;
     UInt32 hardwareOutputQueueDepth() override;
+    // setAssociateRequest() calls [vptr+0xc78] (= this predicate, live
+    // 0xffffff8001fed798) right after the driver accepts ASSOCIATE and, when it
+    // answers true, writes a 15-unit supplicant deadline into the vif and returns
+    // 6 to the caller — i.e. it hands the four-way handshake to Apple's in-kernel
+    // RSN supplicant. That class only exists in IO80211FamilyLegacy, which an
+    // injected kext can never bind (HANDOFF §6.27), so the join would never finish:
+    // airportd turns that error into -3903 and reports "could not join".
+    // This personality runs its own supplicant, so answer false.
+    bool useAppleRSNSupplicant(IO80211VirtualInterface *) override;
     SInt32 performCountryCodeOperation(IO80211CountryCodeOp) override;
     // IO80211Controller keeps its command gate on an IO80211WorkQueue it gets
     // from getWorkQueue(). Apple's start() asks before anything exists, then
@@ -102,6 +114,9 @@ private:
     static constexpr u_int32_t kAth10kVifIfnetUnit = 3;
     IOReturn venturaScan(const apple80211_scan_data *request);
     IOReturn venturaAssociate(const apple80211_assoc_data *request);
+    // Replays a parked join once the previous link has finished tearing down, and
+    // makes DISASSOCIATE actually drop the link instead of only publishing a state.
+    void venturaPendingJoinService(UInt64 nowMs);
     void venturaDisassociate(bool deauth);
     IOReturn venturaScanResult(apple80211_scan_result *result);
     // Served by venturaScanResult(). The 13.7 SDK header advertises a pointer
@@ -214,6 +229,18 @@ private:
     // missing/failed ASSOCIATE can be told apart from "the set never arrived".
     UInt8 _venturaPendingSSID[APPLE80211_MAX_SSID_LEN + 1] = {};
     UInt8 _venturaPendingSSIDLength = 0;
+    // A join that arrives while the previous link is still up (or while its teardown
+    // is draining) cannot start a second vdev: the firmware answers the second
+    // VDEV_START with "vdev-start-unsolicited" and the runtime stops (measured in
+    // the click-to-join replay). Such a request is parked here and replayed once the
+    // state machine is idle again.
+    apple80211_assoc_data _venturaPendingAssoc = {};
+    bool _venturaPendingAssocValid = false;
+    UInt64 _venturaPendingSinceMs = 0;
+    UInt32 _venturaAssocDefers = 0;
+    // Copy-in target for request payloads that arrive from userspace (the family
+    // forwards ASSOCIATE with a user pointer in r8).
+    UInt8 _venturaAssocScratch[0x800] = {};
     // Request breadcrumbs: airportd reports "Off (forced)" when the power
     // request never reaches the driver, and there is no other channel to tell
     // "no request arrived" from "request refused".

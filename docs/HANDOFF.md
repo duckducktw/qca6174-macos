@@ -1,5 +1,10 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
+**第三十四輪（§6.39）補記**：assoc 迴路上找到並修掉四個真 gate（`useAppleRSNSupplicant` 必須回 false、
+第二次 VDEV_START 要 defer/replay、`DISASSOCIATE` 要真的拆鏈路、controller ivar `+0x1a0` 要填 role-6 vif）。
+現在 `a2push`（用 ref 的 fd 送 type 20）可以走完 teardown → replay → connected-wpa2，
+但 airportd 的 ASSOCIATE 仍然沒送到驅動（`Ath10kAssocWho` 一直是 kernel_task、trace 全 getter）→ 牆在 userspace 的 Associate2。
+
 **第三十三輪（§6.38）補記**：系統點選連線走的是 `Apple80211Associate2`（`nm -u airportd` 有這個 import），
 它自己用 `ioctl(ref+0x00 的 fd, 0x802869c8, {type=20,len=0x250})` 送 ASSOCIATE —— **繞過 `Apple80211Set` 的型別白名單**，
 而且這條通道實測會到我們的 dispatcher（`Ath10kAssocRaw=upper=0008 lower=0000 keylen=12`、`AssocPhase=requested`）。
@@ -2389,3 +2394,85 @@ airportd 內部字串裡同時有 `SSID`/`SSID_STR`/`BSSID`/`CHANNEL`/`RSN_IE`/`
   要乾淨狀態直接 `system_reset`。
 - framework 映像的 `__TEXT` 只有 `0x53ff6` bytes，rip-relative 目標算出來若是 `0x3xxxxxx` 級距，
   代表那個位址在 shared cache 的另一個區段，不要當成映像內位移。
+
+### 6.39 第三十四輪：assoc 迴路上的四個真 gate（都已修掉），剩下的牆在 userspace 的 Associate2
+
+這一輪把「family 收到 ASSOCIATE 之後怎麼走」整段反組譯出來，並把四個真正的 gate 逐一補上（v213–v221）。
+每一次改動都用 `tools/a2push.c`（直接走 `ref+0x00` 的 fd 送 `type=20`）與 `tools/cwjoin.m`（airportd 真實路徑）量測。
+
+#### 6.39.1 live `setAssociateRequest` 的完整流程（`0xffffff8001fe2533`）
+
+```
+setAssociateRequest(controller, vif, infra, req, bool)
+  r14 = req->req_data                     ; apple80211_assoc_data
+  if (req_len == 0 || req_data == null)  → 錯誤
+  if ([req_data+0x1cf] & 1)              → BSSID get 分支（本驅動走另一條）
+  /* 轉發路徑 */
+  rax = [[controller+0x120] + 0x1a0]      ; ← 站台介面 ivar（**不是** getPrimarySkywalkInterface()）
+  if (rax == null)                       → 錯誤路徑（我們以前就是死在這裡）
+  rcx = [rax+0x110]; if ([rcx+0x50] != 6) → 錯誤路徑      ; 角色必須是 6
+  rdi = [rcx+0x30]; call [[rdi]+0x1e0] (…) ; true → 回 16
+  [同上物件] call [[rdi]+0x1d0](5,1,1)    ; 通知
+  call [vptr+0xcb0](controller, 0x803069c8, 0x14, iface, assoc_data)   ; ← 送給驅動
+  if (status) return status
+  ax = [assoc_data+8]                     ; ad_auth_upper
+  if (ax > 8 || !bt(0x116, ax))           → return 0
+  call [vptr+0xc78](controller, vif)      ; = useAppleRSNSupplicant（ZTV slot 401）
+  if (true) { [vif ivars+0x118]+0x20 = now+15 ; return **6** }
+  return 0
+```
+
+**vptr 位移換算規則（這輪定案）**：`an.py vtable` 印出的 ZTV index `i`，對應 `[vptr + (i-2)*8]`。
+驗證：ZTV 406 `apple80211_ioctl(Skywalk)` → `0xcb0`、407 `apple80211VirtualRequest` → `0xcb8`、
+401 `useAppleRSNSupplicant` → `0xc78`。
+
+#### 6.39.2 四個 gate 與修法
+
+| 版本 | gate | 症狀 | 修法 |
+|---|---|---|---|
+| **v213** | `useAppleRSNSupplicant` 回 true | family 把 4-way 交給 **legacy 才有的** RSNSupplicant（注入 kext 永遠拿不到）並回 **6** 給呼叫端 → airportd -3903 | 覆寫成永遠 **false**（本 personality 自己跑 4-way）。`tools/a2push.c` 的 ioctl 從 `-1/EIO` 變成 **rc=0** |
+| **v214** | 第二次 VDEV_START | 已連線時再收 ASSOCIATE → firmware `vdev-start-unsolicited` → runtime STOP（`Ath10kConnectionState=failed`） | 加入 **defer/replay**：忙碌時把請求存起來、要求 teardown，狀態機閒下來再重放（`Ath10kAssocDefer=…/replayed`） |
+| **v215/v216** | 「閒著但 `cancelRequested`」被當成忙 | 重放永遠等到 12 秒 timeout 被丟掉；`DISASSOCIATE` 在 stage=Disabled 時設 `cancelRequested` 會讓狀態機永遠不再服務 | 忙碌判準改成「vdev 真的起來或 teardown 在跑」；`venturaDisassociate()` 改成**真的拆鏈路**（原本只 publish 狀態） |
+| **v217** | controller ivar `[ivars+0x1a0]` 是 null | family 的轉發路徑第一件事就是讀它，null 就直接走錯誤路徑（ASSOCIATE 永遠不轉發） | attach 完把 vif 寫進 `+0x1a0` 並把角色設 6（`Ath10kCtrlPrimaryBefore=null` → `After=set`） |
+
+#### 6.39.3 量測工具的兩個關鍵修正（沒有它們會一直誤判）
+
+- **v218 `Ath10kAssocWho`**：auto-join 與 airportd 送的 `apple80211_assoc_data` **位元組完全相同**
+  （`ver=1 len=8 upper=0008 lower=0001 keylen=12`），只看 `Ath10kAssocRaw` 會把 auto-join 誤認成 airportd。
+  加上 `proc_selfpid()` 之後量到：整個 cwjoin 期間 `Ath10kAssocWho = pid=0 kernel_task`（= 自動連線），
+  **airportd 的 ASSOCIATE 從來沒到驅動**。
+- **v219 `Ath10kSetSeen`**：`Ath10kEntryTrace` 只有 12 格，airportd 每秒幾十個 getter 會把它瞬間洗掉，
+  所以「看不到 set」不代表沒送。改成獨立記錄最後一筆 set 之後量到 airportd 的 set 確實會到 slot 406。
+- **v220/v221 五參數 slot**：family 呼叫 slot 406 的實際暫存器是
+  `(controller, cmd, req_block, 0xffff, 0xffffffff)`（`Ath10kIoctlArgs a=… b=c03069c9 c=ffffffcdb2812c08 d=ffff e=ffffffff`），
+  所以把 override 宣告成 5 個參數才拿得到 r8（ASSOCIATE 的 payload 就在那裡）。
+
+#### 6.39.4 現在的狀態（v221）與剩下的牆
+
+```
+./a2push QCA-TEST          → ioctl(set 20) rc=0；Ath10kAssocDefer=replayed；ConnectionState=connected-wpa2
+./cwjoin QCA-TEST en1      → assoc-ok=0，-3903；Ath10kRequestTrace 全是 getter（g9 / g11=5 / g1 / g2 …）
+```
+
+也就是說：
+
+- **kernel 側完全通了**：同一份 ASSOCIATE 從 `ref+0x00` 的 fd 送進去，會走完 defer → teardown → replay →
+  WPA2 4-way → `connected-wpa2`。
+- **airportd 的 ASSOCIATE 還是沒送出來**：`Ath10kSetAssocSeen` 不存在、trace 只有 getter，
+  代表 `Apple80211Associate2` 在 userspace 就先放棄了（它自己的前置檢查，或它組的字典不完整）。
+
+下一步（唯一還沒封的路）：**把 Associate2 的字典 schema 補完**，用我們自己的程式呼叫它。
+已知：`SSID` 必須是 **NSData**；單獨餵任一鍵回 `-3900`；全部一起餵會踩 `-[__NSCFData objectForKey:]`
+（某個鍵的值必須是字典，還沒定位）。airportd 內的字串有
+`SSID / SSID_STR / BSSID / CHANNEL / RSN_IE / passphrase / password / security`。
+一旦我們呼叫 Associate2 能讓 `Ath10kSetAssocSeen` 出現（pid 是我們自己），
+就代表 airportd 只是前置條件不同，可以直接 diff 兩邊的請求軌跡。
+
+#### 6.39.5 這輪的陷阱
+
+- **改 vtable 順序前先換算清楚**：`ZTV index i` → `[vptr + (i-2)*8]`。用 `i*8` 會整體偏 0x10，
+  找錯函式（本輪一開始就因此把 `getIO80211CommandGate` 當成 `useAppleRSNSupplicant`）。
+- **`Ath10kAssocRaw` 不能判斷「誰在連線」**，一定要配 `Ath10kAssocWho`。
+- **12 格 trace ring 對高頻 getter 沒有用**，重要事件要有獨立屬性。
+- **改 `apple80211_ioctl` 的參數個數時，fallback 呼叫（`IO80211Controller::apple80211_ioctl`）也要一起改**，
+  否則編譯失敗（`no matching member function`）。

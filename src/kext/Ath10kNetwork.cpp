@@ -651,6 +651,12 @@ const char *Ath10kPCIDevice::submitNetworkPacket(const UInt8 *data,UInt32 bytes,
 const char *Ath10kPCIDevice::serviceConnection(UInt64 nowMs)
 {
     using Ath10k::LinkStage;auto &s=_connection;
+#ifndef ATH10K_NATIVE
+    // Must run before the Disabled early-return below: after a teardown the state
+    // machine sits at stage Disabled, and that is exactly when a join parked during
+    // the drain has to be replayed (HANDOFF §6.39).
+    venturaPendingJoinService(nowMs);
+#endif
     if(s.stage==LinkStage::Disabled)return nullptr;
     if(s.diagnostics.mlmeCount!=s.diagnostics.mlmeLogged){
         auto &d=s.diagnostics;d.mlmeLogged=d.mlmeCount;
