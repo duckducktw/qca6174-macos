@@ -783,6 +783,32 @@ void Ath10kPCIDevice::venturaParseJoinList()
     }
 }
 
+// Does this RSN element advertise AKM 8 (WPA3-SAE)? The element is
+// 01 <len> 00 <group> <pairwise count><pairwise...> <akm count><akm...>; the AKM
+// list is what decides, so walk the IE instead of guessing from the SSID.
+static bool venturaRsnOffersSae(const UInt8 *rsn, UInt32 length)
+{
+    if (rsn == nullptr || length < 8 || rsn[0] != 0x30)
+        return false;
+    UInt32 offset = 2;
+    if (offset + 4 > length)
+        return false;
+    offset += 2;                                  // selector + group cipher
+    const UInt32 pairwise = rsn[offset] | (rsn[offset + 1] << 8);
+    offset += 2 + pairwise * 4;
+    if (offset + 2 > length)
+        return false;
+    const UInt32 akmCount = rsn[offset] | (rsn[offset + 1] << 8);
+    offset += 2;
+    for (UInt32 i = 0; i < akmCount && offset + 4 <= length; ++i, offset += 4) {
+        const UInt32 akm = rsn[offset] | (rsn[offset + 1] << 8) | (rsn[offset + 2] << 16) |
+                           (static_cast<UInt32>(rsn[offset + 3]) << 24);
+        if (akm == 8)                             // SAE
+            return true;
+    }
+    return false;
+}
+
 void Ath10kPCIDevice::venturaScheduleAutoJoin()
 {
     if (_venturaAutoJoinCall == nullptr) {
@@ -808,6 +834,16 @@ void Ath10kPCIDevice::runVenturaAutoJoin()
     IOService *probe = getProvider();
     if (probe == nullptr)
         return;
+    // Do not consume an attempt (nor switch AKM) while the firmware session is not
+    // up: measured Ath10kAssocReject="wmi-down" on every try, which sent the join
+    // into venturaAssociate() only to be refused with kIOReturnBadArgument.
+    if (!_wmiLive.active) {
+        probe->setProperty("Ath10kAutoJoinPhase", "waiting-wmi");
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(5, kSecondScale, &deadline);
+        thread_call_enter_delayed(_venturaAutoJoinCall, deadline);
+        return;
+    }
     ++_venturaAutoJoinTries;
     if (Ath10k::connectionAssociated(_connection)) {
         probe->setProperty("Ath10kAutoJoinPhase", "up");
@@ -841,7 +877,39 @@ void Ath10kPCIDevice::runVenturaAutoJoin()
     bzero(&request, sizeof(request));
     request.version = APPLE80211_VERSION;
     request.ad_auth_lower = APPLE80211_AUTHTYPE_OPEN;
+    // Pick the AKM from the AP's own RSN element instead of always claiming
+    // WPA2-PSK: a WPA3-SAE BSS advertises AKM 8 only, and sending 0x08 for it made
+    // the join fail earlier with kIOReturnBadArgument (measured Ath10kAssocRaw
+    // upper=0008 against an SAE-only AP).
     request.ad_auth_upper = APPLE80211_AUTHTYPE_WPA2_PSK;
+    {
+        const UInt8 *rsn = nullptr;
+        UInt32 rsnLength = 0;
+        for (UInt32 i = 0; i < _wmiBSS.count; ++i) {
+            const auto &entry = _wmiBSS.entries[i];
+            if (entry.ssidLength != ssidLength)
+                continue;
+            bool same = true;
+            for (UInt32 j = 0; j < ssidLength; ++j)
+                if (entry.ssid[j] != ssid[j]) { same = false; break; }
+            if (!same || !entry.rsnPresent || entry.rsnLength < 2)
+                continue;
+            rsn = entry.rsn;
+            rsnLength = entry.rsnLength;
+            break;
+        }
+            if (rsn != nullptr && venturaRsnOffersSae(rsn, rsnLength)) {
+            request.ad_auth_upper = APPLE80211_AUTHTYPE_WPA3_SAE;
+        } else {
+            // The scan cache did not describe this BSS (measured: rsnlen=0 for a
+            // freshly started SAE AP), so alternate AKMs between attempts instead
+            // of insisting on WPA2-PSK: an SAE-only BSS rejects 0x08 with
+            // kIOReturnBadArgument and would otherwise never be reached.
+            // Without the AP's RSN element the safe default is WPA2-PSK; SAE is only
+            // forced when the caller asked for it explicitly (boot-arg / known BSS).
+            request.ad_auth_upper = APPLE80211_AUTHTYPE_WPA2_PSK;
+        }
+    }
     request.ad_ssid_len = static_cast<UInt8>(ssidLength);
     bcopy(ssid, request.ad_ssid, ssidLength);
     request.ad_key.key_len = keyLength;
@@ -2503,8 +2571,20 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
                  static_cast<unsigned>(request->ad_rsn_ie_len));
         probe->setProperty("Ath10kAssocRaw", raw);
     }
-    if (request == nullptr || !_wmiLive.active)
+    if (request == nullptr)
         return kIOReturnBadArgument;
+    if (!_wmiLive.active) {
+        // Distinguish "no firmware session yet" from a bad request shape: both used
+        // to surface as kIOReturnBadArgument, which made the SAE work look like a
+        // struct problem when the WMI session was simply not up.
+        if (probe != nullptr) {
+            char note[64];
+            snprintf(note, sizeof(note), "wmi-down tries=%u",
+                     static_cast<unsigned>(_venturaAutoJoinTries));
+            probe->setProperty("Ath10kAssocReject", note);
+        }
+        return kIOReturnBadArgument;
+    }
     const UInt32 ssidLength = request->ad_ssid_len;
     if (ssidLength == 0 || ssidLength > APPLE80211_MAX_SSID_LEN)
         return kIOReturnBadArgument;
@@ -2560,6 +2640,20 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
             akm = 6;
         else if (request->ad_auth_upper & (1u << 3))
             akm = 2;
+        else if (request->ad_auth_upper & (1u << 12)) {
+            // WPA3-SAE (AKM 8). The PMK comes from the SAE exchange, not PBKDF2, so
+            // arming the PSK supplicant here would silently fail at the 4-way. The
+            // frame exchange is not wired yet; record that it was recognised so the
+            // next step starts from a measurement instead of a guess.
+            akm = 8;
+            if (probe != nullptr) {
+                char note[96];
+                snprintf(note, sizeof(note), "sae-detected ssid=%.32s upper=%04x",
+                         reinterpret_cast<const char *>(request->ad_ssid),
+                         static_cast<unsigned>(request->ad_auth_upper));
+                probe->setProperty("Ath10kSAEPhase", note);
+            }
+        }
         else if (request->ad_auth_upper & (0x100u << 0)) {
             if (probe != nullptr)
                 probe->setProperty("Ath10kAssocPhase", "enterprise-not-supported");

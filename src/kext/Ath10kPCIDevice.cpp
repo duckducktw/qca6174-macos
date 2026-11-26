@@ -1457,6 +1457,7 @@ bool Ath10kPCIDevice::prepareWMIRuntime()
     _wmiTimerAdded=true;
     _wmiLive.active=true;
     _wmiLive.status="prepared";
+    if (IOService *prov = getProvider()) prov->setProperty("Ath10kWmiLive", "active");
     return true; // start() arms only after probeTarget finishes ownership transfer.
 }
 
