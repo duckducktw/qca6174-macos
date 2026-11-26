@@ -1,5 +1,10 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
+**第四十輪（§6.45）補記**：`error 37 Already associated` 的來源找到了——**BSD 介面的 link 狀態沒掉**
+（拆線後 `ifconfig en1` 仍是 `status: active` 且留著舊 IP）。`networkLink()` 只更新 controller，
+沒推到已發佈介面。改用 live 的 `IO80211InfraInterface::setLinkState`（`IO80211Interface::setLinkState`
+只存在 legacy bundle，引用它會讓 kext 直接載入失敗）。修好後 `status: inactive`。
+
 **第三十九輪（§6.44）補記**：`-3903` 的真正來源是 **airportd 自己的 error 37「Already associated, and network
 transition not permitted」**（`log show --predicate 'process == "airportd"'` 直接寫出來），不是驅動回的。
 原因：驅動的 auto-join 先連上 + disassociate 沒真的拆鏈路。已加「拆鏈路 + 壓住 auto-join 60 秒」，
@@ -2772,3 +2777,58 @@ airportd 的 driver-message tracer 從沒初始化，但**它自己的 WiFiManag
    要用 `tools/imgdump2.c` dump `Apple80211.framework` 的 `Apple80211Scan` 本體、比對它讀哪個位移。
 2. 在那之後再測一次 `cwjoin`：若 error 37 消失、ASSOCIATE 真的送到驅動（`Ath10kClientTrace` 出現 `s20`），
    join 就通了。
+
+### 6.45 第四十輪：BSD 介面的 link 狀態沒跟著掉 —— airportd 的「already associated」就是它
+
+#### 6.45.1 決定性量測
+
+拆掉連線後（`Ath10kConnectionState=disabled`、`Ath10kAutoJoinPhase=suppressed-for-airportd`）：
+
+```
+$ ifconfig en1 | grep status
+	status: active          <-- 錯的：介面還是 active，而且留著舊 IPv4
+```
+
+airportd 的 WiFiManager log 因此一直回：
+
+```
+AUTO-JOIN: Auto-join aborted ... error=(37 'Already associated, and network transition not permitted')
+```
+
+`-3903` = airportd 的 error 37，來源就是這個 **BSD 介面的 link 狀態沒更新**。
+
+原因是 `networkLink(bool)` 只對 **controller** 呼叫 `setLinkStatus()`，
+從來沒把狀態推到已發佈的介面節點（BSD 看到的 en1）。
+
+#### 6.45.2 修法與一個踩到的坑
+
+- 新增 `venturaInterfaceLink(bool)`，在 `networkLink()` 裡同步呼叫，把 link 狀態推到介面。
+- **坑**：第一次用的是 `IO80211Interface::setLinkState(IO80211LinkState,unsigned)`，
+  但那個符號**只存在於 legacy bundle**（`0x218xxxxx`），live KC 沒有
+  → 整個 kext **載入失敗**（serial 完全沒有 `Ath10kMac`、`ifconfig -l` 少了 en1）。
+- 正確的是 **`IO80211InfraInterface::setLinkState(IO80211LinkState, bool, unsigned)`**
+  （live `0x2040406`，mangled `__ZN21IO80211InfraInterface12setLinkStateE16IO80211LinkStatejbj`），
+  物件取自 controller ivars `+0x198`（就是 attachInterface 停在那裡的那個）。
+
+修好後（v240）：
+
+```
+$ ifconfig en1 | grep status
+	status: inactive        <-- 正確
+Ath10kIfaceLink = iface-link=0 ok=1
+```
+
+#### 6.45.3 仍然存在的東西
+
+`cwjoin` 目前還是 `-3903`，但 airportd 的 log 已經變成
+`setJoinEvent: Joining QCA-TEST (details:(null))` 之後才 aborted，
+而且 `wifivelocityd` 的 `GET CURR SCAN RESULT` 一直 `err=2`（= 沒有掃描結果可拿）。
+下一輪要查的是 **scan result 在 airportd/scan manager 的快取裡為什麼是空的**
+（我們的 driver 有回 15~21 筆，BSD ioctl 路徑也拿得到正確紀錄）。
+
+#### 6.45.4 教訓
+
+- **live KC 與 legacy bundle 的符號要分清**：`an.py list` 的位址在 `0x218xxxxx` 就是 legacy，
+  引用它会讓 kext 載入失敗，而且失敗得很安靜（只有 serial 少了 log、介面消失）。
+- 每次 deploy 之後**先確認 kext 真的載入**（`ioreg -c Ath10kPCIDevice` 或 serial 第一行），
+  再開始看行為，否則會把「沒載入」誤讀成「行為改變」。

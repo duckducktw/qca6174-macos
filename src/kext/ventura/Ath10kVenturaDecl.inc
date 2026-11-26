@@ -124,6 +124,8 @@ private:
     // Association completion events for the client's join loop (see the
     // implementation: without them Apple80211Associate2 times out with -3905).
     void venturaPostLinkEvents(bool up);
+    // Same state on the published interface (the node BSD knows as en1).
+    void venturaInterfaceLink(bool up);
     IO80211LinkState _venturaLinkState = kIO80211NetworkLinkUndefined;
     // DISASSOCIATE(22) only publishes state (a real teardown made airportd's
     // routine disassociates knock the link over). The link therefore stays up,

@@ -2642,7 +2642,10 @@ IOReturn Ath10kPCIDevice::venturaScanResult(apple80211_scan_result *result)
     if (result == nullptr)
         return kIOReturnBadArgument;
     memset(result, 0, sizeof(*result));
-    result->version = APPLE80211_VERSION;
+    // TEMPORARY diagnostic: airportd's join log printed BSSDetails:{BSSID:01:00:00:00:00:00},
+    // i.e. exactly this version field, which would mean the live consumer reads the BSSID
+    // from offset 0 of the record. A distinctive value makes that visible in one run.
+    result->version = 0xABCD1234u;
 
     // Cursor protocol: one BSS per call, end signalled with a non-zero return.
     // airportd stops reading at the first failure, so handing it the whole
@@ -3650,6 +3653,39 @@ extern "C" IOReturn ath10kVifPostMessageInternal(IO80211VirtualInterface *self, 
 // (IO80211InterfacePostMessage, the same bridge SCAN_DONE already uses) is what
 // Apple80211Associate2's reader thread consumes; without it the join completes in the
 // driver but the caller still times out with -3905 after 10.2 s (measured).
+// IO80211InfraInterface::setLinkState(IO80211LinkState, bool, unsigned int) - the
+// live symbol; IO80211Interface::setLinkState exists only in the legacy bundle, so
+// referencing that one makes the kext fail to load outright (measured: no Ath10kMac
+// line at all on the serial port, en1 missing from `ifconfig -l`).
+extern "C" bool ath10kInfraSetLinkState(IO80211InfraInterface *self, IO80211LinkState s,
+                                        bool debounce, unsigned int code)
+    __asm("__ZN21IO80211InfraInterface12setLinkStateE16IO80211LinkStatejbj");
+
+// Drive the *published* interface's link state (the one BSD knows as en1), not just
+// the controller's. Windows are reported through IO80211Interface::setLinkState, which
+// is what propagates to the ifnet and to airportd.
+void Ath10kPCIDevice::venturaInterfaceLink(bool up)
+{
+    if (_venturaInterface == nullptr)
+        return;
+    const IO80211LinkState state = up ? kIO80211NetworkLinkUp : kIO80211NetworkLinkDown;
+    // The infra interface is the object attachInterface() parks on the controller, and
+    // the one the family marks as the published station interface.
+    IO80211InfraInterface *infra = nullptr;
+    if (_venturaInterface != nullptr) {
+        void **ivars = *reinterpret_cast<void ***>(reinterpret_cast<char *>(this) + 0x120);
+        if (ivars != nullptr)
+            infra = reinterpret_cast<IO80211InfraInterface *>(ivars[0x198 / 8]);
+    }
+    const bool ok = (infra != nullptr) ? ath10kInfraSetLinkState(infra, state, false, 0) : false;
+    if (IOService *probe = getProvider()) {
+        char note[96];
+        snprintf(note, sizeof(note), "iface-link=%d ok=%d", up ? 1 : 0, ok ? 1 : 0);
+        probe->setProperty("Ath10kIfaceLink", note);
+    }
+    IOLog("Ath10kMac: interface link %s ok=%d\n", up ? "up" : "down", ok ? 1 : 0);
+}
+
 void Ath10kPCIDevice::venturaPostLinkEvents(bool up)
 {
     IOService *probe = getProvider();

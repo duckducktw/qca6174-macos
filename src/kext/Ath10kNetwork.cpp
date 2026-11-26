@@ -126,6 +126,14 @@ void Ath10kPCIDevice::networkLink(bool up)
     _networkLinkUp=up;
     if(!up && getOutputQueue()){getOutputQueue()->stop();getOutputQueue()->flush();}
     setLinkStatus(kIONetworkLinkValid|(up?kIONetworkLinkActive:0));
+#ifndef ATH10K_NATIVE
+    // Push the same state onto the published interface. setLinkStatus() above only
+    // touches the controller, so `ifconfig en1` kept reporting "status: active" (and
+    // kept its old IPv4) after a teardown - airportd reads that and refuses the user's
+    // next join with error 37 "Already associated, and network transition not
+    // permitted", which surfaces as -3903.
+    venturaInterfaceLink(up);
+#endif
     if(up && getOutputQueue())getOutputQueue()->start();
 }
 bool Ath10kPCIDevice::prepareNetwork()

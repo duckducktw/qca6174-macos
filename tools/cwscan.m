@@ -32,7 +32,7 @@ int main(int argc, const char *argv[])
         for (CWNetwork *n in sorted) {
             printf("  ssid='%s' bssid=%s ch=%ld rssi=%ld sec(wpa2=%d wpa3=%d wpa=%d)\n",
                    n.ssid ? [n.ssid UTF8String] : "(hidden)",
-                   [[n bssid] UTF8String], (long)[n wlanChannel].channelNumber,
+                   (n.bssid ? [[n bssid] UTF8String] : "(nil-string)"), (long)[n wlanChannel].channelNumber,
                    (long)[n rssiValue], (int)[n supportsSecurity:kCWSecurityWPA2Personal],
                    (int)[n supportsSecurity:kCWSecurityWPA3Personal],
                    (int)[n supportsSecurity:kCWSecurityWPAPersonal]);
