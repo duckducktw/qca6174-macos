@@ -2231,8 +2231,14 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         apple80211_bssid_data *bssid = static_cast<apple80211_bssid_data *>(data);
         bssid->version = APPLE80211_VERSION;
         memset(&bssid->bssid, 0, sizeof(bssid->bssid));
-        if (!_venturaDisassociated && Ath10k::connectionAssociated(_connection))
+        // The family asks for the BSSID right at the start of setAssociateRequest and
+        // takes a different (failing) branch when the answer is all zeros, so a BSSID the
+        // client pinned with Set(BSSID) must beat the "we just disassociated" idle state.
+        if (_venturaPinnedBSSIDValid) {
+            bcopy(_venturaPinnedBSSID, &bssid->bssid, 6);
+        } else if (Ath10k::connectionAssociated(_connection)) {
             bcopy(_connection.bssid, &bssid->bssid, 6);
+        }
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_CHANNEL:
@@ -3213,8 +3219,36 @@ SInt32 Ath10kPCIDevice::venturaChannel(void *data, bool isSet)
     }
     channel->version = APPLE80211_VERSION;
     channel->channel.version = APPLE80211_VERSION;
-    channel->channel.channel = 0;
-    channel->channel.flags = 0;
+    // airportd reads CHANNEL in the run-up to a join (trace: g1 SSID, g4 CHANNEL,
+    // g96 role, then the join decision). Answering 0 while idle made every check
+    // "this interface has no channel" - report what the client pinned with Set(CHANNEL),
+    // else the live channel, else the channel of the BSS it asked for by SSID.
+    UInt32 ch = _venturaPinnedChannel;
+    if (ch == 0 && Ath10k::connectionAssociated(_connection))
+        ch = _connection.operatingChannel;
+    if (ch == 0 && _venturaPinnedBSSIDValid) {
+        for (UInt32 i = 0; i < _wmiBSS.count; ++i) {
+            const auto &entry = _wmiBSS.entries[i];
+            if (memcmp(entry.bssid, _venturaPinnedBSSID, 6) != 0)
+                continue;
+            ch = entry.advertisedChannel != 0 ? entry.advertisedChannel : entry.rxChannel;
+            break;
+        }
+    }
+    if (ch == 0 && _venturaPendingSSIDLength != 0) {
+        for (UInt32 i = 0; i < _wmiBSS.count; ++i) {
+            const auto &entry = _wmiBSS.entries[i];
+            if (entry.ssidLength != _venturaPendingSSIDLength ||
+                memcmp(entry.ssid, _venturaPendingSSID, _venturaPendingSSIDLength) != 0)
+                continue;
+            ch = entry.advertisedChannel != 0 ? entry.advertisedChannel : entry.rxChannel;
+            break;
+        }
+    }
+    channel->channel.channel = static_cast<UInt32>(ch);
+    channel->channel.flags = ch != 0 ? venturaScanChannelFlags(ch) : 0;
+    if (IOService *probe = getProvider())
+        probe->setProperty("Ath10kChannelReply", static_cast<UInt64>(ch), 32);
     return kIOReturnSuccess;
 }
 

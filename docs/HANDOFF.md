@@ -1,5 +1,12 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
+> **新接手先讀這份**：[`docs/handoff-apple-join-conditions.md`](handoff-apple-join-conditions.md)
+> —— 蘋果「放行 join」的四層條件（airportd／Associate2／IO80211Family／驅動回報）、
+> 每一條的反組譯位址與實測證據、目前卡在第 1 層（airportd 連 `Set(SSID)` 都不送），
+> 以及 OpenIntelWireless AirportItlwm 的可照抄做法。
+> 逐輪細節在本文 §6.x；逐 API 對照在 `docs/apple-vs-ours.md`；工具與流程在
+> `docs/reverse-engineering-playbook.md`。
+
 **第四十輪（§6.45）補記**：`error 37 Already associated` 的來源找到了——**BSD 介面的 link 狀態沒掉**
 （拆線後 `ifconfig en1` 仍是 `status: active` 且留著舊 IP）。`networkLink()` 只更新 controller，
 沒推到已發佈介面。改用 live 的 `IO80211InfraInterface::setLinkState`（`IO80211Interface::setLinkState`
@@ -2919,3 +2926,27 @@ Ath10kScanMgrStart  = "ok"
 也就是說這些 `err=2` 來自 **wifivelocityd / configd** 對「目前掃描結果」的查詢，
 不是 join 的必要步驟；而 airportd 的 join 在送 `Set(SSID)` 之前就停了。
 下一步要把焦點放在「airportd 為什麼不送 Set(SSID)」，而不是掃描快取。
+
+### 6.49 第四十四輪：交接文件（重點：蘋果放行 join 的條件）
+
+新增 **`docs/handoff-apple-join-conditions.md`**，把「蘋果什麼時候才肯放行一次 join」
+寫成四層 AND 條件，每一條都附反組譯位址或 ioreg／log 證據：
+
+```
+第 1 層 airportd/CoreWLAN 願不願意發      ← 目前卡在這（它連 Set(SSID) 都不送）
+第 2 層 Apple80211Associate2 願不願意送    ✅ 條件 A/B/C 都量過
+第 3 層 IO80211Family 願不願意轉發         ✅ ivar+0x1a0 / role6 / predicate=0 / 5 參數 / RSN gate
+第 4 層 驅動回報是否合格                   ✅ 除「完成延遲 9–11s vs 10.2s 窗」外全部對齊
+```
+
+文件同時整理了 **社群做法（OpenIntelWireless AirportItlwm）**：
+`setLinkStateGated` 的順序、`eventHandler` 的事件、`getASSOCIATE_RESULT` 以狀態表達可用性、
+`getLINK_CHANGED_EVENT_DATA` 的欄位，以及它「驅動不主動 join、讓 airportd 主導」的策略。
+
+本輪同時修的兩個契約（v246／v247）：
+- `BSSID` getter：pin 過的值優先（`setAssociateRequest` 一進來就 GET BSSID）。
+- `CHANNEL` getter：不可回 0（pin → 現行 → 目標 BSS 頻道三層 fallback）。
+
+**本輪最後量測**：`cwjoin` 仍 `-3903`，`Ath10kClientTrace` 只有 getter
+（`g12 g19 g96 g1 g1 g2 g15 g4 …`，**沒有任何 set**），`Ath10kChannelReply = 0`
+（證明 airportd 沒有 pin 頻道，即沒進入寫入階段）。
