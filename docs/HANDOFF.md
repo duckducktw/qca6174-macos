@@ -1,5 +1,9 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
+**第三十五輪（§6.40）補記**：`-3903` 在 `Apple80211Associate2` 內只有兩個出口，其中一個要求「密碼參數非 nil」
+（`[ref+0x51] & 0x40` 這一位實測是 1）；airportd 傳給 Associate2 的字典是 `[[profile scanRecord] mutableCopy]`，
+不是從零組的鍵值表 —— 這就是自己重組字典永遠對不上的原因。
+
 **第三十四輪（§6.39）補記**：assoc 迴路上找到並修掉四個真 gate（`useAppleRSNSupplicant` 必須回 false、
 第二次 VDEV_START 要 defer/replay、`DISASSOCIATE` 要真的拆鏈路、controller ivar `+0x1a0` 要填 role-6 vif）。
 現在 `a2push`（用 ref 的 fd 送 type 20）可以走完 teardown → replay → connected-wpa2，
@@ -2476,3 +2480,64 @@ setAssociateRequest(controller, vif, infra, req, bool)
 - **12 格 trace ring 對高頻 getter 沒有用**，重要事件要有獨立屬性。
 - **改 `apple80211_ioctl` 的參數個數時，fallback 呼叫（`IO80211Controller::apple80211_ioctl`）也要一起改**，
   否則編譯失敗（`no matching member function`）。
+
+### 6.40 第三十五輪：`-3903` 在 Associate2 裡的位置找到了（兩個），airportd 用的字典是 scanRecord 的可變副本
+
+#### 6.40.1 先把 airportd 的呼叫點讀出來
+
+`otool -tV /usr/libexec/airportd` 有 258k 行，`Apple80211Associate2` 只有一個呼叫點（`0x100012886`）：
+
+```
+0x1285c  Apple80211Set(ref, 0x1a6 /*422*/, 0, &val, 4)      ; 回傳值被忽略
+0x1286e  rdi = ref            (由 [self …] 的 msgSend 取得)
+0x12871  rsi = 字典           ← 「scanRecord 的 mutableCopy」，之後再用
+                                setObject:forKeyedSubscript: 補 capabilities/… 
+0x12878  rdx = CFString       (密碼；nil 時以 @"1234567890123" 佔位)
+0x1287f  rcx = 第四個參數
+0x12886  call Apple80211Associate2
+0x1288b  eax = 回傳值；非 0 就直接走失敗路徑
+```
+
+所以 airportd 傳的字典**不是**從零組的：它是 `[[profile scanRecord] mutableCopy]`。
+這解釋了為什麼自己用「SSID + passphrase + security」重組永遠對不上——schema 是掃描記錄那一套鍵。
+
+#### 6.40.2 `-3903`（`0xfffff0c1`）在 Associate2 內的兩個出口
+
+反組譯 dump（`tools/dump_a2.c`）掃 `c1 f0 ff ff` 直常量，總共 37 處，扣掉 `-3900/-3905` 後真正的 `-3903` 只有兩條可達路徑：
+
+```
+; 出口 A（0x93e7）
+0x93b9  cmp  rbx, rax            ; 字典某欄轉成資料後的長度
+0x93d6  test r14, r14 ; je 0x93e7   ; ← 第三個參數（密碼）是 nil 就 -3903
+0x93db  test byte [ref+0x51], 0x40  ; bit14 = 0x4000（實測 bind 後 ref 旗標 0xa073ee6f → 這一位是 1）
+0x93e1  jne  0x977d
+0x93e7  mov  [rbp-0x410], 0xfffff0c1   ; -3903
+
+; 出口 B（0x9840）
+0x980a  test byte [ref+0x59], 8
+0x982b  lea  rdi/ rsi … ; call 0x3d890（logger）
+0x9840  mov  [rbp-0x410], 0xfffff0c1   ; -3903（安全型別 switch 走到不支援的分支）
+```
+
+出口 A 要求「密碼非 nil」，而 airportd 只有在**它自己知道金鑰**時才會傳非 nil
+（金鑰在 keychain；`Apple80211Set(422)` 的內容可能就是這件事）。這正是為什麼
+「用我們自己的程式呼叫 Associate2」會拿到 `-3900/-3905`，而 airportd 拿到 `-3903`：
+兩邊走的不是同一個分支。
+
+#### 6.40.3 新增的分析工具（進 repo `tools/`）
+
+| 工具 | 用途 |
+|---|---|
+| `resolve.py` | 解析 airportd（universal binary）裡 `__cfstring`／selref 的 rip-relative 目標，含 **DYLD_CHAINED_PTR_64** 解碼（low 36 bits + image base）；`leaq` 目標是物件本身、`movq` 目標是槽，兩者要分開處理 |
+| `annotate.py` | 把 `otool -tV` 的某段行號區間直接標上解析後的字串（`python3 annotate.py /tmp/airportd.asm 15040 15172`） |
+| `resolve_str.c` | 同上的 C 版（沒有 python 的環境用） |
+
+關鍵坑：機場的 `__DATA` 指標不是純 VA，直接讀會全部失敗；必須 `(p & 0xFFFFFFFFF) + 0x100000000`，
+bit63 代表 bind（外部符號），要另外查 `dyld_info -fixups`。
+
+#### 6.40.4 下一步
+
+1. 用 `annotate.py` 把 `0x11e80–0x12890` 整段標完，列出 airportd 塞進那份 `scanRecord` 副本的所有鍵
+   （已知會出現 `capabilities`／`ASSOC_FLAGS`／`COLOCATED_NETWORK_SCOPE_ID`／`TRANS_DISABLED_FLAGS_ASSOC`）。
+2. 用同一份鍵組字典呼叫 `Apple80211Associate2`，看能不能讓 `Ath10kSetAssocSeen` 出現（pid = 我們自己）。
+3. 若成功，再回頭比對「airportd 的密碼為什麼是 nil」（`Apple80211Set(422)` 這個 4-byte set 很可能就是關鍵）。
