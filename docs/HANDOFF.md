@@ -1123,10 +1123,35 @@ airportd 走的路；`Apple80211BindToInterfaceWithService` 對非 airportd 的�
 2. **驅動自連（目前採用）**：`ath10kjoin=ssid:psk,…` 開機參數 + 看門狗，開機自動連、關開 Wi-Fi
    會自癒、換網路改 boot-args 即可。日常可用，但不是「隨選」。
 
-### 6.37.3 還沒查完的下一步（本輪已排定）
-- service 路徑本體（`0x…be8df7`）**是否支援 type 20**：若支援，正解是讓 airportd 成功走 service
-  綁定（我們的 `newUserClient` 要回 family 的 `IO80211APIUserClient`），而不是去改 framework。
-- airportd 的 ref 怎麼變成 `+0x5d != 0`（哪個 API／entitlement 觸發），以及我們的介面能否滿足它。
+### 6.37.3 本輪追加的實測（4 項，含推翻）
+
+1. **service 路徑也不吃 type 20**（推翻 §6.37.3 原本的假設）。本輪開機的 service 入口
+   `0x7ffb19afedf7`（`Apple80211Set` 本體 `0x7ffb19ad81b3`、entry `0x7ffb19ac556e`）反組譯後
+   與 ioctl 路徑結構相同：`mov ebx,[rsi+0x10]` → `cmp ebx,0x73; jle` → ≤0x1b 過位圖 `0x8089000`
+   → 其餘（含 20）落到 `0x…b00b11` 的 `mov r15d,0xfffff0c1` 尾巴。**兩條路都不支援用 Set 送
+   ASSOCIATE**，所以真正的 join 一定是 `Apple80211Associate2`（它自己組 `apple80211_assoc_data`，
+   不走 Set(20)）。這也解釋了為何自製程式呼叫 Associate2 只拿到純 userspace 的 -3903、errno=0。
+
+2. **我們的 user client 其實開得成功**：`Ath10kFamilyClient = created`、
+   `Ath10kVifEventPipe = 18446743613723228192`（非 null）、`Ath10kUserClientAttempt = 2`、
+   `Ath10kNewUserClientType = 0`、節點 `IOUserClientClass = IO80211APIUserClient`
+   （`Ath10kVenturaInterface::newUserClient` 轉呼叫 family 的 `IO80211APIUserClient`）。
+   ⇒ 原始碼註解裡那行 `IOServiceOpen failed 0xe00002c2` 是舊輪次的記錄，不是現在。
+
+3. **「隨點」在 v212 的實際序列**（`networksetup -setairportnetwork en1 QCA-TEST`，等於系統設定）：
+   `… g12=0 s22=0 g254=0 g19=0 g15=0 g15=0 g1=0 g103=0 g1=0` 然後結束。
+   `s22` 是 DISASSOCIATE，之後全是 getter，**沒有 `s20`**；`Ath10kLastApple80211Request = 1`
+   （最後一個是 SSID get）。錯誤仍是 `-3903`。
+
+4. **airportd 的 logger 起不來**，所以 wifi.log 沒有 join 細節：
+   `_initInterface: Unable to initialize logger` / `unified logger` / `driver message tracer monitor`
+   每次開機都印。要在日誌層面看原因，得先讓那個 driver message tracer 成功（猜測與 corecapture
+   的 CCLogStream / `getLogPipes` 有關）。
+
+**因此下一步只有一條主線**：把 `Apple80211Associate2` 的成功路徑反組譯出來（它在 +0x2500 之後
+才真正送出請求），找出它用哪個 user-client selector 送 assoc、以及我們的 family client 是否回
+`0xe00002c2`；同時把 airportd 的 logger（driver message tracer）修起來，之後每次隨點都能在
+wifi.log 看到它自己的理由。
 
 ---
 
