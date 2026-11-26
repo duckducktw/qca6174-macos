@@ -17,6 +17,7 @@ extern "C" IOReturn ath10kPrepareVifBsdInterface(IO80211VirtualInterface *, ifne
 #include "../Ath10kPCIDevice.hpp"
 #include "../../shared/Ath10kSupplicant.hpp"
 #include "../native/Ath10kKernelCrypto.hpp"
+#include "../native/Ath10kP256KernelBinding.hpp"
 #include <IOKit/IOCommandGate.h>
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSCollectionIterator.h>
@@ -707,6 +708,43 @@ bool Ath10kPCIDevice::publishVenturaVifBsdUnit(IO80211VirtualInterface *vif, IOS
 //   ath10kjoin="ssid:psk,ssid2:psk2"
 // so a different network only needs a config.plist edit (no rebuild). Falls back
 // to the compiled Ath10kAutoJoin.inc when the argument is absent.
+// Prove in-kernel that the corecrypto P-256 binding is callable: 2*3 mod p == 6
+// through the same P256FieldCandidate the SAE exchange uses. Runs once at start;
+// without this measurement the only signal that SAE could never work was a link
+// failure at kext load.
+void Ath10kPCIDevice::venturaP256SelfTest()
+{
+    IOService *probe = getProvider();
+    if (probe == nullptr)
+        return;
+    if (probe->getProperty("Ath10kP256SelfTest") != nullptr)
+        return;
+    AthSecurity::P256FieldCandidate field(Ath10kP256KernelBinding::field());
+    uint8_t a[32] = {0}, b[32] = {0}, out[32] = {0};
+    a[31] = 2;
+    b[31] = 3;
+    AthSecurity::P256FieldWorkspace work;
+    const bool ok = field.multiply(a, sizeof(a), b, sizeof(b), out, sizeof(out), work);
+    probe->setProperty("Ath10kP256SelfTest",
+                       ok && out[31] == 6 ? "mul-ok" : (ok ? "mul-wrong" : "mul-failed"));
+    // Field layout evidence: the P-256 prime must appear as
+    //   ffffffff00000001 0000000000000000 00000000ffffffff ffffffffffffffff
+    // If these limbs are garbage for a given candidate offset, the cczp view is
+    // wrong rather than corecrypto being unusable.
+    {
+        using namespace Ath10kP256KernelSymbols;
+        const void *cp = ccec_cp_256();
+        char note[160];
+        const uint64_t *p16 = reinterpret_cast<const uint64_t *>(cp);
+        snprintf(note, sizeof(note),
+                 "n@8=%u n@16=%u limb0=%016llx limb1=%016llx limb2=%016llx",
+                 static_cast<unsigned>(*reinterpret_cast<const uint32_t *>((const char *)cp + 8)),
+                 static_cast<unsigned>(*reinterpret_cast<const uint32_t *>((const char *)cp + 16)),
+                 p16[0], p16[1], p16[2]);
+        probe->setProperty("Ath10kP256Fields", note);
+    }
+}
+
 void Ath10kPCIDevice::venturaParseJoinList()
 {
     if (_venturaJoinParsed)

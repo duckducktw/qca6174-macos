@@ -147,6 +147,7 @@ private:
     UInt32 _venturaJoinCount = 0;
     bool _venturaJoinParsed = false;
     void venturaParseJoinList();
+    void venturaP256SelfTest();
     UInt32 _vifPublishAttempts = 0;
     static void vifPublishCall(thread_call_param_t, thread_call_param_t);
     static void venturaAutoJoinCall(thread_call_param_t, thread_call_param_t);

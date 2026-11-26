@@ -20,7 +20,7 @@ ATH10K_P256_SYMBOL(int,ccec_affinify,(const void *,void *,const void *));
 ATH10K_P256_SYMBOL(int,ccec_mult_blinded,(const void *,void *,const uint64_t *,const void *,void *));
 ATH10K_P256_SYMBOL(int,ccec_full_add,(const void *,void *,const void *,const void *));
 ATH10K_P256_SYMBOL(int,ccec_full_sub,(const void *,void *,const void *,const void *));
-ATH10K_P256_SYMBOL(int,ccn_read_uint,(size_t,uint64_t *,size_t,const void *));
+ATH10K_P256_SYMBOL(int,ccn_read_uint,(size_t,uint64_t *,size_t,const uint8_t *));
 ATH10K_P256_SYMBOL(void *,ccrng,(int *));
 // `cczp_n` / `cczp_prime` are macros over the cczp struct in corecrypto's own
 // headers, not exported symbols (measured: absent from every KC symtab), so a
@@ -28,17 +28,22 @@ ATH10K_P256_SYMBOL(void *,ccrng,(int *));
 // Read the fields here instead. 13.x layout: {struct cczp_funcs *di; cc_size n;
 // cc_unit *prime; cc_unit *mod_minus_2; ...}; cc_size is 32-bit and the pointer
 // that follows it is 8-byte aligned, i.e. prime sits at +8.
-struct Ath10kCczpView {
-    const void *di;
-    uint32_t n;
-    uint32_t pad;
-    const uint64_t *prime;
-};
-static inline size_t Ath10kCczpUnits(const void *cp) {
-    return cp ? static_cast<const Ath10kCczpView *>(cp)->n : 0;
+// ccec_cp_256()'s object does not expose {di, n, prime} the way the corecrypto
+// headers describe it (measured on 13.7: the first word is the limb count 4, the
+// next words are 0x100 and a kernel pointer - neither is a usable prime array).
+// Both values are constants for P-256 anyway, and P256FieldCandidate::run() only
+// uses them to check "units==4 and prime==the P-256 modulus" before handing the
+// real curve pointer to cczp_mul, so answer with the constants instead of
+// decoding a layout that differs per build.
+static inline size_t Ath10kCczpUnits(const void *)
+{
+    return 4;
 }
-static inline const uint64_t *Ath10kCczpPrime(const void *cp) {
-    return cp ? static_cast<const Ath10kCczpView *>(cp)->prime : nullptr;
+static inline const uint64_t *Ath10kCczpPrime(const void *)
+{
+    static const uint64_t prime[4] = {0xffffffffffffffffull, 0x00000000ffffffffull,
+                                      0ull, 0xffffffff00000001ull};
+    return prime;
 }
 ATH10K_P256_SYMBOL(int,cczp_mul,(const void *,uint64_t *,const uint64_t *,const uint64_t *));
 ATH10K_P256_SYMBOL(int,cczp_inv,(const void *,uint64_t *,const uint64_t *));
@@ -49,8 +54,15 @@ ATH10K_P256_SYMBOL(int,cczp_sub,(const void *,uint64_t *,const uint64_t *,const 
 struct Ath10kP256KernelBinding {
     static AthSecurity::P256CoreCryptoAPI points(){
         using namespace Ath10kP256KernelSymbols;
+        // ccn_read_uint's real prototype (corecrypto's ccn.h) takes
+        // (size_t, cc_unit *, size_t, const uint8_t *), while the shared API
+        // struct types the slot as const void *. Adapt instead of redeclaring the
+        // symbol: redeclaring it is what produced "conflicting types" once the
+        // corecrypto headers were in the same translation unit.
+        static int (*const readScalar)(size_t, uint64_t *, size_t, const void *) =
+            reinterpret_cast<int (*)(size_t, uint64_t *, size_t, const void *)>(ccn_read_uint);
         return {ccec_cp_256,ccec_x963_import_pub,ccec_validate_pub,ccec_x963_export,
-            ccec_projectify,ccec_affinify,ccec_mult_blinded,ccec_full_add,ccec_full_sub,ccn_read_uint,ccrng};
+            ccec_projectify,ccec_affinify,ccec_mult_blinded,ccec_full_add,ccec_full_sub,readScalar,ccrng};
     }
     static AthSecurity::P256FieldAPI field(){
         using namespace Ath10kP256KernelSymbols;

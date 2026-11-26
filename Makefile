@@ -65,7 +65,8 @@ LDFLAGS = $(ARCH) -static -nostdlib -Xlinker -kext \
            -F$(SDK)/System/Library/Frameworks
 
 ifeq ($(VENTURA),1)
-CXXFLAGS += -DATH10K_VENTURA=1 -UATH10K_NATIVE -I$(PROJ_ROOT)/vendor/itlwm-v1 -I$(PROJ_ROOT)/vendor/itlwm-v1/Airport
+CXXFLAGS += -DATH10K_VENTURA=1 -UATH10K_NATIVE -I$(PROJ_ROOT)/vendor/itlwm-v1 -I$(PROJ_ROOT)/vendor/itlwm-v1/Airport \
+            -DATH10K_P256_DIAGNOSTIC_BINDING=1
 MINOS := -mmacosx-version-min=13.0
 # SAE/PMF sessions are shared with the native personality: they only need
 # corecrypto (cchmac/ccsha256) plus the P-256 binding, both of which resolve in
