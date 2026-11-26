@@ -1,17 +1,17 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-最後更新：2026-11-26（**第三十輪：join 打通（驅動自連）**。`-3903` 追到源頭：framework 的
-userspace 白名單（`Apple80211Set` 對 type 20 直接記 log 回 `-3903`，位圖 `0x08089000` 只放行
-12/15/19/27），所以 airportd 不可能發起 join。改由驅動自己關聯：延遲 `thread_call` + 常駐看門狗
-呼叫 `venturaAssociate()`，憑證在產生的 `Ath10kAutoJoin.inc`（gitignore）。v199 實測：冷開機
-自動連上、`Current Wi-Fi Network: QCA-TEST`、DHCP 192.168.77.75、ping 1.1.1.1 3/3、https 200、
-DNS 正常；關/開 Wi-Fi 後 15 秒自動重連。）
+最後更新：2026-11-26（**第三十二輪：把「不能隨點連線」定位到 framework 的 userspace 白名單**。
+`-3903` 的完整鏈路已釘死：`Apple80211Set` 本體以位圖 `0x08089000`（只放行 12/15/19/27）過濾型別，
+type 20 落到 `0x7ffb1eb43b11`：拿 `OS_os_log` 記一條 log、直接把 `r15d` 設成 `0xfffff0c1` 後返回。
+所以 airportd 永遠發不出 ASSOCIATE，隨點連線只能靠「關 SIP 改 framework」或「驅動自連」。
+本輪同時：P-256 在核心裡真的算得出來（`Ath10kP256SelfTest = mul-ok`）、SAE 偵測與 AKM 傳遞打通
+（`Ath10kSAEPhase = "sae-detected … upper=1000"`）、SAE/PMF 類別進 Ventura 連結、
+開機 panic 收斂（`ath10kvifbsd` 閘門）、自動連線等 WMI 就緒
+（`Ath10kWmiLive = active`、`Ath10kAutoJoinPhase = up`、`connected-wpa2`、DHCP 192.168.77.75）。
+多網路：`ath10kjoin=ssid:psk,…` 開機參數。真機 ESP 已備妥但未重開驗證。）
 分支：`ventura-io80211`　最新 commit：見 `git log -1`
-VM 現況：**v208**（`/tmp/vk200`，Acer 上，sha256 `75e46c62c14153de5f05d7ad54fba459a9ba7284b7a06a29466361f98a3854c3`；與 v199 同一個二進位）— kext 載入、
-en1 `UP,RUNNING`、驅動自連 `connected-wpa2`、SSID 正確回報、DHCP＋上網已通
-第十九輪：§6.23；第十七輪掃描：§6.21；§1 條件 D ✅ 的推導見 §6.25；第三十輪：§6.35
+VM 現況：**v212**（Acer `/tmp/vk212`，sha256 `474d0c3e…`）— 驅動自連、SSID 正確、DHCP＋上網已通
 
----
 
 ## 1. 目標與驗收條件
 
@@ -1094,6 +1094,39 @@ scan manager 裡，driver 不再「按需求送 SCAN_RESULT」，而是由 manag
   VM 實測 `Ath10kJoinList = boot-args entries=2 first=QCA-TEST` 仍正常連線。
 - **真機 ESP 已部署**（`nvme0n1p3`）：kext v204、`Kernel/Add … Enabled=True`、boot-args 帶
   `ath10kjoin=…`；備份在 `/root/ath10k-real-esp-backup-20261126-084903`。**尚未重開機驗證**。
+
+---
+
+## 6.37 第三十二輪：為什麼「不能隨點連線」——完整證據鏈
+
+### 6.37.1 兩條 Set 路徑，只有一條吃 type 20
+`Apple80211Set`（使用者空間 `IO80211.framework`，entry 是 10-byte thunk，本次開機
+`0x7ffb1eb0856e` → 本體 `0x7ffb1eb41df7`）在把請求送進 kernel 前先做型別分派：
+
+| type 範圍 | 走法 |
+|---|---|
+| ≤ 0x1b 且在位圖 `0x08089000` 內（只有 12/15/19/27） | 快速路徑，直接轉發 |
+| 0x60 / 0x61 | 個別處理 |
+| **其餘（含 20 ASSOCIATE）** | `0x7ffb1eb43b11`：`mov rdi,[OS_os_log]; mov esi,0x11; call log; mov r15d,0xfffff0c1; … jmp epilogue` |
+
+⇒ **-3903 是 userspace 直接回的**，不是 family、更不是驅動。實測：我們自己寫 40 行小程式呼叫
+`Apple80211Set(ref, 20, …)` 一樣拿到 `-3903`，且驅動端請求計數不動（`Ath10kApple80211Requests` 只 +1，
+那是背景 airportd 的）。
+
+另一條 service 路徑（dispatcher 開頭 `cmp byte ptr [ref+0x5d], 0`，非 0 時 `jmp 0x…be8df7`）才是
+airportd 走的路；`Apple80211BindToInterfaceWithService` 對非 airportd 的程式回 `-3900`（要
+`com.apple.wlan.authentication`），所以無法在自製程式裡重現。
+
+### 6.37.2 結論與兩條可行路線
+1. **關 SIP + 改 framework**：唯一能讓「系統設定點選任意網路」真正走 airportd 的辦法，但要動
+   Apple 的 dyld 快取／注入 dylib，等於放棄原廠簽章與更新。
+2. **驅動自連（目前採用）**：`ath10kjoin=ssid:psk,…` 開機參數 + 看門狗，開機自動連、關開 Wi-Fi
+   會自癒、換網路改 boot-args 即可。日常可用，但不是「隨選」。
+
+### 6.37.3 還沒查完的下一步（本輪已排定）
+- service 路徑本體（`0x…be8df7`）**是否支援 type 20**：若支援，正解是讓 airportd 成功走 service
+  綁定（我們的 `newUserClient` 要回 family 的 `IO80211APIUserClient`），而不是去改 framework。
+- airportd 的 ref 怎麼變成 `+0x5d != 0`（哪個 API／entitlement 觸發），以及我們的介面能否滿足它。
 
 ---
 
