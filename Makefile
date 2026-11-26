@@ -67,7 +67,11 @@ LDFLAGS = $(ARCH) -static -nostdlib -Xlinker -kext \
 ifeq ($(VENTURA),1)
 CXXFLAGS += -DATH10K_VENTURA=1 -UATH10K_NATIVE -I$(PROJ_ROOT)/vendor/itlwm-v1 -I$(PROJ_ROOT)/vendor/itlwm-v1/Airport
 MINOS := -mmacosx-version-min=13.0
-VENTURA_OBJECT := $(BUILD_DIR)/Ath10kVentura.o $(BUILD_DIR)/Ath10kVenturaInterface.o $(BUILD_DIR)/Ath10kVenturaUserClient.o
+# SAE/PMF sessions are shared with the native personality: they only need
+# corecrypto (cchmac/ccsha256) plus the P-256 binding, both of which resolve in
+# the Ventura personality too, so the same objects are linked here.
+VENTURA_OBJECT := $(BUILD_DIR)/Ath10kVentura.o $(BUILD_DIR)/Ath10kVenturaInterface.o $(BUILD_DIR)/Ath10kVenturaUserClient.o \
+                  $(BUILD_DIR)/Ath10kSAEWorker.o $(BUILD_DIR)/Ath10kSAESession.o $(BUILD_DIR)/Ath10kPMFSession.o
 endif
 
 ifeq ($(NATIVE),1)
@@ -87,6 +91,9 @@ endif
 $(OBJS): $(wildcard src/shared/*.hpp)
 ifeq ($(NATIVE),1)
 $(OBJS): $(wildcard src/kext/native/*)
+endif
+ifeq ($(VENTURA),1)
+$(OBJS): $(wildcard src/kext/native/Ath10kSAE*.hpp) $(wildcard src/kext/native/Ath10kPMFSession.hpp)
 endif
 
 $(BUILD_DIR)/Ath10kVentura.o: src/kext/ventura/Ath10kVentura.cpp $(wildcard src/kext/ventura/*) | $(BUILD_DIR)

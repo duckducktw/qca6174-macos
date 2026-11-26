@@ -22,8 +22,24 @@ ATH10K_P256_SYMBOL(int,ccec_full_add,(const void *,void *,const void *,const voi
 ATH10K_P256_SYMBOL(int,ccec_full_sub,(const void *,void *,const void *,const void *));
 ATH10K_P256_SYMBOL(int,ccn_read_uint,(size_t,uint64_t *,size_t,const void *));
 ATH10K_P256_SYMBOL(void *,ccrng,(int *));
-ATH10K_P256_SYMBOL(size_t,cczp_n,(const void *));
-ATH10K_P256_SYMBOL(const uint64_t *,cczp_prime,(const void *));
+// `cczp_n` / `cczp_prime` are macros over the cczp struct in corecrypto's own
+// headers, not exported symbols (measured: absent from every KC symtab), so a
+// binding to them fails the whole kext at link time with an unresolved symbol.
+// Read the fields here instead. 13.x layout: {struct cczp_funcs *di; cc_size n;
+// cc_unit *prime; cc_unit *mod_minus_2; ...}; cc_size is 32-bit and the pointer
+// that follows it is 8-byte aligned, i.e. prime sits at +8.
+struct Ath10kCczpView {
+    const void *di;
+    uint32_t n;
+    uint32_t pad;
+    const uint64_t *prime;
+};
+static inline size_t Ath10kCczpUnits(const void *cp) {
+    return cp ? static_cast<const Ath10kCczpView *>(cp)->n : 0;
+}
+static inline const uint64_t *Ath10kCczpPrime(const void *cp) {
+    return cp ? static_cast<const Ath10kCczpView *>(cp)->prime : nullptr;
+}
 ATH10K_P256_SYMBOL(int,cczp_mul,(const void *,uint64_t *,const uint64_t *,const uint64_t *));
 ATH10K_P256_SYMBOL(int,cczp_inv,(const void *,uint64_t *,const uint64_t *));
 ATH10K_P256_SYMBOL(int,cczp_add,(const void *,uint64_t *,const uint64_t *,const uint64_t *));
@@ -38,6 +54,6 @@ struct Ath10kP256KernelBinding {
     }
     static AthSecurity::P256FieldAPI field(){
         using namespace Ath10kP256KernelSymbols;
-        return {ccec_cp_256,cczp_n,cczp_prime,cczp_mul,cczp_inv,cczp_add,cczp_sub};
+        return {ccec_cp_256,Ath10kCczpUnits,Ath10kCczpPrime,cczp_mul,cczp_inv,cczp_add,cczp_sub};
     }
 };
