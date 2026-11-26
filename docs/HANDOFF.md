@@ -2882,3 +2882,40 @@ airportd 在 join 時一定會送 `Set(SSID)`，即使它的 `Associate2` 在 us
 - VM 保持在可用狀態：`connected-wpa2` / `status: active` / 舊 IP 正常。
 - 點選連線（`cwjoin`、`networksetup`）仍是 `-3903`，且**沒有 `s1`／`s20`**。
 - 對照表（`docs/apple-vs-ours.md`）裡 §4.3 的 request-node 差異已定位到具體參數白名單，是下一輪最明確的著力點。
+
+### 6.48 第四十三輪：scan manager 的請求被 `validateScanData` 擋掉（`err=2` 的真因）
+
+#### 6.48.1 真因
+
+SCAN_REQ 是交給 Apple 的 scan manager（`ath10kScanManagerStartScan`），而它**先跑 `validateScanData`**，
+通過了才建立 `apple80211scan_req_node`；之後所有 `GET CURR SCAN RESULT` 都是從那個 node 回答的。
+所以「請求沒過驗證 → 沒有 node → 之後每次查詢都 `err=2`」。
+
+live 的驗證條件（`IO80211ScanManager::getCachedScanResults` `0x201150a`）：
+
+```
+[data+0x04] - 1 > 2                          → 0x16   ; bss_type 必須 1..3
+[data+0x10]     > 0x20                       → 0x16   ; ssid_len ≤ 32
+[data+0x34] > 9 或 !bt(0x38e, [data+0x34])   → 0x16   ; scan_type 白名單 (1,2,3,7,8,9)
+[data+0x44]     > 0x190                      → 0x16
+```
+
+#### 6.48.2 修法（v245）
+
+在把請求交給 manager 之前先做一份 sanitized 副本（`Ath10kScanDataSane` breadcrumb）：
+
+```
+Ath10kScanDataSane = "bss_type=3 ssid_len=0 scan_type=3 [+0x44]=0"
+Ath10kScanMgrStart  = "ok"
+```
+
+`cwscan` 仍正常（9–15 個網路），`startScan` 也 `ok`。
+
+#### 6.48.3 但 `err=2` 還在，而且 join 更早失敗
+
+`GET CURR SCAN RESULT` 仍 `err=2`，而且 join 的 `Ath10kClientTrace` 只有
+`g2 g1 g2 g1 g1 g1 g1 g2 …`（**連 `s1` Set(SSID) 都沒有**）。
+
+也就是說這些 `err=2` 來自 **wifivelocityd / configd** 對「目前掃描結果」的查詢，
+不是 join 的必要步驟；而 airportd 的 join 在送 `Set(SSID)` 之前就停了。
+下一步要把焦點放在「airportd 為什麼不送 Set(SSID)」，而不是掃描快取。

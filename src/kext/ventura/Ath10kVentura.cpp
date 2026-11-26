@@ -3527,11 +3527,41 @@ SInt32 Ath10kPCIDevice::venturaScanManagerRequest(int type, void *data)
     // the flag keeps that call from being routed back into the manager.
     _venturaManagerCall = true;
     if (isScanRequest) {
-        // startScan() runs validateScanData(), allocates the pending request node (the
-        // pid-keyed record getScanResult() matches on) and then calls this driver back
-        // through the Skywalk request slot for the real SCAN_REQ.
-        const SInt32 status = ath10kScanManagerStartScan(
-            _venturaScanManager, static_cast<const apple80211_scan_data *>(data));
+        // startScan() runs validateScanData() before it allocates the pending request
+        // node - and that node is what every later "GET CURR SCAN RESULT" is answered
+        // from. The live validation (IO80211ScanManager::getCachedScanResults,
+        // 0xffffff800201150a) is:
+        //     [data+0x04] - 1 > 2        -> fail (bss_type must be 1..3)
+        //     [data+0x10]      > 0x20    -> fail (ssid_len <= 32)
+        //     [data+0x34] > 9 || !bit(0x38e, [data+0x34]) -> fail (scan_type whitelist)
+        //     [data+0x44]      > 0x190   -> fail
+        // A request that fails here leaves no node, which is why airportd logged
+        // "GET CURR SCAN RESULT err=2" on every query. Sanitise the request first.
+        apple80211_scan_data sane;
+        bzero(&sane, sizeof(sane));
+        if (data != nullptr)
+            bcopy(data, &sane, sizeof(sane));
+        sane.version = APPLE80211_VERSION;
+        if (sane.bss_type < APPLE80211_AP_MODE_IBSS || sane.bss_type > APPLE80211_AP_MODE_ANY)
+            sane.bss_type = APPLE80211_AP_MODE_INFRA;
+        if (sane.ssid_len > APPLE80211_MAX_SSID_LEN)
+            sane.ssid_len = 0;
+        const UInt32 scanTypeBit = (sane.scan_type <= 9) ? (1u << sane.scan_type) : 0u;
+        if ((scanTypeBit & 0x38eu) == 0)
+            sane.scan_type = APPLE80211_SCAN_TYPE_ACTIVE;
+        UInt16 *dwellWord = reinterpret_cast<UInt16 *>(reinterpret_cast<char *>(&sane) + 0x44);
+        if (*dwellWord > 0x190)
+            *dwellWord = 110;
+        if (probe != nullptr) {
+            char note[128];
+            snprintf(note, sizeof(note), "bss_type=%u ssid_len=%u scan_type=%u [+0x44]=%u",
+                     static_cast<unsigned>(sane.bss_type),
+                     static_cast<unsigned>(sane.ssid_len),
+                     static_cast<unsigned>(sane.scan_type),
+                     static_cast<unsigned>(*dwellWord));
+            probe->setProperty("Ath10kScanDataSane", note);
+        }
+        const SInt32 status = ath10kScanManagerStartScan(_venturaScanManager, &sane);
         if (probe != nullptr)
             probe->setProperty("Ath10kScanMgrStart", status == 0 ? "ok" : "failed");
         if (status == 0)
