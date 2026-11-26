@@ -116,6 +116,14 @@ private:
     IOReturn venturaAssociate(const apple80211_assoc_data *request);
     // Replays a parked join once the previous link has finished tearing down, and
     // makes DISASSOCIATE actually drop the link instead of only publishing a state.
+    // Credentials this driver already holds, used when a caller's ASSOCIATE arrives
+    // without key material (airportd's Associate2 does exactly that).
+    const char *venturaCredentialForSSID(const UInt8 *ssid, UInt32 length);
+    bool venturaBSSProtected(const UInt8 *ssid, UInt32 length, const UInt8 **rsn,
+                             UInt32 *rsnLength);
+    // Association completion events for the client's join loop (see the
+    // implementation: without them Apple80211Associate2 times out with -3905).
+    void venturaPostLinkEvents(bool up);
     void venturaPendingJoinService(UInt64 nowMs);
     void venturaDisassociate(bool deauth);
     IOReturn venturaScanResult(apple80211_scan_result *result);

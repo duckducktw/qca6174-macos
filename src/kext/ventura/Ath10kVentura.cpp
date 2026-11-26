@@ -2632,6 +2632,54 @@ IOReturn Ath10kPCIDevice::venturaScanResult(apple80211_scan_result *result)
     return kIOReturnSuccess;
 }
 
+// The PSK this driver already knows for an SSID: the ath10kjoin boot-arg list first,
+// then the compiled-in test network. Used when the caller's ASSOCIATE carries no key
+// material of its own (measured: airportd's Apple80211Associate2 sends keylen=0).
+const char *Ath10kPCIDevice::venturaCredentialForSSID(const UInt8 *ssid, UInt32 length)
+{
+    if (ssid == nullptr || length == 0 || length > APPLE80211_MAX_SSID_LEN)
+        return nullptr;
+    venturaParseJoinList();
+    for (UInt32 i = 0; i < _venturaJoinCount; ++i) {
+        if (strlen(_venturaJoinSSID[i]) != length)
+            continue;
+        bool same = true;
+        for (UInt32 j = 0; j < length; ++j)
+            if (static_cast<UInt8>(_venturaJoinSSID[i][j]) != ssid[j]) { same = false; break; }
+        if (same && _venturaJoinPSK[i][0] != 0)
+            return _venturaJoinPSK[i];
+    }
+    if (strlen(ATH10K_AUTOJOIN_SSID) == length) {
+        bool same = true;
+        for (UInt32 j = 0; j < length; ++j)
+            if (static_cast<UInt8>(ATH10K_AUTOJOIN_SSID[j]) != ssid[j]) { same = false; break; }
+        if (same)
+            return ATH10K_AUTOJOIN_PSK;
+    }
+    return nullptr;
+}
+
+// Does the BSS we resolved for this SSID advertise RSN (i.e. would a keyless
+// ASSOCIATE be refused)?
+bool Ath10kPCIDevice::venturaBSSProtected(const UInt8 *ssid, UInt32 length,
+                                          const UInt8 **rsn, UInt32 *rsnLength)
+{
+    for (UInt32 i = 0; i < _wmiBSS.count; ++i) {
+        const auto &entry = _wmiBSS.entries[i];
+        if (entry.ssidLength != length)
+            continue;
+        bool same = true;
+        for (UInt32 j = 0; j < length; ++j)
+            if (entry.ssid[j] != ssid[j]) { same = false; break; }
+        if (!same || !entry.rsnPresent || entry.rsnLength < 2)
+            continue;
+        if (rsn != nullptr) *rsn = entry.rsn;
+        if (rsnLength != nullptr) *rsnLength = entry.rsnLength;
+        return true;
+    }
+    return false;
+}
+
 static UInt64 ath10kNowMs()
 {
     uint64_t now = 0, ns = 0;
@@ -2718,6 +2766,28 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
     if (ssidLength == 0 || ssidLength > APPLE80211_MAX_SSID_LEN)
         return kIOReturnBadArgument;
 
+    // Already associated to exactly this network: answer success instead of tearing
+    // the link down and building it again. Measured, the defer + teardown + rejoin
+    // path takes 9-11 s while Apple's callers wait 10.2 s for an association result
+    // (Apple80211Associate2 then returns -3905), so a same-network click used to
+    // time out even though the link never had to change.
+    if (Ath10k::connectionAssociated(_connection) &&
+        _connection.ssidLength == ssidLength &&
+        memcmp(_connection.ssid, request->ad_ssid, ssidLength) == 0) {
+        UInt8 nonzeroBssid = 0;
+        for (UInt32 i = 0; i < 6; ++i)
+            nonzeroBssid |= request->ad_bssid.octet[i];
+        const bool sameBssid = (nonzeroBssid == 0) ||
+                               memcmp(_connection.bssid, request->ad_bssid.octet, 6) == 0;
+        if (sameBssid) {
+            if (probe != nullptr)
+                probe->setProperty("Ath10kAssocDefer", "already-connected");
+            IOLog("Ath10kMac: ASSOCIATE already satisfied ssid-len=%u\n",
+                  static_cast<unsigned>(ssidLength));
+            return kIOReturnSuccess;
+        }
+    }
+
     // The family names the BSS it wants. A zeroed BSSID means "any AP with this
     // SSID", which this driver resolves against its own beacon cache: the family's
     // scan cache is not reachable from here.
@@ -2757,19 +2827,47 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
     // supplicant answer the four-way handshake once the BSS is committed.
     // Enterprise (802.1X) has no supplicant in this personality yet and SAE is
     // handled by its own exchange, so both are still refused with a breadcrumb.
-    const bool wantsKey = (request->ad_auth_upper != 0) ||
-                          (request->ad_key.key_len != 0) ||
-                          (request->ad_rsn_ie_len != 0);
+    bool wantsKey = (request->ad_auth_upper != 0) ||
+                    (request->ad_key.key_len != 0) ||
+                    (request->ad_rsn_ie_len != 0);
+    UInt16 authUpper = request->ad_auth_upper;
+    const UInt8 *keyBytes = request->ad_key.key;
+    UInt32 keyLength = request->ad_key.key_len;
+    if (!wantsKey) {
+        // The caller asked for an open join. airportd's Apple80211Associate2 does
+        // exactly that here (measured Ath10kAssocRaw upper=0000 keylen=0) because its
+        // dictionary carries no key material, and refusing it turned every click into
+        // "protected-network-not-supported". The driver already knows the PSK for this
+        // SSID, so use its own credentials instead of dropping the join.
+        const char *credential = venturaCredentialForSSID(request->ad_ssid, ssidLength);
+        if (credential != nullptr) {
+            const UInt8 *rsn = nullptr;
+            UInt32 rsnLen = 0;
+            if (venturaBSSProtected(request->ad_ssid, ssidLength, &rsn, &rsnLen)) {
+                keyBytes = reinterpret_cast<const UInt8 *>(credential);
+                keyLength = static_cast<UInt32>(strlen(credential));
+                authUpper = venturaRsnOffersSae(rsn, rsnLen) ? APPLE80211_AUTHTYPE_WPA3_SAE
+                                                             : APPLE80211_AUTHTYPE_WPA2_PSK;
+                wantsKey = true;
+                if (probe != nullptr)
+                    probe->setProperty("Ath10kAssocKeyFallback", "join-list");
+            } else if (probe != nullptr) {
+                probe->setProperty("Ath10kAssocKeyFallback", "bss-not-protected");
+            }
+        } else if (probe != nullptr) {
+            probe->setProperty("Ath10kAssocKeyFallback", "no-credential");
+        }
+    }
     UInt8 akm = 2;
     if (wantsKey) {
         // Bit 3 is WPA2-PSK (RSN AKM 2), bit 10 is PSK-SHA256 (AKM 6). Both share
         // the PBKDF2 PMK; only the descriptor differs and the supplicant picks it
         // from the validated RSN element.
-        if (request->ad_auth_upper & (1u << 10))
+        if (authUpper & (1u << 10))
             akm = 6;
-        else if (request->ad_auth_upper & (1u << 3))
+        else if (authUpper & (1u << 3))
             akm = 2;
-        else if (request->ad_auth_upper & (1u << 12)) {
+        else if (authUpper & (1u << 12)) {
             // WPA3-SAE (AKM 8). The PMK comes from the SAE exchange, not PBKDF2, so
             // arming the PSK supplicant here would silently fail at the 4-way. The
             // frame exchange is not wired yet; record that it was recognised so the
@@ -2779,11 +2877,11 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
                 char note[96];
                 snprintf(note, sizeof(note), "sae-detected ssid=%.32s upper=%04x",
                          reinterpret_cast<const char *>(request->ad_ssid),
-                         static_cast<unsigned>(request->ad_auth_upper));
+                         static_cast<unsigned>(authUpper));
                 probe->setProperty("Ath10kSAEPhase", note);
             }
         }
-        else if (request->ad_auth_upper & (0x100u << 0)) {
+        else if (authUpper & (0x100u << 0)) {
             if (probe != nullptr)
                 probe->setProperty("Ath10kAssocPhase", "enterprise-not-supported");
             return kIOReturnUnsupported;
@@ -2805,7 +2903,7 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
     if (wantsKey) {
         // Key material first: a failure here must refuse the join instead of
         // associating and then failing every handshake frame.
-        const IOReturn armed = venturaSecurityArm(request->ad_key.key, request->ad_key.key_len, akm);
+        const IOReturn armed = venturaSecurityArm(keyBytes, keyLength, akm);
         if (armed != kIOReturnSuccess)
             return armed;
     } else {
@@ -2860,16 +2958,12 @@ void Ath10kPCIDevice::venturaDisassociate(bool)
     // userspace believed the link was gone; the ASSOCIATE that airportd sends right
     // after then failed the firmware's VDEV_START ("vdev-start-unsolicited") and the
     // whole click-to-join died. Ask the state machine for a real teardown instead.
+    // Publish the state only. Tearing the link down here made airportd's routine
+    // DISASSOCIATE (it sends one around every scan/join attempt) knock the working
+    // link over and over, which the auto-join watchdog then had to rebuild - measured
+    // as a connected/disabled flap every few seconds on v215-v226. The teardown a real
+    // join needs is requested by venturaAssociate() through its defer path instead.
     _venturaPendingAssocValid = false;
-    if (_connection.stage > Ath10k::LinkStage::Scan || _connection.vdevUp) {
-        _connection.error = "user-disassociate";
-        _connection.cancelRequested = true;
-    } else {
-        // Nothing is up: asking for a drain here would set cancelRequested on a
-        // state machine that never services it again (stage Disabled returns early),
-        // which blocked every later join.
-        _connection.cancelRequested = false;
-    }
     venturaPublishState(APPLE80211_S_INIT);
 }
 
@@ -3412,6 +3506,45 @@ extern "C" IOReturn ath10kVifPostMessageIOUC(IO80211VirtualInterface *self, cons
 extern "C" IOReturn ath10kVifPostMessageInternal(IO80211VirtualInterface *self, UInt32 message,
                                                  void *data, size_t len)
     __asm("__ZN23IO80211SkywalkInterface19postMessageInternalEjPvm");
+
+// Post the association events the client's join loop waits on. The kern_event route
+// (IO80211InterfacePostMessage, the same bridge SCAN_DONE already uses) is what
+// Apple80211Associate2's reader thread consumes; without it the join completes in the
+// driver but the caller still times out with -3905 after 10.2 s (measured).
+void Ath10kPCIDevice::venturaPostLinkEvents(bool up)
+{
+    IOService *probe = getProvider();
+    if (_venturaVif == nullptr)
+        return;
+    char ifname[16] = {};
+    const char *unit = nullptr;
+    if (_venturaInterface != nullptr) {
+        if (OSString *n = OSDynamicCast(OSString, _venturaInterface->getProperty("IOInterfaceName")))
+            unit = n->getCStringNoCopy();
+    }
+    strlcpy(ifname, unit != nullptr ? unit : "en1", sizeof(ifname));
+    // Payload shape Apple's own driver sends for M_LINK_CHANGED: two u32 (link up, rssi).
+    struct { UInt32 up; UInt32 rssi; } linkPayload{up ? 1u : 0u, 0u};
+    const int linkStatus = ath10kInterfacePostMessage(ifname, APPLE80211_M_LINK_CHANGED,
+                                                      &linkPayload, sizeof(linkPayload), this);
+    int assocStatus = 0;
+    if (up) {
+        struct { UInt32 status; UInt32 bssidOk; } assocPayload{0, 1};
+        assocStatus = ath10kInterfacePostMessage(ifname, APPLE80211_M_ASSOC_DONE,
+                                                 &assocPayload, sizeof(assocPayload), this);
+        // Skywalk fan-out for clients that hold an IOUC pipe instead.
+        if (_venturaVif != nullptr) {
+            _venturaVif->postMessage(APPLE80211_M_ASSOC_DONE, &assocPayload, sizeof(assocPayload));
+            _venturaVif->postMessage(APPLE80211_M_LINK_CHANGED, &linkPayload, sizeof(linkPayload));
+        }
+    }
+    if (probe != nullptr) {
+        char note[96];
+        snprintf(note, sizeof(note), "up=%d kev(link=%d assoc=%d) name=%s",
+                 up ? 1 : 0, linkStatus, assocStatus, ifname);
+        probe->setProperty("Ath10kLinkEvent", note);
+    }
+}
 
 void Ath10kPCIDevice::scanNotifyCall(thread_call_param_t param0, thread_call_param_t)
 {

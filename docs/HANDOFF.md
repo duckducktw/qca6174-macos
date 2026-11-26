@@ -1,5 +1,10 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
+**第三十七輪（§6.42）補記**：驅動端 join 只要 **約 2 秒**，但 `Apple80211Associate2` 每次都等 **10.2 秒**
+然後回 `-3905`（errno 60＝讀事件逾時）——缺的是**完成事件**，不是關聯失敗。
+已補 `M_LINK_CHANGED`/`M_ASSOC_DONE` 的 kern_event 發送（`Ath10kLinkEvent = up=1 kev(link=0 assoc=0)`）、
+同網路快路徑，並把 v215 的「真拆鏈路」改回去（它讓 airportd 例行 DISASSOCIATE 反覆打斷連線）。
+
 **第三十六輪（§6.41）補記**：自己呼叫 `Apple80211Associate2` 的請求**已經打到驅動**
 （`Ath10kAssocWho = pid=… name=a2join`），卡點收斂成一個：字典裡的金鑰材料沒被認出來，
 Associate2 送出的 `assoc_data` 是 `keylen=0`（開放式），驅動以 `protected-network-not-supported` 拒絕。
@@ -2612,3 +2617,42 @@ RUNTIME STOP reason=protected-network-not-supported
 - kernel 側、family 側、defer/replay、teardown 全部可用（`a2push` 可以走完 4-way 到 `connected-wpa2`）。
 - 唯一缺口是 **Associate2 的字典 schema**：金鑰材料沒被認出來，於是它送出「開放式」關聯，
   驅動以 `protected-network-not-supported` 拒絕，airportd 最終報 `-3903`。
+
+### 6.42 第三十七輪：join 在驅動裡只需要 2 秒，userspace 卻等 10 秒 —— 缺的是「完成事件」
+
+#### 6.42.1 量到的三個事實
+
+1. **驅動端 join 很快**：用 `jointime2.sh` 每 0.4 秒取一次狀態，一次 `a2join` 內看到
+   `wpa2-handshake → connected-wpa2` 只隔 **約 2 秒**（含 defer、teardown、replay 全流程）。
+2. **呼叫端永遠等 10.2 秒**：`a2join`（直接叫 `Apple80211Associate2`）每次都是
+   `elapsed=10.2s rc=-3905 (ETIMEDOUT, errno=60)`，即使連線已經建立。
+3. **`AssocRaw` 顯示呼叫端送的是空金鑰**：`upper=0000 lower=0001 keylen=0`；
+   v222 的 `Ath10kAssocKeyFallback=join-list` 會用驅動自己手上的 PSK 補上，所以能連上。
+
+結論：**Associate2 不是在等 getter，而是在等事件**（`read(fd)` 逾時 = errno 60）。
+
+#### 6.42.2 已補的東西
+
+- v226 起：`ASSOCIATE` 若目標就是目前連線中的 SSID/BSSID，直接回成功（`Ath10kAssocDefer=already-connected`）。
+- v227：`venturaDisassociate()` **改回只發狀態**。v215–v226 的「真拆鏈路」讓 airportd 例行的
+  DISASSOCIATE 反覆打斷連線（實測 connected / disabled 每幾秒翻一次）。
+- v228：`venturaPostLinkEvents()`，在 WPA2 port authorized 與斷線時送
+  `APPLE80211_M_LINK_CHANGED` / `M_ASSOC_DONE`，走的是 SCAN_DONE 已在用的那條 kern_event 橋
+  （`IO80211InterfacePostMessage`）。實測事件送出成功：`Ath10kLinkEvent = up=1 kev(link=0 assoc=0) name=en1`。
+
+#### 6.42.3 為什麼還是 -3905／-3903
+
+- `a2join` 是「我們自己的行程」呼叫 Associate2，**沒有先做 `Apple80211EventMonitoringInit2`**，
+  所以就算驅動把事件送到 kern_event，這個行程也沒有讀者 → 仍然 10 秒逾時。也就是說
+  `a2join` 這種用法**在架構上不可能量到成功**，必須用會註冊事件監聽的行程（airportd）來驗。
+- airportd 那條路仍然回 `-3903`，而且 `Ath10kAssocRaw` 顯示它送出的請求是空金鑰
+  （`upper=0000 keylen=0`）→ 我們的 fallback 接手、連線成功（`ssid-now=QCA-TEST rssi=-41`），
+  但 airportd 在更前面就判定失敗。
+
+所以下一步只剩兩件，都是「量」而不是「猜」：
+
+1. 用 `Apple80211EventMonitoringInit2` + `Apple80211StartMonitoringEvent(M_ASSOC_DONE)` 在
+   我們的測試程式裡註冊監聽，再呼叫 Associate2 → 這樣才能驗證事件是否真的能讓 join 回 0。
+2. airportd 的 `-3903`：已確認與金鑰無關（fallback 生效、連線成功），要往
+   `setAssociateRequest` 之外的 userspace 分支查；§6.40.2 的出口 A（密碼 nil）用 `Airport keychain`
+   已排除，剩下出口 B 之外的授權類檢查（`0xa46d` / `0xa62d` / `0xafe5` 那幾個 `-3903` 常量）。

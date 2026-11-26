@@ -846,6 +846,12 @@ const char *Ath10kPCIDevice::serviceConnection(UInt64 nowMs)
             ++s.securityGeneration;s.portAuthorized=true;networkLink(true);
             IOLog("Ath10kMac: WPA2 port authorized generation=%u peer=%u peers=%u channel=%u ap-step=%u\n",
                 s.securityGeneration,s.peerId,s.peerCount,s.operatingChannel,s.maintenance.step);
+#ifndef ATH10K_NATIVE
+            // The client's join does not poll to completion: Apple80211Associate2 waits
+            // on the kern_event stream and gives up after 10.2 s with -3905 (measured,
+            // even though this driver had the link up in ~2 s). Post what it waits for.
+            venturaPostLinkEvents(true);
+#endif
             if(getOutputQueue())getOutputQueue()->service(1);
         }
         publishConnection();return nullptr;
