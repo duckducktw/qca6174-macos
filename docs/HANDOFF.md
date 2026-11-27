@@ -3261,3 +3261,84 @@ a2cipher（RSN 字典）→ 仍然全部 -3903（0.0 秒）
 `br s -n Apple80211Associate2` 之後用 `image lookup` 拿到 base，再對
 `base+0x93e7`、`base+0x9840`、`base+0xa46d`、`base+0xafe5` 下中斷點，看哪一個先命中——
 就能一次確定是哪個 gate，不必再靠字典變體猜。
+
+### 6.55 第四十九輪：`-3903` 的真因定位到單一位元 —— `apple80211_ref+0x51` bit 6
+
+#### 6.55.1 我們終於不再靠猜字典：把 14 個出口「就地編號」
+
+新增一支不需要 debugger 的工具（lldb 在非互動 session 拿不到 debug 權限，
+Developer mode 也是關的，sudo 密碼不猜）：
+
+```
+a2patch2.c  把 Apple80211Associate2 內所有 c1 f0 ff ff（-3903）常數
+            就地改寫成 1..N，再呼叫一次，回傳值就是「哪一個出口」。
+```
+
+第一次跑：`HIT tag 1 at fn+0x8b3` → 換算 `0x8b3a + 0x8b3 = 0x93ed`，
+正是 `0x93e7` 那個 `mov dword ptr [rbp-0x410], 0xfffff0c1` 的立即數。
+
+#### 6.55.2 0x93e7 的兩個條件，用「就地改分支」分開
+
+```
+93d6  test r14, r14            ; 第 4 個參數非空？
+93d9  je   0x93e7              ; 空 → -3903
+93db  test byte [r12+0x51],0x40
+93e1  jne  0x977d              ; bit 6 有設 → 放行
+93e7  mov  [rbp-0x410], -3903
+```
+
+`a2gate.c` 把 `0x93e1` 的 `jne` 換成無條件 `jmp 0x977d`：
+
+```
+mode 1（強制通過 0x93e1）→ rc=-3900 (0xfffff0c4)   ← 過了，換下一道
+mode 3（nop 掉 0x93d9）  → rc=-3903               ← r14 不是問題
+```
+
+**結論：卡的是 `[ref+0x51] & 0x40`（注意 `r12 = ref+4`，所以 `r12+0x51` = `ref+0x55`）。**
+
+#### 6.55.3 第 4 個參數到底是什麼（先前一直傳錯，才會難查）
+
+airportd 的呼叫點 `0x100012541`→`0x100012557`：
+
+```
+dictionaryWithCapacity:0  →  [rbp-0x210]      ; 第 4 個參數
+0x10001287f mov rcx, qword ptr [rbp-0x210]
+0x100012886 call Apple80211Associate2
+```
+
+傳的是 **`NSMutableDictionary`（輸出字典）**，不是結果緩衝。這解釋了為什麼之前
+餵 raw buffer 會 SIGILL、餵 NULL 一定在 0x93e7 被踢掉。改傳空的可變字典後
+不再 crash，錯誤才穩定落在同一個出口。
+
+另外 `[rbp-0x1e8] = [[profile scanRecord] mutableCopy]`（0x100011ecf–0x100011efb），
+就是 Associate2 的第二個參數。
+
+#### 6.55.4 下一道的落點
+
+強制通過 0x93e1 之後的錯誤是 `-3900`。把 23 個 `c4 f0 ff ff`（-3900）常數編號後
+回傳 **tag 12 → `0xa586`**；那一段的前一句就是 `0xa567 test byte ptr [rbx+0x51], 0x40`
+（`rbx` = 第 1 參數 = `apple80211_ref`），**同一個 bit 6**。也就是說：
+
+> RSN 與 WPA 兩條 join 路徑都被 `ref+0x51` bit 6 擋住，
+> 這個 bit 就是「本介面支援 WPA/WPA2-PSK 加密」的能力宣告。
+
+#### 6.55.5 ref 佈局（實測，`tools/refflags.c` + proberef）
+
+```
+after bind   ref+0x50: 01 00 00 00 | 0x54: 6f ee 73 a0 04 59 00 00 01 00 …
+                          ↑ bit0        ↑ capabilities[0..] 鏡像
+```
+
+- `ref+0x54+i == capabilities[i]`（CARD_CAPABILITIES 回覆）
+- `ref+0x50` 是**另一個 8-byte 欄位**，bind 時被 `mov qword [r13+0x50], r14`
+  與 `mov qword [r13+0x55], r14`（r14 = 0）清掉，之後只有 request 0xc/0xd
+  （`call 0x654c`，緩衝就是 ref+0x50）會填它
+- 手動把 `ref+0x51 |= 0x40` 會讓 framework 丟 NSException → 證明它不是普通位元組，
+  要由驅動在 bind 的那個 request 回覆裡正確填
+
+#### 6.55.6 下一輪（唯一入口）
+
+查 bind 時 `call 0x654c`（request type 0xc / 0xd，目標緩衝 ref+0x50）在驅動端
+對應哪個 IOC，我們目前回什麼（`Ath10kRequestTrace` 只看得到 `g12/g96/g43/g19/g1/g2/g15/g4`，
+沒有 0xc/0xd → **可能根本沒回，或回了但透過別的 slot**）。
+補上那個回覆裡的「WPA-PSK 支援」位元，0x93e1 與 0xa567 兩道門就會同時打開。
