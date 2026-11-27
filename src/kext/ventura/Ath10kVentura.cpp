@@ -3392,6 +3392,36 @@ SInt32 Ath10kPCIDevice::venturaCapabilities(void *data)
     // that carries an RSN dictionary dies in userspace in 0.0s, which is exactly the
     // -3903 airportd reports (reproduced with tools/a2cipher.c).
     bits[5] |= 0x10;            // buffer +0x09 bit 4 -> ref+0x59 bit 4
+    // Authoritative alternative (HANDOFF §7.2-old 3 / §6.59): the only Ventura
+    // implementation known to complete a real join from the UI is AirportItlwm
+    // v2.2.0, and its getCARD_CAPABILITIES table is a fixed, commented byte
+    // layout rather than bits derived from Apple's BCM dump. Default to it now;
+    // ath10kcap=1 restores the hand-derived bytes above for A/B.
+    {
+        int legacy = 0;
+        const bool useLegacy = PE_parse_boot_argn("ath10kcap", &legacy, sizeof(legacy)) && legacy != 0;
+        if (!useLegacy) {
+            memset(bits, 0, sizeof(capabilities->capabilities));
+            // AirportSTAIOCTL.cpp:667-715 (AirportItlwm v2.2.0), byte for byte.
+            bits[0] = static_cast<UInt8>((1 << APPLE80211_CAP_TKIP) |
+                                         (1 << APPLE80211_CAP_AES_CCM));
+            bits[1] = static_cast<UInt8>((1 << (APPLE80211_CAP_SHSLOT - 8)) |
+                                         (1 << (APPLE80211_CAP_SHPREAMBLE - 8)) |
+                                         (1 << (APPLE80211_CAP_WPA1 - 8)) |
+                                         (1 << (APPLE80211_CAP_WPA2 - 8)) |
+                                         (1 << (APPLE80211_CAP_TKIPMIC - 8)));
+            bits[2] = 0xFF;   // BURST, WME, SHORT_GI_40/20, WOW, TSN, ...
+            bits[3] = 0x2B;
+            bits[4] = 0xAD;
+            bits[5] = 0x8C;   // isCntryDefaultSupported | 0x0C
+            bits[6] = 0x8C;   // 0x8 | 0x4 | 0x80 (MFP bit deliberately off, like itlwm)
+            bits[7] = 0x84;   // Apple Watch unlock
+            if (IOService *probe = getProvider())
+                probe->setProperty("Ath10kCapsTable", "airportitlwm");
+        } else if (IOService *probe = getProvider()) {
+            probe->setProperty("Ath10kCapsTable", "apple-bcm-derived");
+        }
+    }
     if (IOService *probe = getProvider()) {
         char caps[sizeof(capabilities->capabilities) * 3 + 1];
         caps[0] = 0;
