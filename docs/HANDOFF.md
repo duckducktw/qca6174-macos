@@ -9,7 +9,7 @@
 | 項目 | 值 |
 |---|---|
 | 分支 / HEAD | `ventura-io80211` / `9c5ed7b` 之後的這一筆 |
-| 目前部署 | **v254**（bundle 留在 `/tmp/vk254`，可回滾） |
+| 目前部署 | **v258**（預設回 hand-built；`ath10kpub=1` 走 §6.57 的權威路徑。可回滾：`/tmp/vk254`–`/tmp/vk258` 都在） |
 | boot-args | `… ath10kjoin=<ssid>:<psk> ath10krole=7`（`ath10krole` 是本輪新旋鈕，預設 7＝原行為） |
 | VM 主機 | Acer `100.64.0.152`；guest：`ssh 100.64.0.152 "ssh -p 2223 user@127.0.0.1 'bash -s'" < script.sh` |
 
