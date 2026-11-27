@@ -3418,3 +3418,46 @@ ioc 103 CURRENT_NETWORK    CRASH
 
 下一步（明確）：先補 `STATE` 與 `OP_MODE` 兩個 getter 的成功回覆，再重跑這張表與 `cwjoin`，
 看 `ref+0x51` bit 6 是否翻起來、`-3903` 是否變成 `-3905`。
+
+#### 6.55.10 收斂：`IO80211InfraInterface` 根本沒進 registry —— `-3900`/`-3903` 的共同根
+
+`tools/iocs.c` 的逐 IOC 表說 STATE(13)、OP_MODE(15)、ASSOC_RESULT(21)、
+ASSOC_STATUS(50)、VIRTUAL_IF_ROLE(96) 全部 `-3900`；同時
+`Apple80211GetVirtualIfListCopy` 從本輪最開頭就是 `ifCount[0]`。
+
+把 registry 打開來看：
+
+```
+ioreg -c Ath10kPCIDevice | grep Ath10k…
+  Ath10kInfraAttach   = "ok"            ← 我們以為 attach 成功
+  Ath10kInfraPhase    = "attached"
+  Ath10kVifPhase      = "vif-registered"
+  Ath10kVifStart      = "ok"
+  Ath10kVifPublishRetry = "failed"      ← ★ 發佈重試失敗
+  Ath10kVifBsdPhase   = "skipped-guarded"  ← 沒有 BSD 名字
+  Ath10kVifBsdName    = ""
+
+class 實例計數：
+  IO80211InfraInterface     = 0    ← ★ 一個都沒有
+  IO80211Interface          = 0
+  IO80211VirtualInterface   = 1
+  Ath10kVenturaInterface    = 1
+```
+
+也就是：我們自己那顆 `Ath10kVenturaInterface` 在，但 **`IO80211InfraInterface`
+（框架要拿來當 STA 介面、也是 capability 握手與 STATE/OP_MODE 的對象）不存在**。
+`ifconfig en1` 之所以還能動，是因為 en1 是走我們自己發佈的網路介面，不是走
+`IO80211InfraInterface`。
+
+對照 §6.45 的 `setLinkState` 修正（`IO80211InfraInterface::setLinkState` 從
+controller ivar `+0x198` 拿物件）——那顆物件存在於 ivar，但沒有以
+`IO80211InfraInterface` 的身分進 registry / IO80211Plane。
+
+#### 6.55.11 下一輪（結構性，不是位元）
+
+1. 查 `Ath10kVifPublishRetry = failed` 的原因：`attachInterface` 之後
+   framework 期望的 publish 流程（`IO80211VirtualInterfaceNamer` / BSD unit / plane attach）
+   哪一步回失敗（registry 裡 `IO80211VirtualInterfaceNamer = 1` 存在，可作為切入點）。
+2. 目標是讓 `ioreg -c IO80211InfraInterface` 至少出現 1 個實例、且
+   `Apple80211GetVirtualIfListCopy` 不再回空。那之後 STATE/OP_MODE 應該就會成功，
+   `ref+0x51` bit 6 才有機會被設起來，`-3903` 才會變成只剩完成事件的 `-3905`。
