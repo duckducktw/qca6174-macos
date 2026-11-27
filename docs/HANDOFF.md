@@ -3722,3 +3722,48 @@ BSD 單元一直是由 Apple 的 `start()` 發的那一顆，`attachInterface` �
   框架沒有把這個 ref 對到「它自己 Skywalk 註冊過的介面」。要翻這頁只剩
   §6.19.3 的兩條路：讓物件真的是 `IO80211InfraInterface`（需要 Skywalk 註冊 + packet buffer
   pool），或改寫 airportd 端（關 SIP 改 framework）。
+
+### 6.58 第十八輪（量測，v258 不重編）：`-3900` 是「我們的 harness 走 ioctl 備援」的結果，airportd 走的是 service 路徑
+
+#### 6.58.1 決定性量測（單發 harness + 驅動端 pid 軌跡）
+
+新增 `tools/a2get1.c`（`Apple80211Open` → `BindToInterface(en1)` → 單一 `Apple80211Get`，
+印 pid），跑完立刻讀 `Ath10kClientTrace`（格式 `g<type>:<pid>:<status>`）：
+
+| 型別 | 我們的 harness rc | 驅動軌跡是否出現該請求 |
+|---|---|---|
+| 13 STATE | **-3900** | **沒有**（只有 bind 期的 `g12:pid:0`） |
+| 15 OP_MODE | **-3900** | 沒有 |
+| 21 ASSOC_RESULT | **-3900** | 沒有 |
+| 50 ASSOC_STATUS | **-3900** | 沒有 |
+| 96 VIF_ROLE | **-3900** | 沒有 |
+| 9 BSSID | 0 | **有**（`g12:pid:0 g9:pid:0`） |
+
+同一份軌跡裡，**airportd（pid 931）的 `g15:931:0` 是成功的** —— 也就是同一個型別
+（OP_MODE）airportd 拿得到，我們的 harness 拿不到。
+
+#### 6.58.2 結論：`-3900` = ioctl 備援路徑的能力拒絕，不是驅動缺功能
+
+- `Apple80211Get` 在 bind 之後先送 `CARD_CAPABILITIES(12)`（驅動回 0），接著對
+  13/15/21/50/96 **在 userspace 就拒掉、連 ioctl 都沒發**；只有 9/12/14/19/27/43/44/97/103
+  這類「不需要介面物件」的型別會走 `SIOCGA80211`。
+- airportd 走的是 `Apple80211BindToInterfaceWithService`（family 的 user client，我們 v121
+  起已經讓它建得起來），所以那些 getter 它拿得到。
+- 因此 **`tools/iocs.c` 那張 13/15/21/50/96 = -3900 的表，不代表 airportd 看到的世界**；
+  不要再拿它當「框架不認介面」的證據（HANDOFF §0.2-3 的判讀要在這一輪之後降級為
+  「ioctl 備援的限制」）。
+
+#### 6.58.3 真正的權威條件仍然只有一個：`Apple80211Associate2` 的 `ref+0x51 & 0x40`
+
+- §6.37 已釘死：`-3903` 在 `Apple80211Associate2` 內是 `test [ref+0x51], 0x40`（`0x93e7`
+  一帶），該 bit 在 bind 後實測永遠 0。
+- 這個位元由 **bind 期的 capability 握手**填（skill 記錄：`call 0x654c` 的 type 0xc/0xd
+  請求，緩衝就是 `ref+0x50`；而 `ref+0x54+i` 才是 `capabilities[i]` 的鏡像）。
+- 所以下一輪的工作不是再掃 kernel gate，而是：**把這兩個握手請求的實際內容量出來**
+  （用 `a2get1` 擴成「bind 後 dump `ref+0x48..0x68`」＋ 驅動端記錄 type 0xc/0xd 的
+  請求/回覆位元組），確認框架期待的回覆長相，再讓驅動照那個長相回。
+
+#### 6.58.4 現況
+
+VM 仍是 v258（hand-built 預設、`ath10kpub=1` 可切權威路徑），`connected-wpa2`、
+`Current Wi-Fi Network: QCA-TEST`、ping 正常。
