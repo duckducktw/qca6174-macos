@@ -3807,3 +3807,18 @@ dump 落在 stub/data 上，反組譯結果是亂碼**（`imul r9d,[r14+0x50],0x
 
 VM = v259：hand-built 發佈、itlwm caps 預設、`ath10kcap=1`／`ath10kpub=1` 兩個 A/B 旋鈕，
 `connected-wpa2` 正常。可回滾 `/tmp/vk254`–`/tmp/vk259`。
+
+### 6.60 對照：Ventura 上各網卡驅動怎麼跟 airportd 講話（三個真實範例）
+
+| 路線 | 介面怎麼來 | 請求入口（airportd 打到哪） | ASSOCIATE 怎麼處理 | 需不需要 userspace app |
+|---|---|---|---|---|
+| **AirportItlwm v2.2.0**（Ventura 可用，唯一有真實 join 的範例） | `AirportItlwmInterface : IO80211Interface`；`start()` 先 `fHalService->attach(pciNub)`（開硬體）→ `attachInterface((IONetworkInterface **)&fNetIf,true)` → `setLinkStatus` → `registerService(); fNetIf->registerService();` | live：`apple80211VirtualRequest(IO80211VirtualInterface*, …)`（先檢查 `request_type` 是 `SIOCGA/SIOCSA80211`）；另外也實作 v1 的 `apple80211Request(IO80211Interface*, …)`（在 13.7 live 沒有這個 slot → 實際不會被叫） | 自己收 `APPLE80211_IOC_ASSOCIATE`：`setASSOCIATE()` 把 `ad_auth_lower/upper`＋`ad_rsn_ie` 塞進 `setAUTH_TYPE/setRSN_IE`，再 `associateSSID(ssid,bssid,key…)`；4-way 用自家 supplicant（`useAppleRSNSupplicant()==false`）；`ASSOCIATE_RESULT` 只在 `ic_state==IEEE80211_S_RUN` 才回 success | 不用 |
+| **itlwm（原版）** | 完全不碰 IO80211（`grep -rln IO80211 itlwm/` 為空） | 沒有入口：不跟 airportd 講話 | 自己的一套 ioctl／自家 supplicant | **要**（HeliPort） |
+| **Apple AirPort_BrcmNIC**（真機 BCM 卡） | prelinked 的 `IO80211FamilyLegacy` plugin，`IO80211Interface`（legacy 那份） | **5 參數** `apple80211_ioctl(IO80211Interface*, IO80211VirtualInterface*, __ifnet*, u_long, void*)`（`0x228f7e2`；legacy base `0x2186bce`）。注入 kext 綁不到 legacy → 這條路對我們封閉（§6.12.2） | commit 在驅動內（legacy 表） | 不用 |
+
+**對我們的含意**：入口點我們其實都已經對上了（live 的 `apple80211VirtualRequest`／`SkywalkRequest`、4 參數 `apple80211_ioctl`、`ASSOCIATE` 與 `ASSOCIATE_RESULT` 都有實作）。
+差別只剩兩件事：
+1. **順序**：權威實作是「先把硬體弄起來，才 `attachInterface`」——我們已經在 v257 改成 WMI 起來後才 attach（§6.57），這條已對齊。
+2. **框架對介面身分的認定**（`ref+0x51` bit `0x40`）：AirportItlwm 之所以不需要處理它，是因為它的 `fNetIf` 是**框架自己透過 `attachInterface` 建出來的 `IO80211Interface`**，而且它的 `apple80211VirtualRequest` 會回齊所有 IOC（含 STATE/OP_MODE/RSSI/RATE/CHANNEL…）。我們的 `fNetIf` 是 Apple `start()` 早期建的，`+0x200` 從沒被塞過 → 框架眼中的 ref 沒有「驅動介面」這個身分。
+
+**下一步（依這張表）**：把 `apple80211VirtualRequest` 的回覆**逐 IOC 補到跟 AirportItlwm 的 switch 一樣完整**（用 `IOCTL_GET` 清單當 checklist，特別是 STATE/OP_MODE/RSSI/RATE/CHANNEL/ROAM_PROFILE/DRIVER_VERSION），再跑一次 bind＋`refdump3` 看 `ref+0x51` 是否被填；這是唯一還能從驅動側施力的地方。
