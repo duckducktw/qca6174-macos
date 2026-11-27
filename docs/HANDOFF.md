@@ -3366,3 +3366,23 @@ after bind   ref+0x50: 01 00 00 00 | 0x54: 6f ee 73 a0 04 59 00 00 01 00 …
 driver 回覆算出來的**（很可能是 `IO80211Controller` 的 ivar／介面 role／`payton` 旗標），
 並在驅動端把它們設成 Apple 期待的值。位元改好之後，RSN join 應該直接從 `-3903` 變成
 `-3905`（只剩完成事件那條已知的線）。
+
+#### 6.55.8 硬跳兩道 gate 的結果（負面但重要）
+
+`a2gate.c` mode 5 同時強制 `0x93e1` 與 `0xa56b` 兩個分支後：
+
+```
+-[__NSCFNumber count]: unrecognized selector sent to instance 0x106fa8478974b9b
+```
+
+也就是說 `0xa567` 之後的程式把 RSN 字典裡的某個值當 **陣列** 用（`count`），
+我們給的是 CFNumber → 崩。這證明：
+
+1. 那兩道 `[ref+0x51] & 0x40` 是**合法控制流上的檢查**，不是可以硬跳的裝飾；
+2. 硬跳過去之後的程式碼路徑本身還需要正確的字典形狀（陣列 vs 數字），
+   所以「先把 bit 補對、再看下一道」才是正路，硬跳只會製造假訊號。
+
+`ref+0x51` / `ref+0x5d` 目前都量到 0x00（`tools/refdump3.c`），而 ref 的
+capability 鏡像從 `0x54` 開始（`0x50..0x53` 是 version=1，13 bytes 的回覆只帶到 caps[8]），
+所以這組「原生介面」判定必須由驅動在 bind 的那次 `CARD_CAPABILITIES`（type 0xc，長度 0xd）
+回覆裡給對，而不是在 userspace 補。
