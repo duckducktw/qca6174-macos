@@ -2253,38 +2253,13 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
                 probe->setProperty("Ath10kSetSSID",
                                    _venturaPendingSSID[0] ? (const char *)_venturaPendingSSID : "");
             }
-            // "Pick this network" is the one instruction every client sends, and it
-            // arrives even when the client's own associate path refuses to run (measured:
-            // airportd's Apple80211Associate2 aborts inside userspace, leaving this
-            // driver a Set(SSID) and nothing else). With credentials already known, the
-            // join can start right here; the later ASSOCIATE - if it ever comes - hits
-            // the same machinery and is simply satisfied by it.
-            {
-                const char *credential = venturaCredentialForSSID(_venturaPendingSSID, bytes);
-                const bool sameAsCurrent = Ath10k::connectionAssociated(_connection) &&
-                                           _connection.ssidLength == bytes &&
-                                           memcmp(_connection.ssid, _venturaPendingSSID, bytes) == 0;
-                if (credential != nullptr && !sameAsCurrent) {
-                    apple80211_assoc_data request;
-                    bzero(&request, sizeof(request));
-                    request.version = APPLE80211_VERSION;
-                    request.ad_auth_lower = APPLE80211_AUTHTYPE_OPEN;
-                    request.ad_auth_upper = APPLE80211_AUTHTYPE_WPA2_PSK;
-                    request.ad_ssid_len = static_cast<UInt8>(bytes);
-                    bcopy(_venturaPendingSSID, request.ad_ssid, bytes);
-                    request.ad_key.key_len = static_cast<UInt32>(strlen(credential));
-                    bcopy(credential, request.ad_key.key, request.ad_key.key_len);
-                    const IOReturn started = venturaAssociate(&request);
-                    if (IOService *probe = getProvider()) {
-                        char note[96];
-                        snprintf(note, sizeof(note), "join-on-ssid rc=%x ssid-len=%u",
-                                 static_cast<unsigned>(started), static_cast<unsigned>(bytes));
-                        probe->setProperty("Ath10kJoinOnSSID", note);
-                    }
-                    IOLog("Ath10kMac: join started from Set(SSID) ssid-len=%u rc=%x\n",
-                          static_cast<unsigned>(bytes), static_cast<unsigned>(started));
-                }
-            }
+            // AirportItlwm's setSSID is a pure no-op: the network name that matters for
+            // a join travels inside apple80211_assoc_data, and starting a join from here
+            // races airportd's own state machine (this driver used to do it whenever a
+            // stored credential matched, which airportd cannot see or cancel). Only
+            // remember the name for diagnostics.
+            if (IOService *probe = getProvider())
+                probe->setProperty("Ath10kSetSSIDNoop", "stored");
             return kIOReturnSuccess;
         }
         // airportd reads the SSID from offset 0 of this reply: with the versioned
@@ -2294,14 +2269,21 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         // `networksetup -getairportnetwork`, `wdutil info` and System Settings show
         // the real SSID, verified against QCA-TEST.
         {
+            const bool linked = !_venturaDisassociated && _connection.ssidLength != 0 &&
+                                Ath10k::connectionAssociated(_connection);
+            if (!linked) {
+                // AirportItlwm answers GET SSID with 6 whenever the link is not RUN, and
+                // airportd/CoreWLAN walk the SSID getter while it decides whether a join
+                // is even possible. "success + empty name" is a third state Apple's own
+                // drivers never produce, so answer the way the community driver does.
+                if (IOService *probe = getProvider())
+                    probe->setProperty("Ath10kSsIdNotReady", static_cast<UInt64>(1), 32);
+                return 6;
+            }
             UInt8 *flat = reinterpret_cast<UInt8 *>(data);
             bzero(flat, 40);
-            const UInt32 n = (!_venturaDisassociated && _connection.ssidLength &&
-                              Ath10k::connectionAssociated(_connection))
-                                 ? (_connection.ssidLength > 32 ? 32 : _connection.ssidLength)
-                                 : 0;
-            if (n)
-                bcopy(_connection.ssid, flat, n);
+            const UInt32 n = _connection.ssidLength > 32 ? 32 : _connection.ssidLength;
+            bcopy(_connection.ssid, flat, n);
             *reinterpret_cast<UInt32 *>(flat + 32) = n;
             return kIOReturnSuccess;
         }
