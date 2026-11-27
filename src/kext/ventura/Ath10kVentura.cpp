@@ -3769,8 +3769,21 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
     // IO80211VirtualInterface::newUserClient() accepts 6 and 7 only and logs
     // "invalid interfaceRole: 1" for anything else - measured in v112, and it is
     // why airportd's IOServiceOpen on this node failed with 0xe00002c2.
+    //
+    // The role is also what the family consults before it answers the per-interface
+    // getters (STATE 13 / OP_MODE 15 come back -3900) and before it fills the
+    // capability flags Associate2 gates the join on, so it is worth sweeping:
+    // ath10krole=1|6|7 picks the value written here, default 7 (the value measured
+    // to keep airportd's IOServiceOpen working).
+    int roleKnob = 7;
+    if (!PE_parse_boot_argn("ath10krole", &roleKnob, sizeof(roleKnob)) ||
+        roleKnob <= 0 || roleKnob > 7)
+        roleKnob = 7;
     if (*ivarsSlot != nullptr)
-        *reinterpret_cast<UInt32 *>(reinterpret_cast<char *>(*ivarsSlot) + 0x50) = 7;
+        *reinterpret_cast<UInt32 *>(reinterpret_cast<char *>(*ivarsSlot) + 0x50) =
+            static_cast<UInt32>(roleKnob);
+    if (probe)
+        probe->setProperty("Ath10kIfaceRoleSet", static_cast<UInt64>(roleKnob), 32);
     if (probe) {
         probe->setProperty("Ath10kInfraAttach", attached ? "ok" : "failed");
         probe->setProperty("Ath10kInfraPhase", attached ? "attached" : "attach-failed");

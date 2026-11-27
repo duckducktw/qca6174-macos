@@ -3461,3 +3461,33 @@ controller ivar `+0x198` 拿物件）——那顆物件存在於 ivar，但沒�
 2. 目標是讓 `ioreg -c IO80211InfraInterface` 至少出現 1 個實例、且
    `Apple80211GetVirtualIfListCopy` 不再回空。那之後 STATE/OP_MODE 應該就會成功，
    `ref+0x51` bit 6 才有機會被設起來，`-3903` 才會變成只剩完成事件的 `-3905`。
+
+#### 6.55.12 role 旋鈕實驗（負面結果，v254）
+
+加了 `ath10krole=1|6|7` boot-arg（`attachPlatformVif()` 寫入 vif ivars `+0x50` 的
+role 值，預設 7）。掃 `ath10krole=1`：
+
+```
+Ath10kIfaceRoleSet = 1
+ioc  13 STATE        rc=-3900     ← 與 role=7 完全相同
+ioc  15 OP_MODE      rc=-3900
+ioc  21 ASSOC_RESULT rc=-3900
+ioc  50 ASSOC_STATUS rc=-3900
+ioc  96 VIF_ROLE     rc=-3900
+ioc   9 BSSID        rc=0
+ioc  43/97           rc=0
+cwjoin → assoc-ok=0
+```
+
+**結論：role 不是那把鎖。** 換 role 對 STATE/OP_MODE 的 `-3900` 毫無影響，
+所以 `-3900` 不是「介面角色不對」，而是「框架根本沒有把這個 ref 對到一個
+它認得的 interface 物件」——與 `Ath10kCtrlInfraIvar = No`（controller ivar `+0x200` 空）
+和 `Apple80211GetVirtualIfListCopy → ifCount[0]` 一致。
+
+旋鈕留著（預設 7，不改變現行行為），方便以後再掃；
+boot-args 已還原成 `ath10krole=7`。
+
+下一輪：改攻 `Ath10kVifPublishRetry = failed`（`publishVenturaVifBsdUnit()` 回 false）。
+那條路就是讓介面拿到 BSD unit / 進 IO80211Plane 的關鍵，而現在的註解已經警告
+「再往前會 panic 在 Skywalk 的 `prepareBSDInterface`」，所以要找的是不觸發 panic
+的發佈方式（社群 itlwm 是走 Apple 的 `start()` 讓框架自己配 BSD unit）。
