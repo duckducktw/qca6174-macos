@@ -10,7 +10,12 @@
 另外 `tools/a2join` 這輪實測 **ASSOCIATE(20) 進得了驅動**，但 `keylen=0`（金鑰沒被認出）＋
 `-3905/errno 60`（等不到完成事件）——兩條路卡的位置不同，下一輪從這兩點分頭下手。
 
-> **新接手先讀這份**：[`docs/handoff-apple-join-conditions.md`](handoff-apple-join-conditions.md)
+> **跨 session 先讀這份**：[`docs/handoff-next-session.md`](handoff-next-session.md)
+> —— 現況、環境指令、今天收斂出的結構性結論（介面發佈路徑要照 AirportItlwm：
+> `createInterface` + `attachInterface` + `registerService`，不要自建 vif/手動 Skywalk publish）、
+> 下一步的改動與回滾方式、新增工具清單、已排除方向。
+>
+> > **新接手先讀這份**：[`docs/handoff-apple-join-conditions.md`](handoff-apple-join-conditions.md)
 > —— 蘋果「放行 join」的四層條件（airportd／Associate2／IO80211Family／驅動回報）、
 > 每一條的反組譯位址與實測證據、目前卡在第 1 層（airportd 連 `Set(SSID)` 都不送），
 > 以及 OpenIntelWireless AirportItlwm 的可照抄做法。
