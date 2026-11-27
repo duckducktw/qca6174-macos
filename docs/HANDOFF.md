@@ -3342,3 +3342,27 @@ after bind   ref+0x50: 01 00 00 00 | 0x54: 6f ee 73 a0 04 59 00 00 01 00 …
 對應哪個 IOC，我們目前回什麼（`Ath10kRequestTrace` 只看得到 `g12/g96/g43/g19/g1/g2/g15/g4`，
 沒有 0xc/0xd → **可能根本沒回，或回了但透過別的 slot**）。
 補上那個回覆裡的「WPA-PSK 支援」位元，0x93e1 與 0xa567 兩道門就會同時打開。
+
+#### 6.55.7 追到 bind 內部握手（本輪收尾）
+
+`0x654c` 是框架內部的 request dispatcher（依 `0xd1cf` 的結果跳 `0x1c125` 或 `0x147b8`），
+其中 `0x1c125` 一進來就：
+
+```
+1c14d  cmp byte ptr [rdi + 0x5d], 0     ; rdi = ref
+1c151  je  0x1c185                      ; ref+0x5d == 0 → 走「非原生」那條
+1c185  mov r13d, dword ptr [r15 + 0x10] ; type = 0xc
+```
+
+而實測 bind 後 `ref+0x5d = 0x00`（`tools/refdump3.c`：off 0x48..0x68 全 dump）。
+配合 `ref+0x51` bit 6 也是 0，兩者一起說明：**框架把這個 ref 判定成「非 Apple 原生介面」**，
+把 capability 握手導到另一條分支，因此 `ref+0x50` 那個 8-byte 旗標只寫了 bit 0，
+`Associate2` 的 RSN/WPA 兩道門（`0x93e1`、`0xa567`）就都關著。
+
+工具已入 repo：`tools/a2gate.c`（就地改分支跑 gate）、`tools/a2bit.c`（ref 位元實驗）、
+`tools/refdump3.c`（ref 0x48..0x68 傾印）、`tools/refflags2.c`（ref + 各 IOC 後的旗標）。
+
+下一輪的入口因此縮到一句話：**找出「`ref+0x5d` / `ref+0x51`:bit6 這組『原生介面』判定」是從哪個
+driver 回覆算出來的**（很可能是 `IO80211Controller` 的 ivar／介面 role／`payton` 旗標），
+並在驅動端把它們設成 Apple 期待的值。位元改好之後，RSN join 應該直接從 `-3903` 變成
+`-3905`（只剩完成事件那條已知的線）。
