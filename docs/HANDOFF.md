@@ -3491,3 +3491,72 @@ boot-args 已還原成 `ath10krole=7`。
 那條路就是讓介面拿到 BSD unit / 進 IO80211Plane 的關鍵，而現在的註解已經警告
 「再往前會 panic 在 Skywalk 的 `prepareBSDInterface`」，所以要找的是不觸發 panic
 的發佈方式（社群 itlwm 是走 Apple 的 `start()` 讓框架自己配 BSD unit）。
+
+### 6.56 對照權威實作（AirportItlwm v2.2.0 原始碼）：我們的介面發佈走錯路
+
+#### 6.56.1 權威做法（AirportItlwm.cpp，v2.2.0，Ventura 可用）
+
+```cpp
+// 1) 只 new 介面物件，不做任何 Skywalk / vif / BSD 動作
+IONetworkInterface *AirportItlwm::createInterface() {
+    AirportItlwmInterface *netif = new AirportItlwmInterface;   // IOEthernetInterface 子類
+    if (!netif) return NULL;
+    if (!netif->init(this, fHalService)) { netif->release(); return NULL; }
+    return netif;
+}
+
+// 2) start() 裡把介面交給框架，然後「兩個 registerService」
+if (!attachInterface((IONetworkInterface **)&fNetIf, true)) {
+    XYLog("attach to interface fail\n");
+    fHalService->detach(pciNub); super::stop(pciNub); releaseAll(); return false;
+}
+...
+setLinkStatus(kIONetworkLinkValid);
+registerService();          // controller
+fNetIf->registerService();  // 介面 → IONetworkStack 才會配 BSD unit
+return true;
+```
+
+重點：
+- **沒有** `createVirtualInterface()`，**沒有** 手動 `attachInterface(controller, vif, this)`，
+  **沒有** 自製 `publish…BsdUnit()`，**沒有** 手寫 controller ivar。
+- BSD unit 是 `fNetIf->registerService()` 之後由 IONetworkStack 配的。
+- 介面類別是 `IOEthernetInterface` 子類（`AirportItlwmInterface`），只有一個介面物件。
+
+#### 6.56.2 我們的做法（對照）
+
+```
+createInterface()            → new Ath10kVenturaInterface（這步與權威一致）
+（另外）createVirtualInterface() → 再生一顆 vif
+（另外）ath10kAttachSkywalkInterface(this, vif, this)
+（另外）publishVenturaVifBsdUnit(vif, provider)   ← 回 false；再往前會 panic 在
+                                                     Skywalk 的 prepareBSDInterface
+（另外）手動寫 controller ivar +0x200（延遲 3 秒的 retry 裡）
+（另外）手動改 vif ivars role 1 → 7
+```
+
+結果就是量到的三件事全部同源：
+```
+Ath10kVifPublishRetry = failed
+Ath10kCtrlInfraIvar   = No          （+0x200 最後仍是空的）
+ioreg -c IO80211InfraInterface = 0
+Apple80211GetVirtualIfListCopy → ifCount[0]
+ioc 13 STATE / 15 OP_MODE / 21 / 50 / 96 → -3900
+Associate2 → -3903（ref+0x51 bit 6 永遠 0）
+```
+
+#### 6.56.3 結論與下一輪
+
+`-3900`/`-3903` 這一串不是位元問題、不是 role 問題，是**介面發佈路徑選錯**：
+我們走的是「自建 vif + 手動 Skywalk/BSD publish」，權威實作走的是
+「單一 IOEthernetInterface 子類 + `attachInterface` + `registerService`」。
+
+下一輪（按權威實作對齊，不再猜）：
+1. 移除／停用 `createVirtualInterface` + `publishVenturaVifBsdUnit` 這條自建路徑；
+2. 讓 `createInterface()` 的物件成為唯一介面，在 `start()` 用
+   `attachInterface((IONetworkInterface **)&fNetIf, true)` + `registerService()`
+   + `fNetIf->registerService()`；
+3. 預期 `BSD Name` / `IO80211InfraInterface` 由框架自己產生，之後 STATE/OP_MODE
+   應該回 0、`ref+0x51` bit 6 由框架填、`-3903` 才會變成只剩完成事件的 `-3905`。
+4. 這是一次結構性改動，風險高（可能失去 en1 連線能力），要先確認可回滾
+   （現行 v254 的 bundle 留在 `/tmp/vk254`，boot-args 已還原）。
