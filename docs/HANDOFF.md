@@ -3874,3 +3874,47 @@ t1:l32:6  t9:l32:0  t1:l32:6  t1:l32:6  t11:l32:5  t9:l32:0  t1:l32:6  t1:l32:6
 1. 把 `sMethods` 表用正確 fixup 基準解出來 → 找 selector 1 handler，看它讀介面哪個屬性；
 2. 或直接 `nvram boot-args="… amfi_get_out_of_my_way=1"` + `codesign --entitlements com.apple.wlan.authentication`
    簽我們的 harness，讓 selector 1 過關，**實測那 13 bytes**。
+
+### 6.62 第廿二輪：`ref+0x50` 的 13 bytes 由誰組 —— 追到 client 的 skywalk 介面
+
+#### 6.62.1 這一輪釘死的事實
+
+1. `IO80211APIUserClient::externalMethod`（`0x2024c44`）的分派表在 **`0x20e1600`**
+   （`lea` 在 `0x2024c78`，+7+0xbc981），24-byte `IOExternalMethodDispatch`：
+   ```
+   sel0 extRunDriverCommand          sel1 extQueryUseIOUCWhenPossible   sel2 extSubscribeEvent
+   sel3 extEventMonitorInit          sel4 extEventMonitorExit           sel5 extQueryUseIOUCEventPipe
+   sel6 extRunLargeBufferCommand
+   ```
+2. `extQueryUseIOUCWhenPossible`（`0x2024d36`）讀 boot-arg **`wlan.useIOUCWhenPossible`**，
+   預設 **true**（我們沒設）；它只回 1 byte，跟 `ref+0x50` 無關。
+3. 真正擋住 harness 的是 `checkEntitlement`（`0x2024402`）→ `copyClientEntitlement(task,
+   "com.apple.wlan.authentication")`。**ad-hoc 簽這條 entitlement 會被 SIGKILL（rc=137）**，
+   `amfi_get_out_of_my_way=1` 在 SIP 未全關時不生效 → 這條「自己造 entitled client」的路封閉
+   （boot-arg 已從 config.plist 移除並重開，VM 回到 `connected-wpa2`）。
+4. `commonStart`（`0x202445a`）把 client ivars 接起來：
+   `[ivars+8] = safeMetaCast(arg, IO80211SkywalkInterface)`、`[ivars+0] = GetProvider() 的 IO80211Controller`、
+   `[ivars+0x10] = [ctrl->vptr+0xc68]()`（= slot 399 `getIO80211CommandGate`）、
+   `[ivars+0x18]/[+0x28]` 兩個 0x4000 buffer、`[+0x150]` IOLock。
+   **沒有** 13-byte blob；`_runDriverCommandHelper`（`0x2024fa2`）也只是一般請求搬運
+   （檢查 `args+0x28`、長度必須落在 `0x3c30..0x4001`、把 scalar 寫到 `[buf+0x20]`）。
+5. `getCardCapabilities`（type 12 handler，`0x1fdc8a0`）開頭就檢查 `req->len != 0` 與
+   `req->data != 0`，接著 `test rsi,rsi`（rsi = **傳入的 vif**）→ 為 0 就走不問驅動的支路。
+6. 我們已經在 publish 時把 `[ctrlIvars+0x1a0] = vif` 且 vif role = 6（見 `Ath10kVentura.cpp:3964` 那段的
+   `Ath10kCtrlPrimaryBefore/After`），但 type 12 用的是呼叫端帶進來的 vif，
+   而那個 vif 就是 **airportd 開 user client 時所掛的 skywalk 介面**（`[clientIvars+8]`）。
+
+#### 6.62.2 結論（下一輪的唯一工作）
+
+`ref+0x50` 的 13 bytes = family 用 **client 綁定的 skywalk 介面** 去問 type 12 得到的 caps 回覆。
+所以瓶頸在：**airportd 開的 user client 是否掛在我們的 vif 上**（`IO80211VirtualInterface::newUserClient`
+只接受 role 6/7，我們已給 6），以及那個 vif 是否已完成 enable。
+
+下一輪：確認 airportd 的 client 綁到哪個物件（`Ath10kFamilyClient*` 斷點已存在），
+若是綁到 Apple `start()` 早期建的那顆而非我們的 vif，就把 publish 流程改成「我們的 vif 先 enable
+（`setEnabledBySystem` + link up）再 register」，讓它成為唯一可被 bind 的 station 介面。
+
+#### 6.62.3 現況
+
+VM = v262（`Ath10kReqLog` 在），boot-args 8 token（已無 amfi），`connected-wpa2` / QCA-TEST / ping 2/2。
+回滾點 `/tmp/vk254`–`/tmp/vk262`。
