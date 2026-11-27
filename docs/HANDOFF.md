@@ -3178,3 +3178,45 @@ authsel=1..12  →  全部 elapsed=10.2s rc=-3905 (0xfffff0bf) errno=60
 WPA2-PSK 組合給 `a2auth`，看哪一組會把回傳從 `-3905` 翻成 `-3903`；
 翻過去的那一組就是我們缺的能力位，對應到驅動端要補的 `CARD_CAPABILITIES`／
 cipher 支援表。
+
+### 6.53 第四十七輪後續：`-3903` 用我們自己的工具重現了（0.0 秒、無 IOCTL）
+
+#### 6.53.1 決定性實驗
+
+`tools/a2cipher.c`（在 v252 上實跑）把 `Apple80211Associate2` 的第二個參數
+（network 字典）加上 `RSN_IE`：
+
+- **`RSN_IE` 的值必須是「字典」**，不是原始 IE blob。證據：`_getRSNCapabilities`
+  對它做 `CFDictionaryGetValue(<RSN_IE>, "IE_KEY_RSN_CAPS")`；餵 `CFData` 會
+  `-[__NSCFData objectForKey:]` 直接丟 NSException（實測 crash 於 `_getMFPCaps`）。
+  這個字典裡的鍵：`IE_KEY_RSN_CAPS`（再一層 dict，含 `MFP_REQUIRED`）、
+  `IE_KEY_RSN_VERSION`、`IE_KEY_RSN_AUTHSELS`（CFArray of CFNumber，2 = PSK）、
+  `IE_KEY_RSN_UCIPHERS`、`IE_KEY_RSN_MCIPHER`、`PRE_AUTH`、`NO_PAIRWISE`、
+  `PTKSA_REPLAY_COUNTERS`、`GTKSA_REPLAY_COUNTERS`。
+
+量測結果（每列獨立 fork）：
+
+```
+psk ccmp4 rp2   / ccmp5 rp2 / aes8 rp2 / 9/8 rp2 / ccmp5 rp0 / ccmp5 rp4
+psk nocipher rp2 / pskmix rp2        →  elapsed=0.0s  rc=-3903 (0xfffff0c1)
+authsels only（無 RSN_IE）/ no ie keys →  elapsed=10.2s rc=-3905 (0xfffff0bf) errno=60
+```
+
+**只要走 RSN/PSK 這條，Associate2 立刻回 `-3903`，而且一個 IOCTL 都沒發**
+（0.0 秒），跟驅動說「沒連上」完全無關。這正是 airportd 點選連線時看到的錯誤碼；
+而沒有 RSN 資訊的呼叫會走到驅動、然後等 10.2 秒逾時（`-3905`）。
+
+#### 6.53.2 意思
+
+- `-3903` 是 **userspace 端的能力位檢查**（`[iface+0x50]` / `[iface+0x59]` 的
+  RSN/cipher 位），不是參數、也不是驅動的錯。
+- 加密法本身不影響（4/5/8/9 全一樣）→ 差的是「介面有沒有宣告 RSN 能力」這個布林。
+- 這解釋了為什麼換 cipher、補 IE key 都沒用：門在還沒進驅動之前。
+
+#### 6.53.3 下一輪
+
+找出 `[iface+0x50]`／`[iface+0x59]` 這些位是誰填的（介面能力物件），
+比對 `venturaCapabilities()`（`CARD_CAPABILITIES`，type 12）目前回的
+`bytes[0..2] = 0x6f 0xee 0x61|0x12` 與真卡回報的差異——把缺的 RSN 位補上，
+`-3903` 應該就會變成 `-3905`（也就是回到「只差完成事件」那條已知的線）。
+`tools/a2cipher.c` 可以直接重跑，用來確認位元補對沒。
