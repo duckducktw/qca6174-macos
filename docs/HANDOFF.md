@@ -3083,3 +3083,43 @@ cat ~/sudo.pwd | ssh 100.64.0.152 'bash ~/qca-tools/deploy.sh /tmp/vk251'
 - `src/kext/ventura/Ath10kVentura.cpp`：`venturaTraceSet()`（含 `Ath10kSetTrace` 發佈）、
   `venturaRecordRequest()` 與兩個 ASSOCIATE 早退分支都會記錄；kernel 區塊分支對
   「type 不在 1..200」的 set 留 `Ath10kSetBlock` 與 `Ath10kSetWeird`。
+
+### 6.51 第四十六輪（v252）：照抄 AirportItlwm 的 SSID 兩側答案（已驗證，未改變 -3903）
+
+#### 6.51.1 抄了什麼
+
+社群原始碼（`AirportSTAIOCTL.cpp`，v2.2.0）有兩個跟前幾輪不同的小地方，本輪照抄：
+
+1. **`getSSID` 未連線時回 `6`（not ready）**，不是「成功 + 空字串」。蘋果自家驅動不會產生
+   「成功但名字是空的」這種第三態，airportd／CoreWLAN 在 join 前會走這顆 getter。
+2. **`setSSID` 是 no-op**。我們原本（v245）只要憑證表裡有同名網路就從這裡直接開連線，
+   airportd 看不到也取消不了，等於跟它的狀態機搶。連線參數本來就隨 `apple80211_assoc_data` 到齊。
+
+#### 6.51.2 v252 實測
+
+```
+networksetup -getairportnetwork en1   -> Current Wi-Fi Network: QCA-TEST   （連線時照常，flat 佈局沒被破壞）
+networksetup -getairportpower en1     -> Wi-Fi Power (en1): On
+冷開機                                 -> Ath10kConnectionState = connected-wpa2（setSSID no-op 不影響自連）
+cwjoin QCA-TEST en1                   -> assoc-error code=-3903（與 v251 相同）
+  Ath10kSetTrace = 22 22 10×7 22 22 10   （仍然沒有 Set(SSID)/AUTH_TYPE/ASSOCIATE）
+  ssid-now = (null)                     ← getSSID 現在對「未連線」回 6，CoreWLAN 就顯示 null 而不是空字串
+失敗後約 60 秒                          -> 自動連線自己回到 connected-wpa2
+```
+
+**結論**：兩個改動都是「行為更像蘋果／社群」，沒有帶來退化，但**對 -3903 沒有影響**——
+證實第 1 層的卡點不是這兩個 getter／setter 的答案形狀。
+
+#### 6.51.3 也順手確認的事
+
+- `Ath10kSetTrace` 在這一版把 UCM coex（255/256）也濾掉了？沒有——這一輪只是該次開機 airportd
+  還沒走過 UCM 那段，`SetTrace` 只看得到 22／10。
+- 失敗的 `cwjoin` 會把連線拆掉（`Ath10kConnectionState=disabled`、`iface-link=0`），
+  但看門狗 60 秒內會自己連回來，所以「點一次失敗」不會把機器留在離線狀態。
+
+#### 6.51.4 下一輪
+
+1. 反組譯 `-[CWXPCSubsystem __associateToWiFiNetwork:…]_block_invoke`，找它呼叫
+   `Apple80211Associate2` 的位置，以及那個位置之前的分支（`-3903` 的產生點）。
+2. 若確認它根本沒呼叫 Associate2，就往上一層找「誰決定不要送」——目前 log 只到
+   `Will associate to [ssid=QCA-TEST, bssid=(null), channel=(channel=6, width=20), …, hasPassword=1]`。
