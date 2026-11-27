@@ -1,26 +1,115 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
+## 0. 現況（2026-11-27 收工，下一個 session 從這裡開始）
+
+**能上網，但「點選連線」不通。** 驅動開機自連（`connected-wpa2`、`en1` 正常），
+但使用者點選網路時 `Apple80211Associate2` 在 userspace 就回 `-3903`。
+今天把原因收斂成**一個結構性錯誤**（§0.3），還沒開始改。
+
+| 項目 | 值 |
+|---|---|
+| 分支 / HEAD | `ventura-io80211` / `9c5ed7b` 之後的這一筆 |
+| 目前部署 | **v254**（bundle 留在 `/tmp/vk254`，可回滾） |
+| boot-args | `… ath10kjoin=<ssid>:<psk> ath10krole=7`（`ath10krole` 是本輪新旋鈕，預設 7＝原行為） |
+| VM 主機 | Acer `100.64.0.152`；guest：`ssh 100.64.0.152 "ssh -p 2223 user@127.0.0.1 'bash -s'" < script.sh` |
+
+### 0.1 建置／部署（**Acer 與 guest 的 `/tmp` 每次重開都會清空**）
+
+```bash
+bash ~/.hermes/cache/scratch/build_v.sh            # 本機 tar → Acer → guest 內 make VENTURA=1 -j2 kext
+ssh 100.64.0.152 'bash ~/qca-tools/pull_v.sh 255'
+cat ~/sudo.pwd | ssh 100.64.0.152 'bash ~/qca-tools/deploy.sh /tmp/vk255'
+```
+
+- 工具正本在 **`~/qca-tools/`**（`pull_v.sh`、`deploy.sh`、`with_esp.sh`、`boot_vm.sh`、
+  `dm_map.sh`、`vfio_bind.sh`、`press_enter.sh`）；`build_v.sh` 只在本機 scratch。
+- 主機重開後：`dm_map.sh`（DM OK）→ `vfio_bind.sh`（`/dev/vfio/8`）→ `boot_vm.sh`。
+- 開機後 60–90 秒回到 `connected-wpa2`；**每次部署先確認 kext 真的載入**再解讀行為。
+- 在 guest 內要用的工具（`cwjoin`、`a2*`、`iocs`、`refflags*`）來源在 `~/qca/tools/`，
+  重開後要重新 `clang`。
+
+### 0.2 今天量到的結論（詳細在 §6.50–§6.56）
+
+1. **airportd 一次 `cwjoin` 只送** UCM coex(255/256) ＋ 7×SCAN_REQ(10) ＋ 3×DISASSOCIATE(22)，
+   沒有 `Set(SSID)`／`Set(AUTH_TYPE)`／`ASSOCIATE`（set-only 證據，不再靠會被洗掉的環）。
+   型別 255/256/363/389 是**蘋果真有的型別**（`_gSetHandlerTable` 解析），不是解析壞掉。
+2. **`-3903` 定位到單一位元**：`Apple80211Associate2` 第一道門 `0x93e7` 是
+   `test r14,r14`（第 4 參數＝輸出字典）＋ `test [r12+0x51],0x40`；實機上那顆 bit 永遠 0。
+   就地把它歸零 → 同一份字典 `rc=0`。強制過 `0x93e1` 後下一道 `-3900` 在 `0xa586`，
+   前面 `0xa567` 又是同一個 bit → **RSN 與 WPA 兩條路被同一顆 bit 擋**。
+3. **根的根**：逐 IOC 探測（`tools/iocs.c`）顯示 `STATE(13)`、`OP_MODE(15)`、`21`、`50`、`96`
+   全回 `-3900`（而這些在驅動裡早就實作且回 success → 是框架在到驅動前就回），
+   registry 則是 `Ath10kVifPublishRetry=failed`、`Ath10kCtrlInfraIvar=No`、
+   `ioreg -c IO80211InfraInterface` = **0**、`GetVirtualIfListCopy → ifCount[0]`。
+   **role 不是那把鎖**（`ath10krole=1` 與 `7` 的結果完全相同）。
+4. 第 4 個參數是 **`[NSMutableDictionary dictionaryWithCapacity:0]`**（airportd 實際傳的），
+   傳 NULL 或裸緩衝都會 0 秒被踢／SIGILL。
+
+### 0.3 權威對照：我們的介面發佈走錯路（AirportItlwm v2.2.0 原始碼）
+
+```cpp
+IONetworkInterface *AirportItlwm::createInterface() {      // 只 new 介面
+    AirportItlwmInterface *netif = new AirportItlwmInterface;   // IOEthernetInterface 子類
+    if (!netif->init(this, fHalService)) { netif->release(); return NULL; }
+    return netif;
+}
+// start() 內：
+if (!attachInterface((IONetworkInterface **)&fNetIf, true)) { … return false; }
+registerService();          // controller
+fNetIf->registerService();  // 介面 → BSD unit 由 IONetworkStack 配
+```
+
+我們多做了：`createVirtualInterface()` 另生 vif、`ath10kAttachSkywalkInterface()`、
+自製 `publishVenturaVifBsdUnit()`（回 false，再往前 panic 在 Skywalk `prepareBSDInterface`）、
+延遲 retry 手塞 controller ivar `+0x200`、手改 vif role。這是 §0.2-3 那一串症狀的來源。
+
+### 0.4 下一個 session 的第一件事（結構性，先備份）
+
+1. `git tag pre-interface-publish-rewrite`（v254 在 `/tmp/vk254`）。
+2. 把自建路徑改成可關（boot-arg 或 `#if`，先別刪，方便 A/B）：
+   `createVirtualInterface` / `publishVenturaVifBsdUnit` / 手塞 ivar `+0x200`。
+3. 讓 `createInterface()` 的物件當**唯一**介面，`start()` 照權威順序：
+   `attachInterface((IONetworkInterface **)&fNetIf, true)` → `registerService()` →
+   `fNetIf->registerService()`。
+4. 驗收順序（**先驗最容易被改壞的**）：
+   `ifconfig en1` 仍 active 且能上網 → `ioreg -c IO80211InfraInterface` ≥ 1 →
+   該節點有 `BSD Name` → `GetVirtualIfListCopy` 不再空 → `iocs` 的 13/15 回 0 →
+   `cwjoin` 由 `-3903` 變 `-3905`（只剩完成事件那條線）。
+5. 壞了就 `deploy.sh /tmp/vk254` 回滾。
+
+### 0.5 新增工具（都在 `tools/`）
+
+`iocs.c`（逐 IOC 探測，fork 隔離）、`a2cipher.c`（完整 RSN 字典；`RSN_IE` 必須是 CFDictionary）、
+`a2auth.c`（`AUTH_SEL_OVERRIDE` 1..12 全 `-3905`）、`a2-3903-sites.py`（14 個出口）、
+`a2gate.c`（就地改分支觀測 gate）、`a2bit.c`（ref 位元）、`refdump3.c`／`refflags2.c`／`refflags.c`。
+
+RE 基本功：**lldb 不可用**（非互動拿不到 debug 權限）→ 改用「把 `-3903` 常數就地改成編號，
+看回傳哪個」或「把 `jne` 改 `jmp`」；patch 前先 `vm_protect(…, RWX)`。
+framework dump 用 guest 內 `dlopen`/`dlsym` + `base64 -i`；kernel cache 用 `/tmp/kc2` + `/tmp/an.py`。
+`airportd` 的 `__associateToWiFiNetwork` IMP = `0x100011c8f`，Associate2 呼叫點 `0x100012886`。
+
+### 0.6 已排除（別重跑）
+
+補 capability 位元（`bits[5] |= 0x10`，v253，保留但無效）、`AUTH_SEL_OVERRIDE` 1..12、
+cipher u/m 1..5 共 25 組、replay counters（已修正為 PTKSA=4／GTKSA=1）、
+加 `WPA_IE`／BSSID／CHANNEL（只有 `AP_MODE=1` 變 `-3900`，那是開 AP/IBSS 分支）、
+掃 vif role 1/6/7、再讀 airportd log（logger 從未初始化）。
+
+### 0.7 其他文件
+
+逐輪細節在本文 §6.x；四層條件在
+[`docs/handoff-apple-join-conditions.md`](handoff-apple-join-conditions.md)；
+逐 API 對照 `docs/apple-vs-ours.md`；反組譯流程 `docs/reverse-engineering-playbook.md`。
+
+**衛生**：測試 AP 的 PSK 在 `src/kext/ventura/Ath10kAutoJoin.inc`，也是 boot-args
+`ath10kjoin=` 的一部分 → 任何回覆／文件都不要貼；`with_esp.sh` 會原樣印 boot-args，用時小心。
+
+---
+
 **第四十五輪（§6.50）補記**：加了 **set 專用軌跡**（`Ath10kSetTrace`／`Ath10kSetBlock`／
 `Ath10kSetWeird`），因為舊的共用環形緩衝一秒內就被 airportd 的 getter 洗掉。
-結論有二：① airportd 一次 `cwjoin` 只送 **UCM coex(255/256) ＋ 7×SCAN_REQ(10) ＋ 3×DISASSOCIATE(22)**，
-`Set(SSID)`／`Set(AUTH_TYPE)`／`ASSOCIATE` 仍然完全沒有（第 1 層卡點成立，現在有 set-only 證據）；
-② 過去當成「解析壞掉」的 type 255／256／363／389 **是蘋果真的有的型別**
-（live `_gSetHandlerTable` 解析：`setUCMCoexProfile`／`setUCMCoexProfileActive`／
-`setUSBHostNotification`／`setUserspaceP2POptions`），以後不要再當 ABI 壞掉查。
-另外 `tools/a2join` 這輪實測 **ASSOCIATE(20) 進得了驅動**，但 `keylen=0`（金鑰沒被認出）＋
-`-3905/errno 60`（等不到完成事件）——兩條路卡的位置不同，下一輪從這兩點分頭下手。
-
-> **跨 session 先讀這份**：[`docs/handoff-next-session.md`](handoff-next-session.md)
-> —— 現況、環境指令、今天收斂出的結構性結論（介面發佈路徑要照 AirportItlwm：
-> `createInterface` + `attachInterface` + `registerService`，不要自建 vif/手動 Skywalk publish）、
-> 下一步的改動與回滾方式、新增工具清單、已排除方向。
->
-> > **新接手先讀這份**：[`docs/handoff-apple-join-conditions.md`](handoff-apple-join-conditions.md)
-> —— 蘋果「放行 join」的四層條件（airportd／Associate2／IO80211Family／驅動回報）、
-> 每一條的反組譯位址與實測證據、目前卡在第 1 層（airportd 連 `Set(SSID)` 都不送），
-> 以及 OpenIntelWireless AirportItlwm 的可照抄做法。
-> 逐輪細節在本文 §6.x；逐 API 對照在 `docs/apple-vs-ours.md`；工具與流程在
-> `docs/reverse-engineering-playbook.md`。
+結論見 §0.2-1。`tools/a2join` 實測 **ASSOCIATE(20) 進得了驅動**，但 `keylen=0` ＋
+`-3905/errno 60`（等不到完成事件）——與 §0.2-3 是兩條不同的線。
 
 **第四十輪（§6.45）補記**：`error 37 Already associated` 的來源找到了——**BSD 介面的 link 狀態沒掉**
 （拆線後 `ifconfig en1` 仍是 `status: active` 且留著舊 IP）。`networkLink()` 只更新 controller，
