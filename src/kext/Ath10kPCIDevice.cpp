@@ -368,6 +368,18 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // Stamp it on the controller as well as on the interface and the vif: it is
     // not yet known which node the entry argument refers to.
     setProperty("IO80211InterfaceRole", "Infrastructure");
+    // Authoritative publish (see venturaPublishAuthoritativeInterface): Apple's
+    // start() ran createInterface()/attachInterface() already, so only query and
+    // replay what the framework parked, then register in AirportItlwm's order
+    // further down (controller first, interface second).
+    const bool authoritativePublish = appleStart && venturaUseAuthoritativePublish();
+    if (authoritativePublish) {
+        void *parkedIvar = *reinterpret_cast<void **>(reinterpret_cast<char *>(this) + 0x200);
+        _venturaAuthInterface = venturaPublishAuthoritativeInterface(
+            reinterpret_cast<IONetworkInterface *>(parkedIvar));
+        provider->setProperty("Ath10kPubPhase",
+                              _venturaAuthInterface != nullptr ? "attached" : "not-attached");
+    }
     // airportd reaches the device through this controller ivar:
     // IO80211Controller::attachInterface(IONetworkInterface **, bool) parks the
     // interface at +0x200, and getNetworkInterface()/getInfraInterface() just
@@ -378,9 +390,9 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // attachInterface skip its whole attach/register pass (measured: the Wi-Fi
     // hardware port disappears). +0x200 cannot collide with our own members;
     // _venturaInterface sits at +0x668.
-    if (appleStart) {
-        provider->setProperty("Ath10kInstanceStart",
-                              static_cast<UInt64>(reinterpret_cast<uintptr_t>(this)), 64);
+    provider->setProperty("Ath10kInstanceStart",
+                          static_cast<UInt64>(reinterpret_cast<uintptr_t>(this)), 64);
+    if (appleStart && !authoritativePublish) {
         IO80211Interface *published = venturaPublishedInterface();
         provider->setProperty("Ath10kCtrlInfraSeen", published != nullptr);
         // airportd's per-interface filter reads this property off the interface it
@@ -459,6 +471,9 @@ bool Ath10kPCIDevice::start(IOService *provider)
     // stack creates it. Ask the controller for a station virtual interface
     // (type 7) so the core has a vif to hang the ifnet on; this runs after
     // either start path.
+    // ... and skipped entirely on the authoritative path: a self-built vif is
+    // exactly what AirportItlwm does not have (HANDOFF §6.56).
+    if (!authoritativePublish) {
     {
         IOEthernetAddress hwAddress{};
         ether_addr vifAddress{};
@@ -526,6 +541,7 @@ bool Ath10kPCIDevice::start(IOService *provider)
         provider->setProperty("Ath10kRoleStamped",
                               static_cast<UInt64>(stampInterfaceRole(this, 0)), 32);
     }
+    }
 #endif
 
 #ifdef ATH10K_NATIVE
@@ -567,6 +583,21 @@ bool Ath10kPCIDevice::start(IOService *provider)
     }
     ath10kSetRecoveryStatus(_pci,"awaiting-initial-power","Waiting for the parent's initial power transition");
     registerService();
+#if defined(ATH10K_VENTURA)
+    // Authoritative publish, second half: AirportItlwm registers the controller
+    // first and the interface second, so IONetworkStack assigns the BSD unit to
+    // an already-registered controller.
+    if (_venturaAuthInterface != nullptr) {
+        _venturaAuthInterface->registerService();
+        if (IOService *probe = getProvider()) {
+            probe->setProperty("Ath10kPubIfaceReg", "done");
+            OSObject *bsd = _venturaAuthInterface->getProperty("BSD Name");
+            if (OSString *name = OSDynamicCast(OSString, bsd))
+                probe->setProperty("Ath10kPubBsdAfter", name->getCStringNoCopy());
+        }
+        _venturaAuthInterface = nullptr;
+    }
+#endif
     PMinit();_powerManaged=true;
     static IOPMPowerState states[2]={
         {1,0,0,0,0,0,0,0,0,0,0,0},

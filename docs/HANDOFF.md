@@ -3654,3 +3654,71 @@ Associate2 → -3903（ref+0x51 bit 6 永遠 0）
    應該回 0、`ref+0x51` bit 6 由框架填、`-3903` 才會變成只剩完成事件的 `-3905`。
 4. 這是一次結構性改動，風險高（可能失去 en1 連線能力），要先確認可回滾
    （現行 v254 的 bundle 留在 `/tmp/vk254`，boot-args 已還原）。
+
+### 6.57 第十七輪（v255–v258）：照權威實作重寫發佈路徑 —— attach 通了，框架仍然不認
+
+#### 6.57.1 做了什麼
+
+1. `createVirtualInterface` / `attachPlatformVif` / `publishVenturaVifBsdUnit` / 手塞
+   controller ivar `+0x200` 整段包進 `if (!authoritativePublish)`，可用 boot-arg 開關
+   （本輪最後定為 `ath10kpub=1` 才走新路，預設回原行為）。
+2. 新路徑 `venturaPublishAuthoritativeInterface()`：`attachInterface(&netif, true)`
+   →（控制器已由 start 註冊）→ `netif->registerService()`，也就是 AirportItlwm 的順序。
+3. 一併把 `getHardwareAddress()` 在 `_wmiInit.ready == false` 時改成回 WMI 板載 MAC
+   （全零才回 `kIOReturnNotReady`）。
+
+#### 6.57.2 為什麼在 `start()` 裡一定失敗（反組譯定案）
+
+- live `IO80211Controller` **沒有**覆寫 `attachInterface(IONetworkInterface**, bool)`：
+  `__ZN17IO80211Controller15attachInterfaceEPP18IONetworkInterfaceb` = `0xffffff800218790a`
+  落在 **legacy** 區間（0x218…）。我們的呼叫走的是
+  `IONetworkController::attachInterface`（`0xffffff8002c5e118`）。
+- 它的第一件事不是 `createInterface()`，而是 `executeCommand(...)` → slot 268 →
+  `handleCommand`（cmd = 3）→ `jmp [vptr+0x998]` = **`IONetworkController::prepare()`**
+  （`0xffffff8002c5e45a`，slot 309）。
+- `prepare()`：`[this+0xc4] != 0` 就回 0；否則要求 **`publishProperties()` 回 true**，
+  失敗就直接回 `0xe00002bc`。
+- `publishProperties()` = `IOEthernetController::publishProperties`（`0x2c56188`），第一關就是
+  `getHardwareAddress()`（slot 358）→ 非 0 就整體 false。
+- `super::start()` 是我們 `start()` 的第一行，那時 firmware 還沒下載、`_wmiInit.mac` 全零 →
+  `getHardwareAddress()` 回 `kIOReturnNotReady` → `prepare()` 失敗 →
+  `attachInterface()` 在任何 `createInterface()` 之前就 return false。
+
+實測（v255/v256）：`Ath10kPubAttach = failed`、`Ath10kCreateIfaceCalls` **仍是 1**、
+`Ath10kPubCtrlIvarBefore/After = No`。
+
+#### 6.57.3 延後到無線電起來之後（v257）：attach 成功，但沒有第二個單元
+
+把 attach 移到自動連線看門狗（`_wmiLive.active` 之後，約開機 10–20 秒）：
+
+```
+Ath10kPubAttach   = ok            Ath10kPubPhase = attached-late
+Ath10kCreateIfaceCalls = 2        Ath10kPubIfaceReg = done-late
+Ath10kPubCtrlIvarAfter = No       （live 的 attach 本來就不寫 +0x200）
+ioreg -c IO80211InfraInterface = 0
+新款介面節點：Ath10kVenturaInterface（registered、role=Infrastructure、**沒有 BSD Name**）
+ifconfig -l：仍然只有 en1          iocs 13/15/21/50/96 全部仍 -3900
+networksetup -getairportnetwork en1 = QCA-TEST（連線沒退化）
+```
+
+結論：把 v1 `IO80211Interface` 交給控制器**可以成功**，但框架只多註冊一顆沒有 BSD 單元的
+介面物件，既不會產生 `IO80211InfraInterface`，也不會補 `ref+0x51` 的能力握手。
+§6.56 的期待（框架自己發佈 BSD 單元 / InfraInterface）在 13.7 的 live family 上不成立 ——
+BSD 單元一直是由 Apple 的 `start()` 發的那一顆，`attachInterface` 不會再造一個。
+
+#### 6.57.4 現況（v258）
+
+- 預設回原行為（hand-built），`ath10kpub=1` 才走新路徑；`getHardwareAddress` 的 WMI 備援保留
+  （無害，只在不 ready 且板載 MAC 已知時生效）。
+- 驗證：開機後約 3 分鐘 `Ath10kConnectionState = wpa2-handshake…→connected`、
+  `Current Wi-Fi Network: QCA-TEST`、`ping 1.1.1.1` 2/2。
+- 可回滾：`/tmp/vk254`（原始可用版）、`/tmp/vk255`–`/tmp/vk258` 都留著。
+
+#### 6.57.5 下一輪的判讀（別再重試的）
+
+- **不要再**在 `start()` 內呼叫 `attachInterface`（`prepare()` 一定失敗），也不要期待
+  `attachInterface(&netif, true)` 會生 BSD 單元或 InfraInterface。
+- `-3900`（STATE 13 / OP_MODE 15 / 21 / 50 / 96）與 `-3903` 是同一件事的兩面：
+  框架沒有把這個 ref 對到「它自己 Skywalk 註冊過的介面」。要翻這頁只剩
+  §6.19.3 的兩條路：讓物件真的是 `IO80211InfraInterface`（需要 Skywalk 註冊 + packet buffer
+  pool），或改寫 airportd 端（關 SIP 改 framework）。

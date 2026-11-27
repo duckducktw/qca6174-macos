@@ -169,6 +169,25 @@ private:
     // cast to IO80211SkywalkInterface, which the v1 interface can never satisfy.
     IOService *_venturaSkywalkIf = nullptr;
     IOService *attachPlatformVif();
+    // Authoritative publish path (AirportItlwm's shape): the object
+    // createInterface() hands the controller is the only interface, and the
+    // controller itself runs attachInterface() + registerService(). Everything
+    // this driver used to build by hand (createVirtualInterface, the Skywalk
+    // attach, publishVenturaVifBsdUnit, writing controller ivar +0x200) is
+    // skipped while this runs; ath10koldpub=1 restores the hand-built path for
+    // A/B testing.
+    bool venturaUseAuthoritativePublish();
+    IONetworkInterface *venturaPublishAuthoritativeInterface(IONetworkInterface *parked);
+    // Deferred half of the authoritative publish: the interface registers only
+    // after the controller does, exactly like AirportItlwm's start() order.
+    IONetworkInterface *_venturaAuthInterface = nullptr;
+    // attachInterface() -> prepare() -> publishProperties() -> getHardwareAddress()
+    // cannot run while super::start() is still on the stack: the radio is not up
+    // yet and _wmiInit.mac is all zero, so prepare() returns 0xe00002bc and
+    // attachInterface() bails before createInterface() (measured v255/v256:
+    // Ath10kPubAttach=failed, Ath10kCreateIfaceCalls stayed 1). Retry once the
+    // WMI session is live, from the auto-join watchdog.
+    bool _venturaAuthTried = false;
     // Airportd's per-interface filter reads "IO80211InterfaceRole" off an entry
     // that has not been identified yet, so stamp the whole subtree once.
     static UInt32 stampInterfaceRole(IOService *root, int depth);

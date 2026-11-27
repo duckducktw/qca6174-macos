@@ -869,6 +869,25 @@ void Ath10kPCIDevice::runVenturaAutoJoin()
         thread_call_enter_delayed(_venturaAutoJoinCall, deadline);
         return;
     }
+    // Radio (and therefore the board MAC in _wmiInit) is up: this is the first
+    // moment attachInterface() can pass prepare() -> publishProperties() ->
+    // getHardwareAddress(). AirportItlwm attaches after its hardware init for the
+    // same reason; our super::start() runs before any of it.
+    if (!_venturaAuthTried && venturaUseAuthoritativePublish()) {
+        _venturaAuthTried = true;
+        void *parked = *reinterpret_cast<void **>(reinterpret_cast<char *>(this) + 0x200);
+        IONetworkInterface *netif = venturaPublishAuthoritativeInterface(
+            reinterpret_cast<IONetworkInterface *>(parked));
+        probe->setProperty("Ath10kPubPhase", netif != nullptr ? "attached-late" : "not-attached-late");
+        if (netif != nullptr) {
+            // Controller is already registered by start(); the interface goes next.
+            netif->registerService();
+            probe->setProperty("Ath10kPubIfaceReg", "done-late");
+            if (OSString *name = OSDynamicCast(OSString, netif->getProperty("BSD Name")))
+                probe->setProperty("Ath10kPubBsdAfter", name->getCStringNoCopy());
+            _venturaAuthInterface = nullptr;
+        }
+    }
     ++_venturaAutoJoinTries;
     if (Ath10k::connectionAssociated(_connection)) {
         probe->setProperty("Ath10kAutoJoinPhase", "up");
@@ -3700,6 +3719,72 @@ SInt32 Ath10kPCIDevice::venturaScanManagerRequest(int type, void *data)
     }
     _venturaManagerCall = false;
     return routed;
+}
+
+// ---------------------------------------------------------------------------
+// Authoritative interface publication (AirportItlwm v2.2.0's shape)
+//
+// AirportItlwm never builds a vif, never attaches a Skywalk interface and never
+// publishes a BSD unit itself. Its start() is:
+//     super::start(provider)
+//     attachInterface((IONetworkInterface **)&fNetIf, true)
+//     registerService()            // controller
+//     fNetIf->registerService()    // interface -> IONetworkStack assigns the unit
+// and the whole BSD unit / 80211 bookkeeping comes out of the framework. This
+// driver instead created its own vif, attached it to the controller by hand,
+// tried to hand an ifnet to the vif, and wrote controller ivar +0x200 from a
+// delayed thread call. Those four steps are what produced the measured set
+//     Ath10kVifPublishRetry = failed, Ath10kCtrlInfraIvar = No,
+//     ioreg -c IO80211InfraInterface = 0, GetVirtualIfListCopy -> ifCount[0],
+//     ioc 13/15/21/50/96 -> -3900, Associate2 -> -3903
+// (HANDOFF §6.56). ath10koldpub=1 keeps that hand-built path available for A/B.
+// ---------------------------------------------------------------------------
+bool Ath10kPCIDevice::venturaUseAuthoritativePublish()
+{
+    // v255-v257 measured this path end to end: the attach only succeeds once the
+    // radio is up (prepare -> publishProperties -> getHardwareAddress), and when
+    // it does, the framework registers a second interface object that never gets
+    // a BSD unit and still produces no IO80211InfraInterface (ioc 13/15 stay
+    // -3900). So it stays opt-in; the hand-built publish is the default again.
+    int knob = 0;
+    const bool optIn = PE_parse_boot_argn("ath10kpub", &knob, sizeof(knob)) && knob != 0;
+    if (IOService *probe = getProvider())
+        probe->setProperty("Ath10kPublishMode", optIn ? "authoritative" : "hand-built");
+    return optIn;
+}
+
+IONetworkInterface *Ath10kPCIDevice::venturaPublishAuthoritativeInterface(IONetworkInterface *parked)
+{
+    IOService *probe = getProvider();
+    IONetworkInterface *netif = parked;
+    bool attached = netif != nullptr;
+    if (probe)
+        probe->setProperty("Ath10kPubCtrlIvarBefore", attached);
+    if (!attached) {
+        // Pass a null slot on purpose: attachInterface() runs its own
+        // createInterface() (our override), configures it, attaches the ifnet
+        // and records the result in both the slot and controller ivar +0x200.
+        // The pointer handed back is the object that really owns the unit.
+        attached = attachInterface(&netif, true) && netif != nullptr;
+        if (probe)
+            probe->setProperty("Ath10kPubAttach", attached ? "ok" : "failed");
+    } else if (probe) {
+        probe->setProperty("Ath10kPubAttach", "skipped-parked");
+    }
+    if (probe) {
+        probe->setProperty("Ath10kPubNetIf",
+                           static_cast<UInt64>(reinterpret_cast<uintptr_t>(netif)), 64);
+        probe->setProperty("Ath10kPubCtrlIvarAfter",
+                           *reinterpret_cast<void **>(reinterpret_cast<char *>(this) + 0x200) != nullptr);
+    }
+    if (!attached)
+        return nullptr;
+    if (Ath10kVenturaInterface *interface = OSDynamicCast(Ath10kVenturaInterface, netif))
+        _venturaInterface = interface;
+    if (probe && netif->getProperty("BSD Name") != nullptr)
+        probe->setProperty("Ath10kPubBsdName", "present");
+    IOLog("Ath10kMac: authoritative publish netif=%p attached=%d\n", netif, (int)attached);
+    return netif;
 }
 
 IOService *Ath10kPCIDevice::attachPlatformVif()

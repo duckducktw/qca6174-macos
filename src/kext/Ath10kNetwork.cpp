@@ -70,7 +70,26 @@ IOOutputQueue *Ath10kPCIDevice::createOutputQueue()
 }
 IOReturn Ath10kPCIDevice::getHardwareAddress(IOEthernetAddress *address)
 {
-    if(!address || !_wmiInit.ready)return kIOReturnNotReady;
+    if(!address || !_wmiInit.ready){
+        // IONetworkController::attachInterface() runs prepare() -> publishProperties()
+        // -> getHardwareAddress() before the radio is up (super::start() is the very
+        // first thing start() does, firmware comes seconds later). Returning
+        // kIOReturnNotReady there makes publishProperties() fail, prepare() return
+        // 0xe00002bc and attachInterface() false *before* createInterface() is even
+        // called (measured: Ath10kPubAttach=failed, Ath10kCreateIfaceCalls stayed 1).
+        // The board address from the WMI init block is already known in that window,
+        // so answer with it instead of failing.
+        if(address){
+            bool anyByte=false;
+            for(UInt32 i=0;i<6;++i)if(_wmiInit.mac[i])anyByte=true;
+            if(anyByte){
+                for(UInt32 i=0;i<6;++i)address->bytes[i]=_wmiInit.mac[i];
+                if(IOService *probe=getProvider())probe->setProperty("Ath10kHwAddrSource","wmi-early");
+                return kIOReturnSuccess;
+            }
+        }
+        return kIOReturnNotReady;
+    }
 #ifdef ATH10K_NATIVE
     const UInt8 *mac=_nativeMACValid?_nativeMACCurrent:_wmiInit.mac;
 #else
