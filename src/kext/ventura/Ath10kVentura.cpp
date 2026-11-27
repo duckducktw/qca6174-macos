@@ -348,9 +348,18 @@ UInt32 Ath10kPCIDevice::hardwareOutputQueueDepth()
 // whole join inside this driver's own four-way handshake.
 bool Ath10kPCIDevice::useAppleRSNSupplicant(IO80211VirtualInterface *)
 {
+    // Upstream AirportItlwm builds every target with USE_APPLE_SUPPLICANT, so its
+    // answer here is true: the framework's own RSN supplicant performs the 4-way and
+    // the driver only associates + reports events. Our earlier reasoning (the
+    // supplicant lives in the legacy bundle only) is contradicted by that shipping
+    // configuration, and Apple80211Associate2's caller treats a true answer as
+    // "wait up to 15 s for the framework" (measured at [vptr+0xc78]). Default to the
+    // upstream behaviour now and keep the old answer behind ath10kapplersn=0.
+    int knob = -1;
+    const bool upstream = !(PE_parse_boot_argn("ath10kapplersn", &knob, sizeof(knob)) && knob == 0);
     if (IOService *probe = getProvider())
-        probe->setProperty("Ath10kAppleRSNGate", "forced-off");
-    return false;
+        probe->setProperty("Ath10kAppleRSNGate", upstream ? "framework-supplicant" : "forced-off");
+    return upstream;
 }
 
 // IO80211Controller stores its IO80211CommandGate on the queue this returns and
@@ -1311,6 +1320,28 @@ SInt32 Ath10kPCIDevice::venturaRecordRequest(UInt requestType, int requestNumber
         _venturaClientTraceNext = (_venturaClientTraceNext + 1) % kVenClientTraceSlots;
         if (_venturaClientTraceCount < kVenClientTraceSlots)
             ++_venturaClientTraceCount;
+    }
+    // Compact (type:len:status) ring for the last requests, so the shape the
+    // family asks for during its own bind (Apple80211BindToInterfaceWithService ->
+    // IOConnectCallStructMethod(selector 1) -> Apple80211RawGet into ref+0x50) can
+    // be read straight off the driver. See HANDOFF 6.61.
+    {
+        static char ring[8][24];
+        static UInt32 next = 0, count = 0;
+        snprintf(ring[next], sizeof(ring[next]), "t%u:l%u:%x", static_cast<unsigned>(requestNumber),
+                 static_cast<unsigned>(_venturaIoctlLength), static_cast<unsigned>(status));
+        next = (next + 1) % 8;
+        if (count < 8) ++count;
+        if (IOService *probe = getProvider()) {
+            char out[8 * 25];
+            out[0] = 0;
+            const UInt32 first = (count == 8) ? next : 0;
+            for (UInt32 i = 0; i < count; ++i) {
+                strlcat(out, ring[(first + i) % 8], sizeof(out));
+                strlcat(out, " ", sizeof(out));
+            }
+            probe->setProperty("Ath10kReqLog", out);
+        }
     }
     if (IOService *provider = getProvider()) {
         char clientTrace[kVenClientTraceSlots * 32];
@@ -4099,6 +4130,54 @@ void Ath10kPCIDevice::scanNotifyCall(thread_call_param_t param0, thread_call_par
     auto *self = static_cast<Ath10kPCIDevice *>(param0);
     if (self != nullptr)
         self->runScanNotify();
+}
+
+// AirportItlwm's enable/disableVirtualInterface: the live family calls these when
+// airportd activates the station vif, and on macOS 13+ the working driver marks the
+// vif enabled-by-system and drives its link state here. Without an override the
+// framework never sees the station interface as enabled, which is one of the few
+// remaining differences between our controller and AirportItlwm (HANDOFF §6.60).
+// The link-state/postMessage thunks are the ones venturaPostLinkEvents already uses,
+// so no new unresolved symbols are introduced.
+SInt32 Ath10kPCIDevice::enableVirtualInterface(IO80211VirtualInterface *vif)
+{
+    const SInt32 ret = IO80211Controller::enableVirtualInterface(vif);
+    if (IOService *probe = getProvider())
+        probe->setProperty("Ath10kVifEnable", ret == 0 ? "super-ok" : "super-failed");
+    if (ret != 0 || vif == nullptr)
+        return ret;
+    ath10kVifLinkStateReporter(vif, kIO80211NetworkLinkUp, 0, false, 0);
+    ath10kVifPostMessage(vif, APPLE80211_M_LINK_CHANGED, nullptr, 0);
+    return kIOReturnSuccess;
+}
+
+SInt32 Ath10kPCIDevice::disableVirtualInterface(IO80211VirtualInterface *vif)
+{
+    const SInt32 ret = IO80211Controller::disableVirtualInterface(vif);
+    if (IOService *probe = getProvider())
+        probe->setProperty("Ath10kVifDisable", ret == 0 ? "super-ok" : "super-failed");
+    if (ret != 0 || vif == nullptr)
+        return ret;
+    ath10kVifLinkStateReporter(vif, kIO80211NetworkLinkDown, 0, false, 0);
+    ath10kVifPostMessage(vif, APPLE80211_M_LINK_CHANGED, nullptr, 0);
+    return kIOReturnSuccess;
+}
+
+
+// Upstream AirportItlwm answers the packet-filter query the same way; the live family
+// asks it while building the interface, and a driver that returns kIOReturnUnsupported
+// for every group leaves the interface without a wake filter.
+IOReturn Ath10kPCIDevice::getPacketFilters(const OSSymbol *group, UInt32 *filters) const
+{
+    IOReturn ret = kIOReturnSuccess;
+    if (group == gIOEthernetWakeOnLANFilterGroup)
+        *filters = kIOEthernetWakeOnMagicPacket;
+    else if (group == gIONetworkFilterGroup)
+        *filters = kIOPacketFilterUnicast | kIOPacketFilterBroadcast | kIOPacketFilterMulticast |
+                   kIOPacketFilterMulticastAll | kIOPacketFilterPromiscuous;
+    else
+        ret = kIOReturnUnsupported;
+    return ret;
 }
 
 // [ivars+0x208] is an OSArray of per-client event pipes; the same vtable slot

@@ -26,6 +26,11 @@ public:
     // airportd turns that error into -3903 and reports "could not join".
     // This personality runs its own supplicant, so answer false.
     bool useAppleRSNSupplicant(IO80211VirtualInterface *) override;
+    // The live family calls these when airportd activates the station vif;
+    // AirportItlwm marks it enabled-by-system here (HANDOFF 6.60).
+    IOReturn getPacketFilters(const OSSymbol *group, UInt32 *filters) const override;
+    SInt32 enableVirtualInterface(IO80211VirtualInterface *) override;
+    SInt32 disableVirtualInterface(IO80211VirtualInterface *) override;
     SInt32 performCountryCodeOperation(IO80211CountryCodeOp) override;
     // IO80211Controller keeps its command gate on an IO80211WorkQueue it gets
     // from getWorkQueue(). Apple's start() asks before anything exists, then

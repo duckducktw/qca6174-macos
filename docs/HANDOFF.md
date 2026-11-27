@@ -3822,3 +3822,55 @@ VM = v259：hand-built 發佈、itlwm caps 預設、`ath10kcap=1`／`ath10kpub=1
 2. **框架對介面身分的認定**（`ref+0x51` bit `0x40`）：AirportItlwm 之所以不需要處理它，是因為它的 `fNetIf` 是**框架自己透過 `attachInterface` 建出來的 `IO80211Interface`**，而且它的 `apple80211VirtualRequest` 會回齊所有 IOC（含 STATE/OP_MODE/RSSI/RATE/CHANNEL…）。我們的 `fNetIf` 是 Apple `start()` 早期建的，`+0x200` 從沒被塞過 → 框架眼中的 ref 沒有「驅動介面」這個身分。
 
 **下一步（依這張表）**：把 `apple80211VirtualRequest` 的回覆**逐 IOC 補到跟 AirportItlwm 的 switch 一樣完整**（用 `IOCTL_GET` 清單當 checklist，特別是 STATE/OP_MODE/RSSI/RATE/CHANNEL/ROAM_PROFILE/DRIVER_VERSION），再跑一次 bind＋`refdump3` 看 `ref+0x51` 是否被填；這是唯一還能從驅動側施力的地方。
+
+### 6.61 第廿一輪（v261–v262）：`ref+0x50` 的來源 = family client selector 1，卡在 entitlement
+
+#### 6.61.1 上游做法（已複製）
+
+`useAppleRSNSupplicant()` 改成跟上游一致預設 **true**（`ath10kapplersn=0` 切回），並補 `getPacketFilters()`。
+上游 `itlwm.xcodeproj` 每個 target 都定義 `USE_APPLE_SUPPLICANT`；其 `apple80211VirtualRequest`
+**沒有** `APPLE80211_IOC_ASSOCIATE` case。實測：v261 仍 `-3903`，且 `Ath10kAppleRSNGate = already-on`
+是 **舊有** publish 階段（`Ath10kVentura.cpp:3870`，`[*skywalkIvars+0x118] |= 2`）寫的 → supplicant 假設排除。
+
+#### 6.61.2 gate 與來源（反組譯定案，lldb 直接開自己的 process，不需 attach）
+
+```
+Apple80211Associate2      +2209  testb $0x40, 0x51(%r12)   → +2221 movl $0xfffff0c1  (-3903)
+                          +2245  testb $0x20, 0x51(%r12)   （第二道）
+Apple80211BindToInterface +93    CFStringCompare(@「AirLink」) → 非 AWDL 走 +276
+                          +276   call Apple80211BindToInterfaceWithService
+…WithService              +612   IOConnectCallStructMethod(*(u32*)(ref+0x16c), 1, …)  ← 失敗即 -3900
+                          +642   xorl %r14d,%r14d
+                          +653   movq %r14,0x55(%r13)   ┐ 旗標區「清零」
+                          +657   movq %r14,0x50(%r13)   ┘
+                          +686   movl $0xc,0x10(%rbx)  ┐ type=12
+                          +693   movq &ref+0x50,0x20(%rbx)  buffer
+                          +697   movl $0xd,0x18(%rbx)  ┘ len=13
+                          +710   call Apple80211RawGet        （結果 → ref+0x50）
+```
+
+結論：`ref+0x50` 是 **family user client selector 1 的回覆**（13 bytes）經 `Apple80211RawGet` 寫入；
+`ref+0x51` bit 0x40 就落在那 13 bytes 的第 2 byte。我們自己的 harness 走不到，因為 selector 1
+在 `IOServiceOpen`/`IOConnectCallStructMethod` 就被擋（回 -3900）。
+
+#### 6.61.3 驅動端新斷點（v262）與量測
+
+`Ath10kReqLog` = 最近 8 筆 `t<type>:l<len>:<status>`。airportd 重連時只有：
+
+```
+t1:l32:6  t9:l32:0  t1:l32:6  t1:l32:6  t11:l32:5  t9:l32:0  t1:l32:6  t1:l32:6
+```
+
+→ **沒有任何 type 12/13**，所以 `ref+0x50` 不是我們回的 caps；是 family 自己從 selector 1 組出來的。
+
+#### 6.61.4 卡點與下一步
+
+`IO80211APIUserClient`（kernel）：
+- `checkEntitlement`（`0x2024402`）= `IOUserClient::copyClientEntitlement(task, <key @0x20b778f>)` + metaclass 比較；
+- `externalMethod`（`0x2024c44`）以 24-byte `IOExternalMethodDispatch` 表（`0x20e15bc`）分派 selector 0–7，
+  但該表的 chained-fixup 解碼還沒對上，selector 1 的 handler 仍未定位。
+
+下一輪兩條：
+1. 把 `sMethods` 表用正確 fixup 基準解出來 → 找 selector 1 handler，看它讀介面哪個屬性；
+2. 或直接 `nvram boot-args="… amfi_get_out_of_my_way=1"` + `codesign --entitlements com.apple.wlan.authentication`
+   簽我們的 harness，讓 selector 1 過關，**實測那 13 bytes**。
