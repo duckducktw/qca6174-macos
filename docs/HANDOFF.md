@@ -3767,3 +3767,43 @@ BSD 單元一直是由 Apple 的 `start()` 發的那一顆，`attachInterface` �
 
 VM 仍是 v258（hand-built 預設、`ath10kpub=1` 可切權威路徑），`connected-wpa2`、
 `Current Wi-Fi Network: QCA-TEST`、ping 正常。
+
+### 6.59 第十九輪（v259）：CARD_CAPABILITIES 換成 AirportItlwm 權威表 —— 對 `-3903` 無效（已證偽）
+
+#### 6.59.1 改動
+
+`venturaCapabilities()` 預設改成 **AirportItlwm v2.2.0 `AirportSTAIOCTL.cpp:667-715` 的逐 byte 表**
+（`[0]=TKIP|AES_CCM`、`[1]=SHSLOT|SHPREAMBLE|WPA1|WPA2|TKIPMIC`、`[2]=0xFF`、`[3]=0x2B`、
+`[4]=0xAD`、`[5]=0x8C`、`[6]=0x8C`、`[7]=0x84`），舊的手工 BCM 推導值保留在 `ath10kcap=1`。
+新斷點 `Ath10kCapsTable` = `airportitlwm` / `apple-bcm-derived`。
+
+#### 6.59.2 量測（v259，sha256 `da28e15b…`）
+
+```
+Ath10kCapsTable = airportitlwm
+Ath10kCaps      = 0a 76 ff 2b ad 8c 8c 84 00 00 00
+refdump3 bind   → ref+0x54.. = 0a 76 ff 2b ad 8c 8c 84   （框架確實鏡像我們的能力回覆）
+                  ref+0x50 = 01、ref+0x51 = 00            （bit 0x40 仍為 0）
+cwjoin QCA-TEST en1（真密碼走 stdin，16 秒）→ assoc-error -3903
+   airportd trace 尾端：… g15:190:0 s10:190:0   （送完 SCAN_REQ 就停，沒有 s20）
+連線：connected-wpa2 / QCA-TEST / 192.168.77.75 / ping 2-2（沒有退化）
+```
+
+**結論：`ref+0x51` bit 0x40 不是由 CARD_CAPABILITIES 算出來的**，換成已知可用的權威表
+（AirportItlwm 在 Ventura 上真的能從 UI 連線）對 `-3903` **零影響**。這一條假設正式封閉。
+
+#### 6.59.3 下一步（唯一還沒做的一塊）
+
+`ref+0x50/0x51` 是 bind 期被寫入的「driver flags」，只能從 **userspace `IO80211.framework`**
+的 bind 流程反組譯出來。本輪已建 `tools/dump_bind.c`（dump `Apple80211BindToInterface`
+與 `…WithService` 周邊 0x20000 bytes 到 `/tmp/bind*.bin`），但**用 `dlsym` 位址 -0x400 起的
+dump 落在 stub/data 上，反組譯結果是亂碼**（`imul r9d,[r14+0x50],0x2f4c6351` 這種）。
+下一輪要換方法：先用 `nm -m`／`otool -tV` 的 `__TEXT` 位移抓真正的函式起點，或用
+「掃 `80 4? 51 40`（`or byte [reg+0x51], 0x40`）原始 byte pattern」再區域反組譯。
+位置線索：`Apple80211BindToInterface` 在這個 image 的 offset 0x1f602、
+`…WithService` 0x1f8d6（相對 base）。
+
+#### 6.59.4 現況
+
+VM = v259：hand-built 發佈、itlwm caps 預設、`ath10kcap=1`／`ath10kpub=1` 兩個 A/B 旋鈕，
+`connected-wpa2` 正常。可回滾 `/tmp/vk254`–`/tmp/vk259`。
