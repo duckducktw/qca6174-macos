@@ -3386,3 +3386,35 @@ driver 回覆算出來的**（很可能是 `IO80211Controller` 的 ivar／介面
 capability 鏡像從 `0x54` 開始（`0x50..0x53` 是 version=1，13 bytes 的回覆只帶到 caps[8]），
 所以這組「原生介面」判定必須由驅動在 bind 的那次 `CARD_CAPABILITIES`（type 0xc，長度 0xd）
 回覆裡給對，而不是在 userspace 補。
+
+#### 6.55.9 逐 IOC 探測表（fork 隔離，`scratch/iocs.c` → 待入 repo）
+
+```
+ioc   1 SSID              CRASH      ← 我們回的長度讓框架讀爆（要查）
+ioc   2 AUTH_TYPE         CRASH
+ioc   4 CHANNEL           CRASH
+ioc   9 BSSID             rc=0
+ioc  12 CARD_CAPABILITIES CRASH      ← 512 bytes 給太小？我們回 20 bytes
+ioc  13 STATE             rc=-3900   ← ★ 失敗
+ioc  14 PHY_MODE          CRASH
+ioc  15 OP_MODE           rc=-3900   ← ★ 失敗
+ioc  19 POWER             CRASH
+ioc  21 ASSOCIATE_RESULT  rc=-3900   ← 已知（離線時本來就會失敗）
+ioc  27 SUPPORTED_CHANNELS CRASH
+ioc  43 DRIVER_VERSION    rc=0
+ioc  44 HW_VERSION        rc=0
+ioc  50 ASSOCIATION_STATUS rc=-3900
+ioc  96 VIRTUAL_IF_ROLE   rc=-3900
+ioc  97 VIRTUAL_IF_PARENT rc=0
+ioc 103 CURRENT_NETWORK    CRASH
+```
+
+重點：
+- **STATE(13) 與 OP_MODE(15) 都是 `-3900`**。這兩個是「這個介面是不是可用 STA 介面」的基本宣告，
+  Apple 的 driver 一定回成功。回失敗很可能就是 `ref+0x51`/`ref+0x5d` 那組「原生介面」判定的來源。
+- 多個 getter 直接 SIGSEGV（1/2/4/12/14/19/27/103）：代表回覆長度或佈局讓框架越界讀。
+  這本身也是漆在牆上的字——Apple 期待的是固定大小的 `apple80211_*_data`。
+- 9/43/44/97 成功，說明 flat/versioned 佈局在那些型別上是對的。
+
+下一步（明確）：先補 `STATE` 與 `OP_MODE` 兩個 getter 的成功回覆，再重跑這張表與 `cwjoin`，
+看 `ref+0x51` bit 6 是否翻起來、`-3903` 是否變成 `-3905`。
