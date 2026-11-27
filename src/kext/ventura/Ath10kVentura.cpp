@@ -3366,6 +3366,13 @@ SInt32 Ath10kPCIDevice::venturaCapabilities(void *data)
     // join dies in userspace: airportd's client trace shows its requests ending at
     // s22 (Associate2's own cleanup disassociate) with no ASSOCIATE ever sent.
     bits[5] |= 0x08;            // buffer +0x09 bit 3 -> ref+0x59 bit 3
+    // Apple80211Associate2's RSN/CCMP dispatch (0xa773 / 0xa78b) refuses with the same
+    // 0xfffff0c1 unless bit 4 of [ref+0x59] is set, and ref+0x59 mirrors
+    // capabilities[5] (measured with tools/refflags.c: ref+0x54+i == capabilities[i],
+    // current reply 6f ee 73 a0 04 49 -> 0x49 lacks 0x10). Without this bit any join
+    // that carries an RSN dictionary dies in userspace in 0.0s, which is exactly the
+    // -3903 airportd reports (reproduced with tools/a2cipher.c).
+    bits[5] |= 0x10;            // buffer +0x09 bit 4 -> ref+0x59 bit 4
     if (IOService *probe = getProvider()) {
         char caps[sizeof(capabilities->capabilities) * 3 + 1];
         caps[0] = 0;

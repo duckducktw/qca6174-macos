@@ -3220,3 +3220,44 @@ authsels only（無 RSN_IE）/ no ie keys →  elapsed=10.2s rc=-3905 (0xfffff0b
 `bytes[0..2] = 0x6f 0xee 0x61|0x12` 與真卡回報的差異——把缺的 RSN 位補上，
 `-3903` 應該就會變成 `-3905`（也就是回到「只差完成事件」那條已知的線）。
 `tools/a2cipher.c` 可以直接重跑，用來確認位元補對沒。
+
+### 6.54 第四十八輪（v253）：`apple80211_ref` 的能力位圖量出來了，但補位還不足以放行
+
+#### 6.54.1 ref 佈局（`tools/refflags.c`，實測）
+
+```
+after bind  ref+0x40: 00×16 | 01 00 00 00 | 6f ee 73 a0 04 59 00 00 01 02 …
+                              ref+0x50      ref+0x54 = capabilities[0]
+```
+
+所以 **`ref + 0x54 + i == capabilities[i]`**（`CARD_CAPABILITIES` 回覆的 16 bytes 直接鏡像在 ref 裡），
+`ref+0x50` 是另一個 4-byte 欄位（=1，本輪確認不是能力位）。先前 §6.52 說「ref+0x59 ==
+capabilities[5]」是對的：0x59 - 0x54 = 5。
+
+`Associate2` 裡的 rbx = arg1 = ref，r12 = ref+4，所以：
+- `[r12+0x51]` = ref+0x55 = capabilities[1]
+- `[rbx+0x50]` = ref+0x50（非能力位）
+- `[rbx+0x59]` = capabilities[5]
+
+#### 6.54.2 v253 的改動與結果
+
+把 `capabilities[5] |= 0x10`（RSN/CCMP 那組 gate `0xa773`/`0xa78b` 要求 bit 4）：
+
+```
+Ath10kCaps = 6f ee 73 a0 04 59 00 00 01 02      ← 之前是 …04 49…
+cwjoin QCA-TEST en1 → 仍然 -3903
+Ath10kSetTrace      → 22 22 10×7 22 22 10      ← 仍然只有掃描與拆線
+a2cipher（RSN 字典）→ 仍然全部 -3903（0.0 秒）
+```
+
+**結論：bit 4 是必要但不足。** RSN 路徑上還有別的出口在擋，候選是：
+`0xa46d`（`test r15d,r15d` 為 0）、`0xafe5`（保底出口）、以及 cipher 跳表那組
+（`0xa62d`/`0xa8e3`/`0xa8fb`/`0xa913` 與 `0xa6f6`/`0xa72b`/`0xa743`/`0xa75b`，
+全部看 `[ref+0x50]` 的 bit 0/1/3）——但 `ref+0x50 = 1` 只滿足 bit 0。
+
+#### 6.54.3 下一輪（最短的一條）
+
+用 **lldb 跑我們自己的 `a2cipher`**（自己的 process，不受 SIP 偵錯限制）：
+`br s -n Apple80211Associate2` 之後用 `image lookup` 拿到 base，再對
+`base+0x93e7`、`base+0x9840`、`base+0xa46d`、`base+0xafe5` 下中斷點，看哪一個先命中——
+就能一次確定是哪個 gate，不必再靠字典變體猜。
