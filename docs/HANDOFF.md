@@ -3123,3 +3123,58 @@ cwjoin QCA-TEST en1                   -> assoc-error code=-3903（與 v251 相�
    `Apple80211Associate2` 的位置，以及那個位置之前的分支（`-3903` 的產生點）。
 2. 若確認它根本沒呼叫 Associate2，就往上一層找「誰決定不要送」——目前 log 只到
    `Will associate to [ssid=QCA-TEST, bssid=(null), channel=(channel=6, width=20), …, hasPassword=1]`。
+
+### 6.52 第四十七輪：`-3903` 的 14 個出口逐一標定 —— 它們是「介面能力位元」的門，不是參數錯誤
+
+#### 6.52.1 先把名字解出來
+
+`airportd` 的 `-[CWXPCSubsystem __associateToWiFiNetwork:…]` 找到 IMP = `0x100011c8f`
+（單一函式到 `ret 0x100013ac1`，中間 `0x100012886` 就是 `_Apple80211Associate2`
+的呼叫點；呼叫前若有 `capabilities containsObject:` 會先做一次
+`_Apple80211Set(ref, 0x1a6, 0, &val, 4)`）。同一個函式裡還看到
+`wifi_blacklist_ssid containsObject:` 的早退。
+
+`Apple80211Associate2` 裡用到的字典鍵（從 shared cache 的 `__cfstring` 解出）：
+`SSID / BSSID / FORCE_BSSID / CHANNEL / CHANNEL_FLAGS / AP_MODE / RSN_IE / WPA_IE /
+ASSOC_FLAGS / AUTH_SEL_OVERRIDE / IE_KEY_RSN_AUTHSELS / IE_KEY_RSN_UCIPHERS /
+IE_KEY_RSN_MCIPHER / IE_KEY_RSN_CAPS / IE_KEY_RSN_VERSION / IE_KEY_WPA_AUTHSELS /
+IE_KEY_WPA_MCIPHER / ALLOW_WPA2_PSK / ALLOW_OWE_TSN / WEP / WEP40 / WEPOPENSYSTEM /
+ASSOC_RET_OPEN_SYSTEM / ASSOC_RET_40_BIT_WEP / PRE_AUTH /
+FAST_ENTERPRISE_NETWORK{,_SUPPORTED_DEVICE} / FT_STATE / TRANS_DISABLED_FLAGS_ASSOC`。
+
+#### 6.52.2 14 個 `-3903` 出口（`tools/a2-3903-sites.py` 可重跑）
+
+```
+0x93e7   test r14,r14 / test byte [r12+0x51],0x40      ← 密語與 ref 的 PSK 能力位
+0x9840   AUTH_SEL_OVERRIDE 跳表第 8 格需要 [r12+0x59]&8
+0xa46d   test r15d,r15d（auth/cipher 沒解析出來就再見）
+0xa62d..0xa913  一組「每種 cipher/auth 各一格」的能力位檢查：
+                [rbx+0x50] 的 bit1 / bit2 / bit8、[rbx+0x59] 的 bit0x10
+0xafe5   最後的保底出口
+```
+
+也就是說：**Associate2 在碰到驅動之前，先拿介面物件的 cipher/auth 位圖對照字典裡
+要求的加密法**；位圖沒有該位就回 `-3903`，一個 IOCTL 都不會發。這解釋了為什麼
+airportd 的錯誤是 `-3903`（能力位不足），而我們自己的 harness 是 `-3905`（位圖過關、
+真的打到驅動但等不到完成事件）。
+
+#### 6.52.3 反證實驗（`tools/a2auth.c`，v252 上實跑）
+
+把 `AUTH_SEL_OVERRIDE` 從 1 掃到 12（涵蓋跳表全部 12 格）各打一次
+`Apple80211Associate2`：
+
+```
+authsel=1..12  →  全部 elapsed=10.2s rc=-3905 (0xfffff0bf) errno=60
+```
+
+**12/12 都沒有變成 `-3903`** → 我們這顆 ref 的 `+0x51`/`+0x59` 位圖是過關的，
+`AUTH_SEL_OVERRIDE` 這條不是 airportd 卡住的地方。落點只剩 `0xa62d..0xa913`
+那組「cipher/auth × 能力位」的門，而 airportd 的字典帶了完整的 RSN IE
+（`IE_KEY_RSN_MCIPHER`/`UCIPHERS`/`AUTHSELS`），選到的加密法可能正是我們沒宣告的那一格。
+
+#### 6.52.4 下一輪（明確）
+
+逐一餵 `IE_KEY_RSN_MCIPHER` / `IE_KEY_RSN_UCIPHERS` / `IE_KEY_RSN_AUTHSELS` 的
+WPA2-PSK 組合給 `a2auth`，看哪一組會把回傳從 `-3905` 翻成 `-3903`；
+翻過去的那一組就是我們缺的能力位，對應到驅動端要補的 `CARD_CAPABILITIES`／
+cipher 支援表。
