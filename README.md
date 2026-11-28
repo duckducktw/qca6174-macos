@@ -166,7 +166,7 @@ make NATIVE=1 DIAGNOSTIC_STAGE=0 -j2 kext
 
 `DIAGNOSTIC_STAGE=3` builds the controller-only diagnostic, which stops before radio start-up; it is
 not a Wi-Fi driver. `NATIVE=0` keeps the historical Ethernet-backed implementation for development.
-Windows cross-compilation: [docs/windows-build.md](docs/windows-build.md).
+Windows cross-compilation: [docs/archive/windows-build.md](docs/archive/windows-build.md).
 
 ```sh
 python3 scripts/audit-native-callbacks.py --check
@@ -200,7 +200,7 @@ most of the reverse engineering above could be measured instead of guessed.
 | [INITIAL-POWER-CONTRACT.md](INITIAL-POWER-CONTRACT.md) | power-on ordering and recovery |
 | [NATIVE-CONNECTION-AUDIT.md](NATIVE-CONNECTION-AUDIT.md) · [OFFLINE-VALIDATION-ERRATUM.md](OFFLINE-VALIDATION-ERRATUM.md) | connection audit, limits of offline validation |
 | [docs/hardware-verification.md](docs/hardware-verification.md) | what was verified on which machine, and how |
-| [docs/legacy-background.md](docs/legacy-background.md) · [docs/native-sequoia.md](docs/native-sequoia.md) | project history, the Sequoia line |
+| [docs/archive/](docs/archive/) | project history, the Sequoia line |
 
 ### Limitations we do not hide
 

@@ -4,15 +4,16 @@ Everything in this folder is engineering documentation for Ath10kMac — the rev
 Apple's Wi-Fi stack, the contracts this driver implements, and the measurements behind every claim in
 the [README](../README.md).
 
-If you are new here, read in this order:
+## Read first
 
 | # | Document | Why |
 |---|---|---|
-| 1 | [handoff-apple-join-conditions.md](handoff-apple-join-conditions.md) | **The core document.** Every condition Apple requires before it admits a join — airportd → `Apple80211Associate2` → `IO80211Family` → driver — with the disassembly address and the measured value for each. Also the community comparison (AirportItlwm) and the exact point the project is stuck on. |
+| 0 | [handoff-current-status.md](handoff-current-status.md) | **Entry point.** Where the project actually is: verified numbers with their source, the eight rules that must not be broken and why, the traps, the open work with acceptance criteria, and the runbook. |
+| 1 | [handoff-apple-join-conditions.md](handoff-apple-join-conditions.md) | **The core engineering problem.** Every condition Apple requires before it admits a join — airportd → `Apple80211Associate2` → `IO80211Family` → driver — with the disassembly address and the measured value for each, plus the comparison against AirportItlwm. |
 | 2 | [apple-vs-ours.md](apple-vs-ours.md) | Per-API diff: what the live stack expects vs. what this driver answers, and which of the two was wrong. |
 | 3 | [reverse-engineering-playbook.md](reverse-engineering-playbook.md) | Toolchain and method: dumping a function out of the dyld shared cache, decoding chained fixups, resolving `__cfstring`/selref, reading a vtable by the right offset rule, and the traps that cost whole rounds. |
 | 4 | [join-flow-reverse.md](join-flow-reverse.md) | The userspace call chain of one join, down to `Apple80211Associate2` and its own two `-3903` exits. |
-| 5 | [HANDOFF.md](HANDOFF.md) | The full engineering log, round by round (currently 44 rounds), with the measurement that justified each change. Long, but it is the audit trail. |
+| 5 | [HANDOFF.md](HANDOFF.md) | The round-by-round engineering log (77 rounds, §6.1–§6.67), with the measurement that justified each change. Long; read it for backstory, not for current state. |
 
 ## Reference by topic
 
@@ -38,15 +39,15 @@ If you are new here, read in this order:
 
 | Document | Contents |
 |---|---|
-| [legacy-background.md](legacy-background.md) | The Ethernet-backed era of this project. |
-| [native-sequoia.md](native-sequoia.md) | The Sequoia native line and its ABI work. |
-| [HANDOFF-v84.md](HANDOFF-v84.md) | Snapshot of the handoff at v84, kept for diffing. |
+| [archive/legacy-background.md](archive/legacy-background.md) | The Ethernet-backed era of this project. Dead code path, kept for context. |
+| [archive/native-sequoia.md](archive/native-sequoia.md) | The Sequoia native line and its ABI work. The live target is Ventura 13.7. |
+| [archive/HANDOFF-v84.md](archive/HANDOFF-v84.md) | Snapshot of the handoff at v84 (2026-11-23). Superseded by [handoff-current-status.md](handoff-current-status.md). |
 
-### Per-machine notes
+### Test rig
 
 | Document | Contents |
 |---|---|
-| [windows-build.md](windows-build.md) | Cross-compiling the kext from Windows. |
+| [archive/windows-build.md](archive/windows-build.md) | Cross-compiling the kext from Windows. Not the path in use: builds run on the Acer host. |
 | [hostapd-qca.conf](hostapd-qca.conf) | The test AP used for every measurement in the log. |
 
 ## Reusable tools
@@ -74,3 +75,19 @@ All measurement tools live in [`../tools/`](../tools). The ones that matter most
   function — that mistake cost a round.
 - **`Ath10k*` ioreg properties** are the interface between the driver and this documentation. When a
   document says "measured", it means one of those properties or a serial line.
+
+## Where things live
+
+```
+docs/
+  README.md                        this index
+  handoff-current-status.md         entry point — read this first
+  handoff-apple-join-conditions.md  the open engineering problem, layer by layer
+  HANDOFF.md                       round-by-round log (§6.x), audit trail
+  apple-vs-ours.md                 per-API diff against the live stack
+  join-flow-reverse.md             one join, userspace to driver
+  reverse-engineering-playbook.md  how the reversing was done
+  hardware-verification.md         what was verified on which machine, `Ath10k*` property list
+  hostapd-qca.conf                 the test AP every measurement in the log came from
+  archive/                         superseded and off-target documents (see the History table)
+```
