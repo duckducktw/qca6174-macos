@@ -4008,3 +4008,50 @@ ping 1.1.1.1                                          → 2/2
 - 開機自動連線：可用（`connected-wpa2`、可上網）。
 - 使用者從 UI／`networksetup` 點連線：**會連上**，但完成者仍是驅動看門狗（約 20 秒）。
 - 尚未達成：airportd 自己把 assoc 走完（`AssocWho=airportd`）。
+
+### 6.65 第廿五輪（v282）：掃描緩衝修好 —— power cycle 後客戶端又看得到網路
+
+#### 6.65.1 症狀與量測
+
+power cycle（`networksetup -setairportpower en1 off/on`）之後：
+
+```
+Ath10kBSSCount = 22   Ath10kScanCached = 22     ← 驅動快取完好
+cwscan en1 → interface=en1 power=1 / networks=0  ← 客戶端卻拿到 0 個
+networksetup -setairportnetwork → "Could not find network QCA-TEST"
+```
+
+也就是**快取沒被清掉，壞的是共用游標**：掃描管理器把 `SCAN_RESULT` 讀到 end-of-list
+（`Ath10kScanServed=259`、`Ath10kScanEnds=52`），客戶端第一次讀就撞到 `EIO`（end marker），
+於是「找不到網路」。
+
+#### 6.65.2 修法
+
+`APPLE80211_IOC_SCAN_REQ` / `_MULTIPLE` 進來時，先把共用游標歸零再交 `venturaScan()`：
+
+```cpp
+case APPLE80211_IOC_SCAN_REQ:
+case APPLE80211_IOC_SCAN_REQ_MULTIPLE: {
+    _venturaScanIndex = 0;
+    for (UInt32 i = 0; i < kVenReaderSlots; ++i) _venturaReaders[i].index = 0;
+    probe->setProperty("Ath10kScanRewind", "on-scan-req");
+    return venturaScan(static_cast<apple80211_scan_data *>(data));
+}
+```
+
+（先前只有 scan-manager 完成時 rewind，power cycle 讓 manager 那條跑不完，游標就卡在尾端。）
+
+#### 6.65.3 驗收（v282）
+
+```
+Ath10kScanRewind = "on-scan-req"
+cwscan en1 → 列出附近網路（Mars的 iPhone ch6 -79、Smartphone_connect_1c3b92 ch6 -80 …），含 QCA-TEST
+networksetup -setairportnetwork en1 QCA-TEST <psk> → 約 20 秒後
+Ath10kConnectionState = connected-wpa2 / AutoJoinPhase = up / status: active
+```
+
+#### 6.65.4 仍然不是 airportd 自己完成的關聯
+
+`Ath10kAssocWho = pid=0 name=kernel_task`、`Ath10kAssocKick = watchdog-only`：
+airportd 送 `ASSOCIATE(20)` 後，驅動立刻用它自己那套（OPEN + WPA2-PSK）完成；
+airportd 帶的 `rsnlen=22 / keylen=32` 那份 request 本身仍不會完成。

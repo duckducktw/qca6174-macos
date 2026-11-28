@@ -2542,8 +2542,19 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
     case APPLE80211_IOC_COUNTRY_CODE:
         return venturaCountryCode(data, isSet);
     case APPLE80211_IOC_SCAN_REQ:
-    case APPLE80211_IOC_SCAN_REQ_MULTIPLE:
+    case APPLE80211_IOC_SCAN_REQ_MULTIPLE: {
+        // The scan manager and the client share one result cursor; after a radio
+        // cycle the manager's sweep may not run to completion, leaving the cursor at
+        // end-of-list so the client's first SCAN_RESULT read returns EIO (measured:
+        // cwscan "networks=0" with Ath10kBSSCount still 22, then networksetup
+        // "Could not find network"). Rewind before every scan.
+        _venturaScanIndex = 0;
+        for (UInt32 i = 0; i < kVenReaderSlots; ++i)
+            _venturaReaders[i].index = 0;
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kScanRewind", "on-scan-req");
         return venturaScan(static_cast<apple80211_scan_data *>(data));
+    }
     case APPLE80211_IOC_SCAN_RESULT: {
         // Every reader gets its own position in the last sweep. airportd retries the
         // read inside one scan, a tool like apple80211-scan walks it once, and the
@@ -2578,6 +2589,7 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
     case APPLE80211_IOC_SCANCACHE_CLEAR:
         _venturaScanIndex = 0;
         return kIOReturnSuccess;
+
     case APPLE80211_IOC_VIRTUAL_IF_CREATE:
     case APPLE80211_IOC_VIRTUAL_IF_DELETE:
         // airportd asks for a virtual interface in the run-up to a join and gave up
@@ -2602,8 +2614,23 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         // SoftAP are 1..5), and this interface has no virtual parent, so the
         // zero-filled buffer is the correct answer for both.
         return kIOReturnSuccess;
-    case APPLE80211_IOC_ASSOCIATE:
-        return venturaAssociate(static_cast<apple80211_assoc_data *>(data));
+    case APPLE80211_IOC_ASSOCIATE: {
+        // airportd's own apple80211_assoc_data (measured rsnlen=22, keylen=32) does not
+        // complete on this firmware path, while the watchdog's plain OPEN + WPA2-PSK
+        // request does. Running both at once made them race: the link came up and then
+        // dropped (AutoJoinPhase "assoc=no", ConnectionState disabled). So hand the
+        // join to the watchdog only - no direct venturaAssociate() from airportd's
+        // parameters - and fire it now instead of waiting for the 30 s tick.
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kAssocKick", "watchdog-only");
+        if (_venturaAutoJoinCall == nullptr) {
+            _venturaAutoJoinCall = thread_call_allocate_with_options(
+                venturaAutoJoinCall, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+        }
+        if (_venturaAutoJoinCall != nullptr)
+            thread_call_enter(_venturaAutoJoinCall);
+        return kIOReturnSuccess;
+    }
     case APPLE80211_IOC_DISASSOCIATE:
     case APPLE80211_IOC_DEAUTH:
         venturaDisassociate(requestNumber == APPLE80211_IOC_DEAUTH);
