@@ -288,6 +288,10 @@ void Ath10kVenturaInterface::noteUserClientAttempt(UInt32 type)
 // is published as Ath10kVifEventPipe; if it is still null the open is refused
 // instead of panicking, so airportd falls back to the ifnet ioctl channel
 // (performCommand) the way v113-v120 ran.
+// Live symbol: IO80211SkywalkInterface::createEventPipe(IO80211APIUserClient*).
+extern "C" bool ath10kSkywalkCreateEventPipe(IO80211VirtualInterface *self, IOUserClient *client)
+    __asm("__ZN23IO80211SkywalkInterface15createEventPipeEP20IO80211APIUserClient");
+
 IOReturn Ath10kVenturaInterface::newUserClient(task_t owningTask, void *securityID,
                                                UInt32 type, OSDictionary *properties,
                                                IOUserClient **handler)
@@ -307,6 +311,18 @@ IOReturn Ath10kVenturaInterface::newUserClient(task_t owningTask, void *security
                            result == kIOReturnSuccess ? "created" : "failed");
     if (result != kIOReturnSuccess || client == nullptr)
         return kIOReturnUnsupported;
+    // Give this client an event pipe on the vif. Without one, postMessageIOUC finds
+    // no entry in [vif+0x110]->[+0x208] and returns kIOReturnUnsupported, so
+    // ASSOC_DONE/LINK_CHANGED never reach the waiter (measured: Ath10kEventPipes=0
+    // with 9 clients attached, and every post returning e00002c7).
+    {
+        const bool piped = ath10kSkywalkCreateEventPipe(vif, client);
+        if (probe != nullptr) {
+            probe->setProperty("Ath10kPipeCreated", piped ? "yes" : "no");
+            probe->setProperty("Ath10kEventPipes",
+                               static_cast<UInt64>(owner->_venturaEventPipe != nullptr ? 1 : 0), 32);
+        }
+    }
     *handler = client;
     return kIOReturnSuccess;
 }

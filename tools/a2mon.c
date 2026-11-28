@@ -71,7 +71,12 @@ int main(int argc, char **argv)
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = A2(ref, d, pw, NULL);
+    /* 4th argument must be a real mutable dictionary (airportd passes
+       [NSMutableDictionary dictionaryWithCapacity:0]); NULL hits the early
+       test r14,r14 exit and returns -3903 without reaching the IOCTL. */
+    CFMutableDictionaryRef out = CFDictionaryCreateMutable(NULL, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    int rc = A2(ref, d, pw, out);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     printf("assoc2 rc=%d (0x%08x) elapsed=%.1fs\n", rc, (unsigned)rc,
            (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);

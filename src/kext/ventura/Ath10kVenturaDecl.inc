@@ -265,6 +265,11 @@ private:
     // [iframeIvars+0x208]: the event pipe Skywalk registration would install. Read
     // (never written) here so "events cannot be delivered" is a measurement.
     void *_venturaEventPipe = nullptr;
+    // Deferred assoc/link event posting (see runLinkEventPost).
+    thread_call_t _linkEventCall = nullptr;
+    bool _venturaLinkUpPending = false;
+    static void linkEventCall(thread_call_param_t, thread_call_param_t);
+    void runLinkEventPost();
     bool _venturaScanNotifySent = false;
     // The radio is up from the moment the firmware boots, so report it as on from
     // the first POWER get: measured with this false, airportd's own state machine

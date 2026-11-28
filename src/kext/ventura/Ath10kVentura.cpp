@@ -4,7 +4,6 @@
 // transmit path, power/state reporting and the apple80211 request dispatcher
 // that airportd uses for everything the Wi-Fi UI shows.
 #include "Ath10kVenturaABI.hpp"
-#include "Ath10kInfraInterface.hpp"
 #include <net/kpi_interface.h>
 #include <net/if_dl.h>
 
@@ -2493,7 +2492,36 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_CARD_CAPABILITIES:
-        return venturaCapabilities(data);
+        // The family's own bind-time query (Apple80211RawGet type 0xc) passes a
+        // 13-byte buffer at ref+0x50 and the gate that decides -3903 reads
+        // byte[1] bit 0x40 of that buffer. Writing apple80211_capability_data
+        // (version first) shifts every capability by 4 bytes, so the bit never
+        // lands where the gate looks. Answer a short request with the raw
+        // capability bytes and no version field.
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kCapsLen", static_cast<UInt64>(_venturaIoctlLength), 32);
+        // Always answer with capabilities[] at offset 0. The family parks this reply
+        // at ref+0x50 and the Apple80211Associate2 gate reads byte[1] bit 0x40 there;
+        // a version-prefixed apple80211_capability_data shifts every capability by 4
+        // bytes and the bit never lands (measured: 13-byte query -> ref+0x51=0x76 with
+        // the bit set, 52-byte query -> version byte, gate fails with -3903).
+        {
+            apple80211_capability_data caps;
+            memset(&caps, 0, sizeof(caps));
+            const SInt32 st = venturaCapabilities(&caps);
+            if (data != nullptr && _venturaIoctlLength != 0) {
+                UInt8 *dst = static_cast<UInt8 *>(data);
+                const UInt32 n = _venturaIoctlLength < sizeof(caps.capabilities)
+                                     ? _venturaIoctlLength
+                                     : static_cast<UInt32>(sizeof(caps.capabilities));
+                for (UInt32 i = 0; i < n; ++i) dst[i] = caps.capabilities[i];
+                if (IOService *probe = getProvider())
+                    probe->setProperty("Ath10kCapsShape", "caps-at-0");
+            } else if (data != nullptr) {
+                memcpy(data, &caps, sizeof(caps));
+            }
+            return st;
+        }
     case APPLE80211_IOC_SUPPORTED_CHANNELS:
     case APPLE80211_IOC_HW_SUPPORTED_CHANNELS:
         return venturaSupportedChannels(data);
@@ -3898,6 +3926,23 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
     }
     if (*ivarsSlot != nullptr)
         *reinterpret_cast<UInt32 *>(reinterpret_cast<char *>(*ivarsSlot) + 0x50) = 1;
+    // Stamp the vif's BSD name. Every event post (postMessage -> postMessageInternal ->
+    // postMessageIOUC) re-derives the name through getBSDName(), which returns the
+    // string at [ivars+0x110]+1 and nothing else for a vif (it has no ifnet). Left empty,
+    // all posts return 0xe00002c7 and the client never sees ASSOC_DONE - measured as
+    // Ath10kVifBsdName="" plus Ath10kLinkPost "link=e00002c7 assoc=e00002c7".
+    {
+        char *nameIvars = *reinterpret_cast<char **>(reinterpret_cast<char *>(vif) + 0x110);
+        const char *unit = "en1";
+        if (_venturaInterface != nullptr) {
+            if (OSString *n = OSDynamicCast(OSString, _venturaInterface->getProperty("IOInterfaceName")))
+                unit = n->getCStringNoCopy();
+        }
+        if (nameIvars != nullptr) {
+            strlcpy(nameIvars + 1, unit, 16);
+            if (probe) probe->setProperty("Ath10kVifBsdNameStamp", unit);
+        }
+    }
     // The userspace filter that decides whether airportd keeps an interface reads
     // the IORegistry property "IO80211InterfaceRole" and requires the string
     // "Infrastructure" (recovered from Apple80211's constant CFStrings). Writing
@@ -3977,17 +4022,6 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
         if (probe)
             probe->setProperty("Ath10kCtrlPrimaryBefore",
                                primaryBefore != nullptr ? "non-null" : "null");
-        // The Skywalk-side interface airportd needs never existed: create it once,
-        // attach it to the controller, and let its newUserClient hand out the
-        // family's Apple80211 client (HANDOFF 6.62/6.63). Without this the family
-        // has no IO80211SkywalkInterface to bind, so Apple80211BindToInterfaceWith
-        // Service fails with -3900 and ref+0x50 keeps the assoc bit clear.
-        if (_venturaInfra == nullptr) {
-            _venturaInfra = Ath10kInfraInterface::createAndAttach(this, this);
-            if (probe)
-                probe->setProperty("Ath10kInfraCreated",
-                                   _venturaInfra != nullptr ? "yes" : "no");
-        }
         if (ctrlIvars != nullptr && primaryBefore == nullptr && *ivarsSlot != nullptr) {
             // Role 6 is what the station path in the family accepts (6 and 7 are the
             // only values IO80211VirtualInterface::newUserClient takes as well).
@@ -4126,6 +4160,17 @@ void Ath10kPCIDevice::venturaPostLinkEvents(bool up)
             unit = n->getCStringNoCopy();
     }
     strlcpy(ifname, unit != nullptr ? unit : "en1", sizeof(ifname));
+    // Inline IOUC posting here is what made v266/v267/v268 unloadable: this runs on
+    // the association-completion path, where the event pipe is not safe to walk. The
+    // scan-done path proves the same call works when it is deferred to a thread call,
+    // so record the state and let the thread-call worker do the posting.
+    _venturaLinkUpPending = up;
+    if (_linkEventCall == nullptr) {
+        _linkEventCall = thread_call_allocate_with_options(
+            linkEventCall, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+    }
+    if (_linkEventCall != nullptr)
+        thread_call_enter(_linkEventCall);
     const int kevLink = ath10kInterfacePostMessage(ifname, APPLE80211_M_LINK_CHANGED, nullptr, 0, this);
     const int kevAssoc = up ? ath10kInterfacePostMessage(ifname, APPLE80211_M_ASSOC_DONE, nullptr, 0, this) : 0;
     if (probe != nullptr) {
@@ -4238,6 +4283,48 @@ void Ath10kPCIDevice::runEventSweep()
         clock_interval_to_deadline(200, kMillisecondScale, &deadline);
         thread_call_enter_delayed(_eventSweepCall, deadline);
     }
+}
+
+void Ath10kPCIDevice::linkEventCall(thread_call_param_t param0, thread_call_param_t)
+{
+    auto *self = static_cast<Ath10kPCIDevice *>(param0);
+    if (self != nullptr)
+        self->runLinkEventPost();
+}
+
+// Same shape as runEventSweep: a thread-call context + the named-IOUC channel the
+// client's pipes are keyed on. Posting LINK_CHANGED/ASSOC_DONE from here instead of
+// inline is the difference between a working kext and a load failure (v266-v268).
+void Ath10kPCIDevice::runLinkEventPost()
+{
+    IOService *probe = getProvider();
+    if (probe == nullptr || _venturaVif == nullptr)
+        return;
+    const char *name = ath10kVifGetBSDName(_venturaVif);
+    char fallback[16] = "en1";
+    if (name == nullptr || name[0] == 0) {
+        if (OSString *n = OSDynamicCast(OSString, _venturaInterface != nullptr
+                                                     ? _venturaInterface->getProperty("IOInterfaceName")
+                                                     : nullptr))
+            strlcpy(fallback, n->getCStringNoCopy(), sizeof(fallback));
+        name = fallback;
+    }
+    // The controller's own fan-out is the other documented route; Apple's drivers use it
+    // for messages that are not tied to a virtual interface.
+    ath10kControllerPostMessage(this, APPLE80211_M_LINK_CHANGED, nullptr, 0, nullptr);
+    if (_venturaLinkUpPending)
+        ath10kControllerPostMessage(this, APPLE80211_M_ASSOC_DONE, nullptr, 0, nullptr);
+    const IOReturn link = ath10kVifPostMessageIOUC(_venturaVif, name, APPLE80211_M_LINK_CHANGED, nullptr, 0);
+    IOReturn assoc = kIOReturnSuccess;
+    if (_venturaLinkUpPending) {
+        assoc = ath10kVifPostMessageIOUC(_venturaVif, name, APPLE80211_M_ASSOC_DONE, nullptr, 0);
+        ath10kVifPostMessageIOUC(_venturaVif, name, APPLE80211_M_RSN_HANDSHAKE_DONE, nullptr, 0);
+    }
+    char note[96];
+    snprintf(note, sizeof(note), "link=%x assoc=%x name=%s up=%d",
+             static_cast<unsigned>(link), static_cast<unsigned>(assoc), name,
+             _venturaLinkUpPending ? 1 : 0);
+    probe->setProperty("Ath10kLinkPost", note);
 }
 
 void Ath10kPCIDevice::runScanNotify()

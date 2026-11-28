@@ -72,8 +72,7 @@ MINOS := -mmacosx-version-min=13.0
 # corecrypto (cchmac/ccsha256) plus the P-256 binding, both of which resolve in
 # the Ventura personality too, so the same objects are linked here.
 VENTURA_OBJECT := $(BUILD_DIR)/Ath10kVentura.o $(BUILD_DIR)/Ath10kVenturaInterface.o $(BUILD_DIR)/Ath10kVenturaUserClient.o \
-                  $(BUILD_DIR)/Ath10kSAEWorker.o $(BUILD_DIR)/Ath10kSAESession.o $(BUILD_DIR)/Ath10kPMFSession.o \
-                  $(BUILD_DIR)/Ath10kInfraInterface.o
+                  $(BUILD_DIR)/Ath10kSAEWorker.o $(BUILD_DIR)/Ath10kSAESession.o $(BUILD_DIR)/Ath10kPMFSession.o
 endif
 
 ifeq ($(NATIVE),1)

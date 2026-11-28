@@ -3933,3 +3933,51 @@ VM = v262（`Ath10kReqLog` 在），boot-args 8 token（已無 amfi），`connec
    supplicant 必須 false、caps byte 佈局）、已封閉的八條路、三條剩下的路（A 手動 attach airportd／
    B 全關 SIP／C 以自帶 join 為成品）、精確 runbook、七條陷阱。
    **新 session 先讀那一份，`HANDOFF.md` 只當逐輪歷史。**
+
+### 6.64 第廿四輪（v271–v278）：**打通** —— airportd 自己送出 ASSOCIATE 並完成關聯
+
+#### 6.64.1 結果（可重現的驗收）
+
+```
+networksetup -getairportnetwork en1  →  Current Wi-Fi Network: QCA-TEST
+Ath10kAssocWho  = pid=181 name=airportd     ← 不是 kernel_task，是 airportd 自己發的
+Ath10kSetTrace  … 20:181:0:e1               ← ASSOCIATE(20) 來自 airportd
+Ath10kIfaceLink = iface-link=1 ok=1
+Ath10kConnectionState = connected-wpa2
+ifconfig en1 → status: active
+ping 1.1.1.1 → 2/2
+```
+也就是「使用者按連線」那條路徑**首次真正完成**：不是驅動偷偷連，而是 airportd 判定介面合格後自己送
+ASSOCIATE，系統也正確回報連上哪個網路。
+
+#### 6.64.2 這一輪修掉的四個獨立缺陷（每個都有可觀測的狀態變化）
+
+1. **kext 載不起來（v265–v270 全部）**：`Makefile` 的 `VENTURA_OBJECT` 已移除 `Ath10kInfraInterface.o`，
+   但 `Ath10kVentura.cpp` 還在呼叫 `Ath10kInfraInterface::createAndAttach`。`nm -u` 一比就只剩這一個
+   未解析符號 → 移除呼叫與 include 後恢復載入（`en1` 回來、序列埠 471 行 `Ath10kMac`）。
+   **判準**：`kmutil showloaded | grep -c Ath10k`、`grep -ac Ath10kMac /tmp/ventura-vm.serial`，不是 `make` 的訊息。
+2. **vif 沒有 BSD name**：`getBSDName()` 讀 `[ivars+0x110]+1`（`0x2000a28`：`cmp byte [rax+1],0`）。
+   publish 時寫入單元名後 `Ath10kVifBsdName` 由 `""` → `en1`。
+3. **event pipe 陣列是空的**：9 個 `IO80211APIUserClient` 掛在 vif 下，但 `Ath10kEventPipes = 0`，
+   所以 `postMessageIOUC`（`0x2000fd8`）永遠在 `0x2001126` 回 `0xe00002c7`。
+   在 `Ath10kVenturaInterface::newUserClient` 拿到 client 後呼叫
+   `IO80211SkywalkInterface::createEventPipe(client)` → pipe 數 0 → 24，投遞回傳值 `e00002c7` → `0`。
+4. **能力回覆的形狀（打通關鍵）**：family 在 bind 時用 13 bytes 問 `CARD_CAPABILITIES`，join 時用 52/32 bytes。
+   舊的 `apple80211_capability_data` 把 `version` 放在最前面，所有 capability 位移 4 bytes，
+   放在 `ref+0x50` 的那塊 `byte[1]` 永遠拿不到 `0x40`（= `APPLE80211_CAP_WPA2`）→ `Associate2` 回 `-3903`。
+   **改成：caps 一律從 offset 0 開始寫（不加 version）**，`Ath10kCapsShape = "caps-at-0"`；
+   `refdump3` 立即看到 `bind … 0a 76 ff 2b …`（`ref+0x51 = 0x76`，bit 0x40 已設）。
+
+#### 6.64.3 過程中確認的錯誤方向（別再走）
+
+- `ath10knoauto=1`（關掉驅動自帶 join）：反而退回 `-3903`，已還原。
+- 在 52-byte 回覆裡硬 `byte[1] |= 0x40`：無效（那條路的 buffer 不是 `ref+0x50`）。
+- airportd 的 unified logger 起不來（`Unable to initialize unified logger`），所以 `log show` /
+  `/var/log/wifi.log` 看不到後續資訊；要診斷請用 `networksetup -setairportnetwork` 的錯誤字串＋驅動 property。
+
+#### 6.64.4 旋鈕與可回滾
+
+- 新增斷點：`Ath10kCapsShape`、`Ath10kCapsLen`、`Ath10kPipeCreated`、`Ath10kEventPipes`、
+  `Ath10kVifBsdName[Stamp]`、`Ath10kLinkPost`、`AssocWho`。
+- bundle：`/tmp/vk262`（舊可用）、`/tmp/vk271`–`/tmp/vk278` 全部留著，v278 = 打通版。
+- boot-args 目前 8 token（已無 `ath10knoauto`、無 `amfi_get_out_of_my_way`）。
