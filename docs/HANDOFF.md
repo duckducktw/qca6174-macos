@@ -4077,3 +4077,80 @@ airportd 帶的 `rsnlen=22 / keylen=32` 那份 request 本身仍不會完成。
 留著的部分（都已部署、無害）：控制器 `setLinkStatus` 現在帶 speed、介面屬性 `IO80211LinkRate/
 LinkQuality`、以及 `APPLE80211_IOC_RATE` 回真值 + `Ath10kRateIoc` 斷點。等哪天 airportd 自己完成
 4-way，這三個面會一起生效。
+
+### 6.67 第廿七輪（v287–v293）：20 dBm 發射功率 —— 一個欄位同時管兩件事，改壞了才知道
+
+#### 6.67.1 先量真實吞吐（原本以為天花板是 72 Mbps）
+
+| 次數 | 結果 |
+|---|---|
+| 1 | 10,962,176 B/s ≈ **87.7 Mbps** |
+| 2 | 10,530,583 B/s ≈ **84 Mbps**（ping 3/3，約 6 ms） |
+| 3–4 | 6.4 / 5.6 MB/s（同一條線，波動大） |
+
+三件事因此確定：**HT20-1SS 只是我們的標籤，不是真實鏈路**（88 Mbps 已超過 HT20-1SS 的 72 Mbps 上限），
+所以先前「效能約 1/12」的估計偏保守；`Ath10kConnectionPHY` 與 `APPLE80211_IOC_RATE` 都是低估的。
+
+#### 6.67.2 10 dBm 的真正來源（三層追下去）
+
+`Ath10kVentura.cpp` 的 `s.txPowerHalfDbm = 20` 只是表層，實際夾鉗走：
+
+`stationPowerLimitFor()` → `regulatoryPower()` → `min(countryPower, boardCountry, ceilingHalfDbm)`
+
+真正的鎖在 `Ath10kRegulatory.hpp`：`UInt8 ceilingHalfDbm=20;`（10 dBm）＋驗證器拒絕 `>20`。
+
+#### 6.67.3 改了之後無線電整個起不來（v289–v292 的假線索）
+
+把 `ceilingHalfDbm` 拉到 40（20 dBm）後，裝置卡在：
+
+```
+Ath10kWMIRuntimeStatus = "radio-build"
+Ath10kAutoJoinPhase    = "waiting-wmi"
+ConnectionState        = "disabled"      PHY = "legacy"
+Ath10kWmiLive          = "active"（舊字串，會騙人）
+Ath10kAutoJoinRuns     = 1               Ath10kAutoJoinSawWmi = "no"
+```
+
+**根因**：`ceilingHalfDbm` 是**一個欄位管兩件事** —— 除了 assoc 夾鉗，它還被當成
+`buildWMIRadio()` 的韌體 radio 功率參數（`Ath10kPCIDevice.cpp:3041`），而該 TLV 的驗證
+（`Ath10kWMI.hpp:319`）明確要求 `mask<=20`：
+
+```cpp
+(param<=2) ? (mask!=1 && mask!=3 && mask!=7) : (!mask || mask>20)   // 40 → return false
+```
+
+`buildWMIRadio()` 回 false → `if(!built) return state.status;` → runtime 永遠停在 `radio-build`，
+WMI 從未 active，watchdog 每次都只能回 `waiting-wmi`。
+
+#### 6.67.4 修法（v293）：把兩個用途拆開
+
+```cpp
+UInt8 ceilingHalfDbm=20;        // 韌體 radio TX 功率（buildWMIRadio 驗證 <=20，即 10 dBm）
+UInt8 powerCeilingHalfDbm=40;   // 我們自己 candidate 的 assoc 夾鉗（20 dBm）
+```
+
+`regulatoryPower()` 與 `stationPowerLimitFor()` 改讀 `powerCeilingHalfDbm`，韌體參數維持 20 不動。
+
+驗證（v293，`c5308efd…`）：
+
+```
+Ath10kWMIRuntimeStatus = "active-msi-worker"
+Ath10kConnectionState  = "connected-wpa2"
+Ath10kConnectionPHY    = "HT20-1SS"
+Ath10kTxPowerApplied   = "halfDbm=40 (20 dBm)"   ← 20 dBm 終於真的送出去了
+Current Wi-Fi Network  = QCA-TEST     ping 4/4，avg 7.0 ms
+```
+
+#### 6.67.5 順手挖到的另一個真 bug：watchdog 無法自我重排
+
+`runVenturaAutoJoin()` 在 `_wmiLive.active == false` 時會 `thread_call_enter_delayed()` 重排自己，
+但 **xnu 拒絕在自己執行中重排自己**，所以它只跑一次（實測 `Ath10kAutoJoinRuns=1`），
+之後永遠不再嘗試 —— 換成 `THREAD_CALL_OPTIONS_ONCE` → `0` 也沒用（同樣是自我重入問題）。
+現在改由每秒在跑的 WMI runtime timer 在 `LinkStage::Disabled` 時每 10 秒踢一次。
+教訓：**thread call 不能自我重排，要用 timer event source 或每次重新 allocate。**
+
+#### 6.67.6 仍未解
+
+- `Ath10kConnectionPHY` 仍寫 `HT20-1SS`，但實測 84–88 Mbps 已超出它的上限 → 標籤/速率回報低估，
+  40 MHz 閘門診斷被後面的 `s.phyReason="ht-common-capabilities"` 覆蓋，要另開屬性。
+- UI 的 `Transmit Rate` 仍是 0（同 §6.66.2：綁在 airportd 自己那條 4-way）。

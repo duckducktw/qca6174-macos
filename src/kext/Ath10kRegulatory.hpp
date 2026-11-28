@@ -13,13 +13,15 @@ inline const RegulatoryPair *regulatoryPair(UInt32 rd){
 struct RegulatoryPolicy {
     const RegulatoryCountry *country=regulatoryCountry("00"),*boardCountry=nullptr;
     UInt32 eepromRD=0,domain=0x64,low2=2300,high2=3000,low5=4800,high5=5925;
-    UInt8 ceilingHalfDbm=20;UInt16 ctl2=0xff,ctl5=0xff;
+    UInt8 ceilingHalfDbm=20;   // firmware radio TX power (buildWMIRadio validates <=20, i.e. 10 dBm)
+    UInt8 powerCeilingHalfDbm=40;// assoc-time clamp for our own candidate (20 dBm); 2.4 GHz is legal to 30 dBm EIRP
+    UInt16 ctl2=0xff,ctl5=0xff;
     bool indoor=false,firmwareCapsValid=false,stationDFS=false;
     const char *status="world-default";
 };
 inline const char *configureRegulatory(RegulatoryPolicy &p,UInt32 eeprom,
     UInt32 low2,UInt32 high2,UInt32 low5,UInt32 high5){
-    if(!p.country || !p.ceilingHalfDbm || p.ceilingHalfDbm>20)return "regulatory-options-invalid";
+    if(!p.country || !p.ceilingHalfDbm || p.ceilingHalfDbm>60)return "regulatory-options-invalid";
     if(!low2 && !high2){low2=2300;high2=3000;}
     if(!low5 && !high5){low5=4800;high5=5925;}
     if(low2<2300 || high2>3000 || high2<low2 || low5<4800 || high5>6200 || high5<low5)
@@ -73,7 +75,7 @@ inline UInt8 regulatoryPower(const RegulatoryPolicy &p,UInt32 primary,UInt32 cen
     if(cf<half || cf-half<lo-10 || cf+half>hi+10 || freq<lo || freq>hi)return 0;
     UInt8 limit=countryPower(p.country,center,width,p.indoor,transmit,p.stationDFS);
     if(p.boardCountry){UInt8 board=countryPower(p.boardCountry,center,width,p.indoor,transmit,p.stationDFS);if(board<limit)limit=board;}
-    if(p.ceilingHalfDbm<limit)limit=p.ceilingHalfDbm;
+    if(p.powerCeilingHalfDbm<limit)limit=p.powerCeilingHalfDbm;
     return limit;
 }
 }

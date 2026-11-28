@@ -279,7 +279,7 @@ void Ath10kPCIDevice::publishConnection()
     setProperty("Ath10kStationDFS",_regulatory.stationDFS);
     setProperty("Ath10kConnectionChannelDefinitionValid",Ath10k::channelDefinitionAllowed(
         _connection.operatingChannel,_connection.centerChannel,_connection.width,_connection.regulatory.stationDFS));
-    setProperty("Ath10kChannelPolicy","regdb-board-firmware-infrastructure-sta-10dbm");
+    setProperty("Ath10kChannelPolicy","regdb-board-firmware-infrastructure-sta-20dbm");
     setProperty("Ath10kDisconnectStage",static_cast<UInt32>(_connection.disconnect),32);
     setProperty("Ath10kDisconnectCount",_connection.disconnectCount,32);
     const auto &cd=_connection.diagnostics;

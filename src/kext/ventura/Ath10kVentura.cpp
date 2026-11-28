@@ -743,6 +743,12 @@ void Ath10kPCIDevice::venturaP256SelfTest()
     IOService *probe = getProvider();
     if (probe == nullptr)
         return;
+    // Evidence counters: prove the watchdog actually runs, and what _wmiLive.active
+    // reads at that moment (the property can be stale after endWMIRuntime).
+    static UInt32 runs = 0;
+    ++runs;
+    probe->setProperty("Ath10kAutoJoinRuns", runs, 32);
+    probe->setProperty("Ath10kAutoJoinSawWmi", _wmiLive.active ? "yes" : "no");
     if (probe->getProperty("Ath10kP256SelfTest") != nullptr)
         return;
     AthSecurity::P256FieldCandidate field(Ath10kP256KernelBinding::field());
@@ -847,7 +853,7 @@ void Ath10kPCIDevice::venturaScheduleAutoJoin()
 {
     if (_venturaAutoJoinCall == nullptr) {
         _venturaAutoJoinCall = thread_call_allocate_with_options(
-            venturaAutoJoinCall, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+            venturaAutoJoinCall, this, THREAD_CALL_PRIORITY_KERNEL, 0);   // repeatable: ONCE burned the call on the first waiting-wmi re-arm
     }
     if (_venturaAutoJoinCall != nullptr) {
         uint64_t deadline = 0;
@@ -2640,7 +2646,7 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
             probe->setProperty("Ath10kAssocKick", "watchdog-only");
         if (_venturaAutoJoinCall == nullptr) {
             _venturaAutoJoinCall = thread_call_allocate_with_options(
-                venturaAutoJoinCall, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+                venturaAutoJoinCall, this, THREAD_CALL_PRIORITY_KERNEL, 0);   // repeatable: ONCE burned the call on the first waiting-wmi re-arm
         }
         if (_venturaAutoJoinCall != nullptr)
             thread_call_enter(_venturaAutoJoinCall);
@@ -3296,8 +3302,18 @@ IOReturn Ath10kPCIDevice::venturaAssociate(const apple80211_assoc_data *request)
     } else {
         venturaSecurityStop();
     }
-    if (s.txPowerHalfDbm == 0 || s.txPowerHalfDbm > 40)
-        s.txPowerHalfDbm = 20;   // 10 dBm; prepareBSSCandidate clamps to the AP limit
+    // Keep the negotiated value; only guard against a nonsense zero/over-range one.
+    // The old code forced 10 dBm here (and the policy property still says so), which
+    // is why every join ran at 10 dBm even after the default was raised.
+    if (s.txPowerHalfDbm == 0 || s.txPowerHalfDbm > 60)
+        s.txPowerHalfDbm = 40;   // 20 dBm; prepareBSSCandidate still clamps to the AP limit
+    if (IOService *probe = getProvider()) {
+        char note[48];
+        snprintf(note, sizeof(note), "halfDbm=%u (%u dBm)",
+                 static_cast<unsigned>(s.txPowerHalfDbm),
+                 static_cast<unsigned>(s.txPowerHalfDbm / 2));
+        probe->setProperty("Ath10kTxPowerApplied", note);
+    }
     s.cancelRequested = false;
     // Never null: publishConnection() hands this straight to setProperty(), and
     // OSSymbol::withCString(NULL) faults in strnlen (measured panic at Start).

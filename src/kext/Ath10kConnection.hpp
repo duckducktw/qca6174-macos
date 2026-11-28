@@ -217,7 +217,7 @@ struct ConnectionState {
     RegulatoryPolicy regulatory{};
     WMIBSS ap{};
     UInt8 local[6]{},ssid[32]{},bssid[6]{},ssidLength=0;
-    UInt8 wmiSequence=10,httSequence=3,txPowerHalfDbm=20;
+    UInt8 wmiSequence=10,httSequence=3,txPowerHalfDbm=40;
     UInt32 operatingChannel=0;
     UInt32 peerIDs[64]{};UInt32 peerCount=0;
     // A key-disable response can follow PEER_UNMAP on CE1. Keep the identities
@@ -420,6 +420,23 @@ inline void negotiateHighThroughput(Config &s){
     s.htEnabled=true;
     const UInt8 offset=a.htOp[1]&3;
     const int secondary=static_cast<int>(s.operatingChannel)+(offset==1?4:-4);
+    // Record *which* gate keeps us at 20 MHz: measured throughput (~88 Mbps) already
+    // exceeds the HT20-1SS ceiling, so the bookkeeping is what is wrong, not the radio.
+    // The reason string surfaces through Ath10kConnectionPHYReason.
+    if(!(ATH10K_MAX_WIDTH>=40))
+        s.phyReason="ht40-disabled-in-build";
+    else if(!(apHT&2))
+        s.phyReason="ap-ht-cap-not-40mhz";
+    else if(!(a.htOp[1]&4))
+        s.phyReason="ap-ht-op-not-40mhz";
+    else if(!(offset==1 || offset==3))
+        s.phyReason="ap-no-secondary-offset";
+    else if(secondary<=0)
+        s.phyReason="ht40-secondary-invalid";
+    else if(!channelDefinitionAllowed(s.operatingChannel,
+                static_cast<UInt32>((static_cast<int>(s.operatingChannel)+secondary)/2),40,
+                s.regulatory.stationDFS))
+        s.phyReason="ht40-channel-not-allowed";
     if(ATH10K_MAX_WIDTH>=40 && (apHT&2) && (a.htOp[1]&4) && (offset==1 || offset==3) &&
        secondary>0 && channelDefinitionAllowed(s.operatingChannel,
            static_cast<UInt32>((static_cast<int>(s.operatingChannel)+secondary)/2),40,s.regulatory.stationDFS)){
@@ -520,7 +537,7 @@ inline void connTLV(UInt8 *,UInt16,UInt16);
 template<class Config>
 inline UInt8 stationPowerLimitFor(const Config &s,UInt32 primary,UInt32 center,UInt8 width,
                                  const UInt8 *country=nullptr,UInt32 countryLength=0){
-    auto p=s.regulatory;p.ceilingHalfDbm=255;
+    auto p=s.regulatory;p.powerCeilingHalfDbm=255;
     const UInt8 maximum=regulatoryPower(p,primary,center,width);
     const int low=width==80?int(center)-6:(width==40?int(center)-2:int(primary));
     const UInt32 channels=width==80?4:(width==40?2:1);
@@ -531,7 +548,7 @@ inline UInt8 stationPowerLimitFor(const Config &s,UInt32 primary,UInt32 center,U
     const UInt32 base=apMaximum>=0?UInt32(apMaximum):maximum;
     UInt8 constrained=static_cast<UInt8>(base>reduction?base-reduction:0);
     if(constrained>maximum)constrained=maximum;
-    return constrained<s.regulatory.ceilingHalfDbm?constrained:s.regulatory.ceilingHalfDbm;
+    return constrained<s.regulatory.powerCeilingHalfDbm?constrained:s.regulatory.powerCeilingHalfDbm;
 }
 template<class Config>
 inline UInt8 stationPowerLimit(const Config &s){

@@ -1489,6 +1489,9 @@ bool Ath10kPCIDevice::prepareWMIRuntime()
     _wmiLive.active=true;
     _wmiLive.status="prepared";
     if (IOService *prov = getProvider()) prov->setProperty("Ath10kWmiLive", "active");
+    // Kick the join watchdog from here: if it was armed only at start() (before WMI came
+    // up) and its thread call is not re-arming, the device sits idle at "waiting-wmi".
+    venturaScheduleAutoJoin();
     return true; // start() arms only after probeTarget finishes ownership transfer.
 }
 
@@ -1570,6 +1573,18 @@ const char *Ath10kPCIDevice::serviceRuntime()
         _connection.fwStats.observedRateSerial=_connection.fwStats.rateSerial;_connection.fwStats.rateObservedMs=tickMs;
     }
     _perf.worker.add(Ath10k::uptimeNS()-started);
+    // The join watchdog cannot re-arm itself: thread_call_enter_delayed from inside the
+    // call's own function is refused by xnu, so it ran exactly once (measured
+    // Ath10kAutoJoinRuns=1) and left the device at "waiting-wmi" forever. The runtime
+    // timer already ticks every second, so drive the retry from here instead.
+    if(maintenance){
+        static UInt64 lastKickMs=0;
+        if(_wmiLive.active && _connection.stage==Ath10k::LinkStage::Disabled &&
+           tickMs-lastKickMs>=10000u){
+            lastKickMs=tickMs;
+            runVenturaAutoJoin();
+        }
+    }
     if(maintenance){_wmiLive.lastMaintenanceMs=tickMs;publishWMIRuntimeProperties();}
     return error;
 }
