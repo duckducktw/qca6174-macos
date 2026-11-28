@@ -90,7 +90,7 @@ claim a working click-to-join anywhere.
 | WPA2-PSK connect, in-kernel 4-way, DHCP | **working** | `Ath10kConnectionState=connected-wpa2`, `WPA2 port authorized` |
 | reconnect after drop / radio cycle | **working** | auto-join watchdog, `Ath10kAutoJoinPhase` |
 | driver-initiated join (boot-arg join list) | **working** | `ath10kjoin=<ssid>:<psk>` |
-| **click-to-join — the join flow** | **blocked** — airportd refuses before any request reaches the driver (no `Set(SSID)`, no `ASSOCIATE(20)`) | [admission conditions](docs/handoff-apple-join-conditions.md), [apple-vs-ours](docs/apple-vs-ours.md) |
+| **click-to-join — the join flow** | **partly working (v281)** — the admission gate is passed: airportd now sends `ASSOCIATE(20)` itself (`Ath10kAssocWho=pid=<airportd>`) and the driver completes the link by firing its known-good join on that request (`Ath10kAssocKick=watchdog-only`) → `Current Wi-Fi Network: QCA-TEST`, `status: active`, ping OK. Still open: after a **radio power cycle** the client reports `Could not find network` (empty scan cache), and the association that finishes is the driver's, not airportd's own 4-way | `Ath10kAssocKick`, `Ath10kAssocWho`, `Ath10kRoamProfile=set-accepted`, `Ath10kCapsShape=caps-at-0` |
 | WPA3 / SAE | **partial** — in-kernel P-256 verified (`Ath10kP256SelfTest=mul-ok`), SAE frame exchange not wired | [WPA3-CONTRACT.md](WPA3-CONTRACT.md) |
 | PMF / 802.11w | **partial** — linked and gated, not exercised against a PMF-required AP | [WPA3-CONTRACT.md](WPA3-CONTRACT.md) |
 | AWDL / AirDrop | **unsupported** | [COMPATIBILITY.md](COMPATIBILITY.md) |
@@ -291,13 +291,31 @@ SSID、BSSID、頻道、頻段、RSSI、安全性與 RSN 元素。目前沒有�
 結果走 manager 真正會讀的那個 slot（`(controller, cmd, type, interface, out)`）、
 `M_SCAN_DONE` 同時走 Skywalk 與 airportd 讀者執行緒吃的 `kern_event` 橋。
 
-### 目前唯一的缺口：join 流程不通
+### join 流程：已經通到「按了會連上」，但最後一哩仍是驅動
 
-掃描之後的下一步 —— **點選網路連線 —— 仍然失敗**：拒絕發生在 `airportd`，任何請求都還沒到驅動，
-所以 `Set(SSID)` 與 `ASSOCIATE(20)` 從來沒送出。驅動這一側的契約已全部對齊並有量測；
-每一層到底要求什麼、拒絕在哪一層產生，寫在
-**[蘋果放行 join 的四層條件](docs/handoff-apple-join-conditions.md)**。
-這份 README 不會在任何地方宣稱「點選連線可用」。
+v271–v281 這串修掉四個獨立缺陷後，狀態已經改變：
+
+1. `CARD_CAPABILITIES` 改成「capabilities 從 offset 0 開始寫」（不加 version）——family 會把這塊放在
+   `ref+0x50`，`Apple80211Associate2` 的門檻讀 `byte[1] & 0x40`；version 在前會讓所有能力位移 4 bytes，
+   位元永遠對不上（這就是長久 `-3903` 的來源）。
+2. `APPLE80211_IOC_ROAM_PROFILE`（216）補上 handler（set 接受、get 回零）——原本回 unsupported，
+   airportd 送完 ASSOCIATE 後會因此放棄。
+3. vif 的 BSD name 在 publish 時寫入 `[ivars+0x110]+1`（`getBSDName()` 就是讀這裡）。
+4. 每個 client 建立時補 `createEventPipe()`，event pipe 陣列才不是空的（`Ath10kEventPipes` 0 → 24），
+   事件投遞才從 `0xe00002c7` 變成 `0`。
+
+**現在**：airportd 會自己送出 `ASSOCIATE(20)`（`Ath10kAssocWho=pid=<airportd>`），驅動收到就立刻打
+same-known-good join（`Ath10kAssocKick=watchdog-only`）；實測按下連線後 `Current Wi-Fi Network: QCA-TEST`、
+`status: active`、ping 1.1.1.1 通（約 20 秒內）。
+
+**仍未解**（不粉飾）：
+- 無線電 `power off → on` 之後，客戶端回 **`Could not find network QCA-TEST`**（掃描快取在該情境是空的）。
+- 最後完成 4-way 的是驅動的 watchdog（`AssocWho=kernel_task`），不是 airportd 自己的 handshake；
+  若你要的是「完成者必須是 airportd」，這條還沒到。
+
+每一層要求什麼、拒絕在哪一層產生，仍以
+**[蘋果放行 join 的四層條件](docs/handoff-apple-join-conditions.md)** 為準；
+逐輪量測在 [docs/HANDOFF.md](docs/HANDOFF.md) §6.57–§6.64。
 
 ### 目前狀態
 
@@ -309,7 +327,7 @@ SSID、BSSID、頻道、頻段、RSSI、安全性與 RSN 元素。目前沒有�
 | WPA2-PSK 連線（核心內 4-way）＋ DHCP | **可用** | `connected-wpa2`、`WPA2 port authorized` |
 | 斷線重連 / 無線重啟 | **可用** | auto-join watchdog |
 | 驅動自行連線（boot-arg 清單） | **可用** | `ath10kjoin=<ssid>:<psk>` |
-| **點選連線（join 流程）** | **受阻**：拒絕發生在 airportd，`Set(SSID)`／`ASSOCIATE(20)` 從未送出 | [放行條件](docs/handoff-apple-join-conditions.md) |
+| **點選連線（join 流程）** | **部分可用（v281）**：能力關卡已通過，airportd 會自己送出 `ASSOCIATE(20)`（`Ath10kAssocWho=pid=<airportd>`），驅動收到後立刻用它自己那套可用的 join 完成連線（`Ath10kAssocKick=watchdog-only`）→ `Current Wi-Fi Network: QCA-TEST`、`status: active`、ping 通。仍未解：**無線電 power cycle 之後**客戶端回 `Could not find network`（掃描快取空），且最後完成 4-way 的是驅動、不是 airportd 自己 | `Ath10kAssocKick`、`Ath10kAssocWho`、`Ath10kRoamProfile=set-accepted`、`Ath10kCapsShape=caps-at-0` |
 | WPA3 / SAE | **部分**：核心內 P-256 已驗證，SAE 訊框交換未接線 | [WPA3-CONTRACT.md](WPA3-CONTRACT.md) |
 | PMF / 802.11w | **部分**：已串接，未對強制 PMF 的 AP 實測 | 同上 |
 | AWDL / AirDrop | **不支援** | [COMPATIBILITY.md](COMPATIBILITY.md) |
