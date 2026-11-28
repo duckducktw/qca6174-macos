@@ -50,8 +50,15 @@ bool Ath10kPCIDevice::runtimeASPM(bool enabled)
     const UInt16 bits=enabled?(_pcieLinkControlBefore&3):0;
     _pci->configWrite16(offset,static_cast<UInt16>((current&~3u)|bits));
     const UInt16 after=_pci->configRead16(offset);
-    if(after==0xffff || (after&3)!=bits)return false;
-    _runtimeASPM=enabled && bits;return true;
+    // A platform that drops ASPM writes (QEMU/VFIO: "write-ignored-continued" at
+    // bring-up) also fails this readback. Treat it as "not controllable", not as a
+    // hardware fault: failing here made every runtime stop set _dmaQuarantine, and
+    // quarantine is exactly what blocks both restart paths, so one teardown used to
+    // brick Wi-Fi until reboot.
+    const bool applied=(after!=0xffff && (after&3)==bits);
+    if(!applied)setProperty("Ath10kRuntimeASPMReadback","write-ignored");
+    _runtimeASPM=enabled && applied && bits;
+    return true;
 }
 bool Ath10kPCIDevice::finishRuntimePower()
 {

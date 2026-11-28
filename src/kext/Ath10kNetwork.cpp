@@ -458,6 +458,7 @@ void Ath10kPCIDevice::publishConnection()
     setProperty("Ath10kDataTxCompletions",_connection.dataCompleted,32);
     setProperty("Ath10kDataTxNoAck",_connection.dataNoAck,32);
     setProperty("Ath10kDataTxDiscard",_connection.dataDiscard,32);
+    setProperty("Ath10kDataTxDrainDropped",_connection.dataDrainDropped,32);
     setProperty("Ath10kDataTxBytes",_connection.txBytes,64);
     setProperty("Ath10kDataRxBytes",_connection.rxBytes,64);
     setProperty("Ath10kDataTxLatencyTotalMs",_connection.dataLatencyMs,64);
@@ -1423,11 +1424,22 @@ const char *Ath10kPCIDevice::serviceDataTX(UInt64 nowMs)
             const bool ceTimeout=!slot.ceConsumed && age>=5000;
             const bool drainTimeout=s.disconnect!=Ath10k::DisconnectStage::None &&
                 nowMs>=s.sinceMs && nowMs-s.sinceMs>=5000;
-            if(ceTimeout || drainTimeout){
-                ++s.dataTimeouts;report(ceTimeout?"ce-timeout":"drain-timeout",i,age);
+            if(ceTimeout){
+                ++s.dataTimeouts;report("ce-timeout",i,age);
                 return "data-tx-completion-timeout";
             }
-            if(age>=5000 && !slot.waitReported){
+            if(drainTimeout){
+                // The peer is already gone (AP deauth, radio-off, teardown), so
+                // firmware will never post an HTT completion for a payload it has
+                // already pulled off CE4. Failing the whole runtime here is what
+                // bricked Wi-Fi in v293: AP kick -> drain-timeout -> radio dead,
+                // and a user power cycle could not bring it back. Abandon the
+                // payload instead and let the drain run to completion.
+                report("drain-dropped",i,age);
+                ++s.dataDiscard;++s.txErrors;++s.dataDrainDropped;
+                slot.owned=false;--s.dataPending;progress=true;
+            }
+            if(age>=5000 && !slot.waitReported && slot.owned){
                 slot.waitReported=true;++s.dataDelayed;report("firmware-retained",i,age);
             }
         }

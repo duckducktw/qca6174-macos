@@ -9,6 +9,7 @@ extern "C" kmod_info_t kmod_info;
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSData.h>
+#include <pexpert/pexpert.h>
 
 #if defined(ATH10K_VENTURA) || defined(ATH10K_NATIVE)
 #define super IO80211Controller
@@ -1666,6 +1667,23 @@ void Ath10kPCIDevice::endWMIRuntime(const char *reason)
     IOLog("Ath10kMac: WMI RUNTIME STOP reason=%s polls=%u rx=%u irq-stop=%s reset=%s\n",
           reason,_wmiLive.polls,_wmiLive.rxCount,irqOK?"yes":"no",resetOK?"yes":"no");
     publishDiagnosticProperties();
+    // Recovery after a runtime stop: the sleep/wake rematch is the only supported
+    // restart, and it is still incomplete after a full rematch — the new instance
+    // dies at "htt-rx-allocation" and en1 never reappears (reproduced with
+    // tools/ctlrestart.c). Until that is fixed, keep the rematch opt-in
+    // (ath10krtrestart=1) so a teardown leaves the published interface in place
+    // (radio dead but recoverable by reboot) instead of deleting en1 under airportd.
+    UInt32 runtimeRestartArg = 0;
+    const bool restartOnStop =
+        PE_parse_boot_argn("ath10krtrestart", &runtimeRestartArg, sizeof(runtimeRestartArg)) && runtimeRestartArg;
+    if (restartOnStop && !_dmaQuarantine && powerRestartAllowed() && _power.deviceOn &&
+        !_power.rootSleeping && !_deferredProbeStopping) {
+        _power.needsRestart = true;
+        setProperty("Ath10kRuntimeRestart", "requested");
+        queueWakeRecovery();
+    } else {
+        setProperty("Ath10kRuntimeRestart", _dmaQuarantine ? "quarantined" : "disabled-by-policy");
+    }
 #ifdef ATH10K_NATIVE
     // DMA/IRQ are quiesced above. Report failure through WCL even though the
     // radio timer is now stopped; never leave a native scan/link hanging.

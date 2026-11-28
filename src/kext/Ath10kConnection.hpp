@@ -154,7 +154,7 @@ struct ConnectionState {
     UInt32 dataCECount=0,dataHTTCount=0;
     // Firmware retains payload ownership until HTT completion. An old frame
     // alone is not evidence that a still-progressing transmit queue is wedged.
-    UInt32 dataDelayed=0,dataTimeouts=0;
+    UInt32 dataDelayed=0,dataTimeouts=0,dataDrainDropped=0;
     const char *dataWatchdogReason="none";UInt32 dataWatchdogSlot=kDataTxSlots;UInt16 dataWatchdogID=0;UInt64 dataWatchdogAgeMs=0;
     UInt64 dataStallSinceMs=0,dataPauseSinceMs=0;
     bool dataStallArmed=false,dataPauseArmed=false;
