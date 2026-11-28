@@ -2467,8 +2467,23 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         apple80211_rate_data *rate = static_cast<apple80211_rate_data *>(data);
         rate->version = APPLE80211_VERSION;
         rate->num_radios = APPLE80211_MAX_RADIO;
+        // Report the negotiated PHY rate in 500 kbps units (the unit apple80211 uses).
+        // Answering 0 here is what made System Settings show "Transmit Rate: 0" even
+        // while the link was up: airportd asks the driver for this IOC directly.
+        UInt32 mbps = 0;
+        if (Ath10k::connectionAssociated(_connection)) {
+            UInt32 perStream = 65;                       // HT20, 800 ns GI
+            if (_connection.vhtEnabled) perStream = _connection.width >= 80 ? 292
+                                          : (_connection.width >= 40 ? 146 : 72);
+            else if (_connection.width >= 40) perStream = 135;
+            if (_connection.shortGI) perStream = perStream * 111 / 100;
+            const UInt32 nss = _connection.nss ? _connection.nss : 1;
+            mbps = perStream * nss;
+        }
         for (int i = 0; i < APPLE80211_MAX_RADIO; i++)
-            rate->rate[i] = 0;
+            rate->rate[i] = static_cast<SInt32>(mbps * 2);   // Mbps -> 500 kbps units
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kRateIoc", static_cast<UInt64>(mbps), 32);
         return kIOReturnSuccess;
     }
     case APPLE80211_IOC_RSSI: {
@@ -4147,6 +4162,27 @@ void Ath10kPCIDevice::venturaInterfaceLink(bool up)
 {
     if (_venturaInterface == nullptr)
         return;
+    // System Settings reads the *interface's* link status, not the controller's, so the
+    // negotiated rate has to be published here too or the UI keeps showing
+    // "Transmit Rate: 0, MCS Index: 0" (measured on v283/v284 with the controller-side
+    // setLinkStatus(status, medium, speed) already carrying 65 Mbps).
+    // The v1 IO80211Interface has no setLinkStatus on the live family (compile error),
+    // so the rate goes out as properties: "IO80211LinkRate"/"IO80211LinkQuality" are what
+    // the family/airportd consult for the menu-bar figure, and the breadcrumb keeps the
+    // value visible for the next measurement.
+    if (up) {
+        UInt32 perStream = 65;
+        if (_connection.vhtEnabled) perStream = _connection.width >= 80 ? 292
+                                      : (_connection.width >= 40 ? 146 : 72);
+        else if (_connection.width >= 40) perStream = 135;
+        if (_connection.shortGI) perStream = perStream * 111 / 100;
+        const UInt32 nss = _connection.nss ? _connection.nss : 1;
+        const UInt64 rate = static_cast<UInt64>(perStream) * nss;
+        _venturaInterface->setProperty("IO80211LinkRate", rate, 32);
+        _venturaInterface->setProperty("IO80211LinkQuality", static_cast<UInt64>(80), 32);
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kIfaceRate", rate, 32);
+    }
     const IO80211LinkState state = up ? kIO80211NetworkLinkUp : kIO80211NetworkLinkDown;
     // The infra interface is the object attachInterface() parks on the controller, and
     // the one the family marks as the published station interface.

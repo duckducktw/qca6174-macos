@@ -144,7 +144,26 @@ void Ath10kPCIDevice::networkLink(bool up)
     if(_networkLinkUp==up)return;
     _networkLinkUp=up;
     if(!up && getOutputQueue()){getOutputQueue()->stop();getOutputQueue()->flush();}
-    setLinkStatus(kIONetworkLinkValid|(up?kIONetworkLinkActive:0));
+    // Report the negotiated PHY rate, not just valid/active: without a speed the
+    // family leaves the link at 0 Mbps and System Settings shows "Transmit Rate: 0,
+    // MCS Index: 0". Approximate PHY (HT/VHT, per-stream base rate x chains, +11%
+    // for a 400 ns guard interval) is enough for the UI.
+    if (IOService *probe = getProvider())
+        probe->setProperty("Ath10kLinkRateDbg",
+                           static_cast<UInt64>((_connection.width << 16) |
+                                               ((_connection.nss & 0xff) << 8) |
+                                               (_connection.shortGI ? 1 : 0)), 32);
+    UInt64 speed = 0;
+    if (up) {
+        UInt32 perStream = 65;                       // HT20, 800 ns GI
+        if (_connection.vhtEnabled) perStream = _connection.width >= 80 ? 292
+                                      : (_connection.width >= 40 ? 146 : 72);
+        else if (_connection.width >= 40) perStream = 135;
+        if (_connection.shortGI) perStream = perStream * 111 / 100;
+        const UInt32 nss = _connection.nss ? _connection.nss : 1;
+        speed = static_cast<UInt64>(perStream) * nss;
+    }
+    setLinkStatus(kIONetworkLinkValid|(up?kIONetworkLinkActive:0), nullptr, speed);
 #ifndef ATH10K_NATIVE
     // Push the same state onto the published interface. setLinkStatus() above only
     // touches the controller, so `ifconfig en1` kept reporting "status: active" (and

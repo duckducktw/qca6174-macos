@@ -4055,3 +4055,25 @@ Ath10kConnectionState = connected-wpa2 / AutoJoinPhase = up / status: active
 `Ath10kAssocWho = pid=0 name=kernel_task`、`Ath10kAssocKick = watchdog-only`：
 airportd 送 `ASSOCIATE(20)` 後，驅動立刻用它自己那套（OPEN + WPA2-PSK）完成；
 airportd 帶的 `rsnlen=22 / keylen=32` 那份 request 本身仍不會完成。
+
+### 6.66 第廿六輪（v283–v286）：UI 速率顯示 —— 驅動已回真值，但畫面仍是 0（與 §6.65.4 同源）
+
+#### 6.66.1 試過的四個出版面（依序）
+
+| 版本 | 做法 | 結果 |
+|---|---|---|
+| v283 | 控制器 `setLinkStatus(status, medium, **speed**)`，speed 由 `_connection` 的 width/nss/sgi 算 | 編譯部署都 OK，UI 仍 `Transmit Rate: 0` |
+| v284 | 加 `Ath10kLinkRateDbg = width<<16 | nss<<8 | sgi` | `1310976` → `width=20 nss=1 sgi=0`：協商參數正確（應為 65 Mbps），排除「欄位是 0」的假設 |
+| v285 | 介面側 `_venturaInterface->setLinkStatus(...)` | **編譯失敗**：`no member named 'setLinkStatus' in 'IO80211Interface'`（live 13.7 的 v1 介面沒有這個 API）；改設 `IO80211LinkRate` / `IO80211LinkQuality` 屬性 → `Ath10kIfaceRate=65`，UI 仍 0 |
+| v286 | `APPLE80211_IOC_RATE`（type 8）原本**一律填 0**，改成回協商速率（500 kbps 單位） | `Ath10kRateIoc = 65`（證明 airportd 真的會問這一項），`connected-wpa2`、ping 2/2，**UI 仍 `Transmit Rate: 0`** |
+
+#### 6.66.2 結論
+
+速率這條「簡單的」其實**不獨立**：airportd 已經拿得到驅動回報的 65 Mbps（`Ath10kRateIoc=65`），
+但 System Settings／`system_profiler` 顯示的是它自己那條關聯狀態下的值，而那條 4-way 不是由它完成的
+（`Ath10kAssocWho=kernel_task`、`Ath10kAssocKick=watchdog-only`，見 §6.65.4）。
+換句話說：**速率顯示卡在同一個根因上，不是另一個可以單獨修的小項。**
+
+留著的部分（都已部署、無害）：控制器 `setLinkStatus` 現在帶 speed、介面屬性 `IO80211LinkRate/
+LinkQuality`、以及 `APPLE80211_IOC_RATE` 回真值 + `Ath10kRateIoc` 斷點。等哪天 airportd 自己完成
+4-way，這三個面會一起生效。
