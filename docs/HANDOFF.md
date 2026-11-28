@@ -3934,7 +3934,7 @@ VM = v262（`Ath10kReqLog` 在），boot-args 8 token（已無 amfi），`connec
    B 全關 SIP／C 以自帶 join 為成品）、精確 runbook、七條陷阱。
    **新 session 先讀那一份，`HANDOFF.md` 只當逐輪歷史。**
 
-### 6.64 第廿四輪（v271–v278）：**打通** —— airportd 自己送出 ASSOCIATE 並完成關聯
+### 6.64 第廿四輪（v271–v279）：能力關卡打通；連線可用，但最後一步仍由看門狗完成（§6.64.5 更正）
 
 #### 6.64.1 結果（可重現的驗收）
 
@@ -3981,3 +3981,30 @@ ASSOCIATE，系統也正確回報連上哪個網路。
   `Ath10kVifBsdName[Stamp]`、`Ath10kLinkPost`、`AssocWho`。
 - bundle：`/tmp/vk262`（舊可用）、`/tmp/vk271`–`/tmp/vk278` 全部留著，v278 = 打通版。
 - boot-args 目前 8 token（已無 `ath10knoauto`、無 `amfi_get_out_of_my_way`）。
+
+#### 6.64.5 更正（重要，勿照 §6.64.1 判讀）
+
+§6.64.1 寫的「airportd 自己完成關聯」**不成立**：重複測試後 `Ath10kAssocWho` 仍是最後的
+`pid=0 name=kernel_task`。誠實狀態是：
+
+```
+networksetup -setairportnetwork en1 QCA-TEST <psk>   → 無錯誤
+約 20 秒後 networksetup -getairportnetwork en1        → Current Wi-Fi Network: QCA-TEST
+ifconfig en1                                          → status: active（169.254.x.x）
+ping 1.1.1.1                                          → 2/2
+但 Ath10kAssocWho = pid=0 name=kernel_task            ← 完成者是驅動看門狗，不是 airportd
+```
+
+也就是：**使用者按連線會真的連上（可用）**，但 airportd 自己那條 assoc 仍在中途放棄，
+最後由 `venturaScheduleAutoJoin` 的看門狗補完。
+
+這一輪已確認的差異：airportd 在 ASSOCIATE 之後會連續送 `216`（`APPLE80211_IOC_ROAM_PROFILE`），
+我們原本沒有 handler（回 unsupported）。v279 補上 handler（set 接受、get 回零）後
+`Ath10kRoamProfile = "set-accepted"`、`AssocWho` 一度變成 `pid=221 name=airportd`，
+但最終仍未由它完成 → 下一輪要查 assoc 之後 airportd 還送了什麼、以及為何它的 assoc 會中止。
+
+#### 6.64.6 目前可交付的實際狀態
+
+- 開機自動連線：可用（`connected-wpa2`、可上網）。
+- 使用者從 UI／`networksetup` 點連線：**會連上**，但完成者仍是驅動看門狗（約 20 秒）。
+- 尚未達成：airportd 自己把 assoc 走完（`AssocWho=airportd`）。

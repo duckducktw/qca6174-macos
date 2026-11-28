@@ -2491,6 +2491,17 @@ SInt32 Ath10kPCIDevice::venturaDispatchRequest(unsigned int requestType, int req
         rssi->aggregate_rssi_ext = 0;
         return kIOReturnSuccess;
     }
+    case APPLE80211_IOC_ROAM_PROFILE:
+        // airportd re-sends the roam profile immediately after ASSOCIATE (measured as
+        // a stream of type-216 requests from pid airportd). Upstream AirportItlwm
+        // accepts it and returns success; leaving it unsupported made airportd abort
+        // its own association, leaving the link to the driver watchdog.
+        if (IOService *probe = getProvider())
+            probe->setProperty("Ath10kRoamProfile", isSet ? "set-accepted" : "get");
+        if (isSet || data == nullptr)
+            return kIOReturnSuccess;
+        memset(data, 0, sizeof(apple80211_roam_profile_band_data));
+        return kIOReturnSuccess;
     case APPLE80211_IOC_CARD_CAPABILITIES:
         // The family's own bind-time query (Apple80211RawGet type 0xc) passes a
         // 13-byte buffer at ref+0x50 and the gate that decides -3903 reads
