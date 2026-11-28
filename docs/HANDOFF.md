@@ -3,17 +3,21 @@
 > **入口文檔：[`docs/handoff-current-status.md`](handoff-current-status.md)**（現況、規則、陷阱、下一步）。
 > 本檔 §6.x 是逐輪實驗紀錄，只在需要沿革時翻。
 
-## 0. 現況（2026-11-28，`1bf98f1`，部署 v293）
+## 0. 現況（2026-11-28 第六十八輪，`0d6819b`，部署 v297）
 
 **可以用，但連線是驅動自己完成的，不是 airportd 完成的。** 開機自連、掃描清單、點選連線、
-斷電重連都正常；`connected-wpa2`、`en1` 有 IP、ping 4/4 平均 7 ms、實測吞吐 45–88 Mbps。
+斷電重連都正常；`connected-wpa2`、`en1` 有 IP、ping 4/4 平均 7–13 ms。
 缺的是 airportd 自己那條 4-way 關聯（`Ath10kAssocWho=kernel_task`），所以 System Settings 的
 `Transmit Rate` / `MCS Index` 還是 0。
 
+**本輪（§6.68）修掉「一次 teardown 就把 Wi-Fi 搞到必須重開機」的兩個真因**：
+drain 期間 firmware 不會補 HTT 完成事件（payload 要丟不能殺 runtime）、
+`runtimeASPM` readback 失敗讓每次 stop 都設 DMA quarantine（quarantine 會擋掉兩條重啟路徑）。
+
 | 項目 | 值 |
 |---|---|
-| 分支 / HEAD | `ventura-io80211` / `1bf98f1`（已推 origin） |
-| 目前部署 | **v293**（`sha256 c5308efd…`；可回滾 `/tmp/vk282`、`/tmp/vk286`–`/tmp/vk293`） |
+| 分支 / HEAD | `ventura-io80211` / `0d6819b`（已推 origin） |
+| 目前部署 | **v297**（`sha256 22d74a13…`；前一版 v296、v295、v293 可在 `/tmp/vk29*` 回滾） |
 | 無線電 | `Ath10kWMIRuntimeStatus="active-msi-worker"`、**TX 20 dBm**（`Ath10kTxPowerApplied="halfDbm=40 (20 dBm)"`） |
 | 鏈路 | `QCA-TEST` / WPA2-PSK / `HT20-1SS`（標籤低估，實測 ≥84 Mbps） |
 | VM 主機 | Acer `100.64.0.152`；guest：`ssh 100.64.0.152 "ssh -p 2223 user@127.0.0.1 'bash -s'" < script.sh` |
@@ -4165,3 +4169,70 @@ Current Wi-Fi Network  = QCA-TEST     ping 4/4，avg 7.0 ms
 - `Ath10kConnectionPHY` 仍寫 `HT20-1SS`，但實測 84–88 Mbps 已超出它的上限 → 標籤/速率回報低估，
   40 MHz 閘門診斷被後面的 `s.phyReason="ht-common-capabilities"` 覆蓋，要另開屬性。
 - UI 的 `Transmit Rate` 仍是 0（同 §6.66.2：綁在 airportd 自己那條 4-way）。
+
+---
+
+## 6.68 第六十八輪（v294–v297）：一次 teardown 就「必須重開機」的兩個真因
+
+進場時 VM 已跑 31 小時，狀態是 `Ath10kWMIRuntimeStatus="data-tx-completion-timeout"`、
+`Ath10kConnectionState="disconnecting"`、`Ath10kAutoJoinPhase="waiting-wmi"`：無線電死透，
+`networksetup -setairportpower en1 off/on` 也叫不回來。serial 裡的原因鏈是
+
+```
+DISCONNECT begin reason=ap-peer-kickout ...          (AP 踢掉我們)
+DATA TX watchdog reason=firmware-retained slot=0..2   (3 個 payload 沒有 HTT 完成)
+DATA TX watchdog reason=drain-timeout                 (5 秒後)
+RUNTIME STOP context reason=data-tx-completion-timeout ... first-error=ap-peer-kickout
+```
+
+### 6.68.1 真因一：拆線時的 payload 被當成「韌體卡死」
+
+`serviceDataTX()` 對「CE4 已被韌體讀走、但 HTT completion 永遠不會來」的 payload 回
+`data-tx-completion-timeout`，於是整個 WMI runtime 被收掉。但拆線時 peer 已經被移除，韌體本來就會
+把那些 payload 丟掉 —— 這是正常行為，不是 wedge。
+
+修法：`drainTimeout`（`s.disconnect != None` 且已 5 秒）改成把 payload 記成 dropped 後放手，
+新增屬性 `Ath10kDataTxDrainDropped`；只有 `ce-timeout`（韌體連命令都沒讀）還算致命。
+
+### 6.68.2 真因二：每次 runtime stop 都設 DMA quarantine（= 重開機）
+
+`runtimeASPM(false)` 對 PCIe Link Control 寫 L0s/L1，然後讀回驗證；這台 QEMU/VFIO 從來不吃這個寫入
+（bring-up 早就有 `Ath10kASPMControl="write-ignored-continued"`）。readback 不符 → 回 false →
+`finishRuntimePower()` 回 false → `endWMIRuntime()` 的 `if(!wakeOK||!irqOK||!resetOK) _dmaQuarantine=true`。
+而 quarantine 正是 app restart（`requestDeviceRestart`）與 sleep/wake rematch（`prepareWakeRecovery`）
+共用的拒絕條件，所以任何一次 teardown 都變成「REBOOT REQUIRED」。
+
+修法：readback 不符只代表「ASPM 不可控」，記 `Ath10kRuntimeASPMReadback="write-ignored"` 後回 true。
+量測（v296）：`/tmp/ctlrestart restart` 從 `kr=0xe00002d8` 變成 **`kr=0x0`**，而且真的 terminate + rematch。
+
+### 6.68.3 rematch 還不完整（下一輪主線）
+
+新實例有起來（`Ath10kRecoveryPhase="ready"`、`READY Qualcomm Atheros QCA6174`），卻死在
+`Ath10kWMIRuntimeStatus="htt-rx-allocation"`（`Ath10kPCIDevice.cpp:2700` 的 `_httRxPool.allocate`），
+而且 `en1` 不再出現。因此自動 rematch 用 boot-arg `ath10krtrestart=1` 關著（預設
+`Ath10kRuntimeRestart="disabled-by-policy"`），預設行為跟 v293 一樣：teardown 後介面還在、無線電死掉。
+
+### 6.68.4 量測環境的兩個坑（這輪花最多時間）
+
+1. **測試 AP 的 DHCP 是手動跑的 dnsmasq，被 SIGTERM 過**：guest 只剩 `169.254.x.x`，但 ping
+   192.168.77.1 正常，看起來像「驅動 RX 壞了」（`Ath10kDataRxPackets=0`）。實際上 AP 沒有 :67 監聽。
+   `sudo dnsmasq --conf-file=/tmp/dnsmasq-qca.conf` 之後 `ipconfig set en1 DHCP` 立刻 `BOUND`
+   192.168.77.84。**判讀順序：先 ping 閘道、再看 AP 有沒有 DHCP，最後才懷疑驅動。**
+2. **`routes` 陷阱**：guest 的 default route 在 en0（VM NAT），`ping -S 192.168.77.x 1.1.1.1` 會走 en0，
+   在 AP 的 tcpdump 上什麼都看不到。要驗 Wi-Fi 對外必須 `route add -host 1.1.1.1 192.168.77.1`。
+
+### 6.68.5 驗收（v297，`22d74a13…`，HEAD `0d6819b`）
+
+| 情境 | 結果 |
+|---|---|
+| 開機自動連線 | `connected-wpa2`、`Current Wi-Fi Network: QCA-TEST`、DHCP 192.168.77.84、ping 3/3 7–13 ms |
+| 連線穩定度 | 相隔 32 秒兩次讀值都是 `connected-wpa2` + `active-msi-worker` |
+| 無線電 power cycle（off 5s → on） | 75 秒後回到 `connected-wpa2`，IP 保留，ping 2/2 |
+| AP（hostapd）重啟、期間有下載流量 | 無 RUNTIME STOP、`DataTxDrainDropped=0`、自動連回 `connected-wpa2` |
+| `networksetup -setairportnetwork` 手動連線 | **未完成**：命令掛住、之後 guest ssh 打不通（serial 被 `SCAN_RESULT`／`newUserClient` 洗版），需重開 VM 才恢復；記在入口文檔 §4.4 |
+
+### 6.68.6 新工具
+
+`tools/ctlrestart.c`：guest 內 `cc -o /tmp/ctlrestart ctlrestart.c -framework IOKit -framework CoreFoundation`，
+`sudo /tmp/ctlrestart status|restart`。它走 `Ath10kPCIDevice` 的 AthControl user client（type `0xa7100057`、
+selector 0），是重現 terminate/rematch 的唯一入口（airportd 走不到這裡）。
