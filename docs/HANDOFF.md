@@ -1,17 +1,28 @@
 # QCA6174 Ventura 原生 Wi-Fi — 交接文檔
 
-## 0. 現況（2026-11-27 收工，下一個 session 從這裡開始）
+> **入口文檔：[`docs/handoff-current-status.md`](handoff-current-status.md)**（現況、規則、陷阱、下一步）。
+> 本檔 §6.x 是逐輪實驗紀錄，只在需要沿革時翻。
 
-**能上網，但「點選連線」不通。** 驅動開機自連（`connected-wpa2`、`en1` 正常），
-但使用者點選網路時 `Apple80211Associate2` 在 userspace 就回 `-3903`。
-今天把原因收斂成**一個結構性錯誤**（§0.3），還沒開始改。
+## 0. 現況（2026-11-28，`1bf98f1`，部署 v293）
+
+**可以用，但連線是驅動自己完成的，不是 airportd 完成的。** 開機自連、掃描清單、點選連線、
+斷電重連都正常；`connected-wpa2`、`en1` 有 IP、ping 4/4 平均 7 ms、實測吞吐 45–88 Mbps。
+缺的是 airportd 自己那條 4-way 關聯（`Ath10kAssocWho=kernel_task`），所以 System Settings 的
+`Transmit Rate` / `MCS Index` 還是 0。
 
 | 項目 | 值 |
 |---|---|
-| 分支 / HEAD | `ventura-io80211` / `9c5ed7b` 之後的這一筆 |
-| 目前部署 | **v258**（預設回 hand-built；`ath10kpub=1` 走 §6.57 的權威路徑。可回滾：`/tmp/vk254`–`/tmp/vk258` 都在） |
-| boot-args | `… ath10kjoin=<ssid>:<psk> ath10krole=7`（`ath10krole` 是本輪新旋鈕，預設 7＝原行為） |
+| 分支 / HEAD | `ventura-io80211` / `1bf98f1`（已推 origin） |
+| 目前部署 | **v293**（`sha256 c5308efd…`；可回滾 `/tmp/vk282`、`/tmp/vk286`–`/tmp/vk293`） |
+| 無線電 | `Ath10kWMIRuntimeStatus="active-msi-worker"`、**TX 20 dBm**（`Ath10kTxPowerApplied="halfDbm=40 (20 dBm)"`） |
+| 鏈路 | `QCA-TEST` / WPA2-PSK / `HT20-1SS`（標籤低估，實測 ≥84 Mbps） |
 | VM 主機 | Acer `100.64.0.152`；guest：`ssh 100.64.0.152 "ssh -p 2223 user@127.0.0.1 'bash -s'" < script.sh` |
+
+### 0.0 本輪（§6.66–§6.67）推翻的舊結論
+
+- 舊：「效能約 1/12（72 Mbps vs 867 Mbps）」。**推翻**：`HT20-1SS` 只是我們的標籤，
+  實測 84–88 Mbps 已超過它的 72 Mbps 上限 → 標籤與 `APPLE80211_IOC_RATE` 都在低估。
+- 舊：「10 dBm 是硬體/regdb 限制」。**推翻**：是我們自己 `RegulatoryPolicy` 的預設值。
 
 ### 0.1 建置／部署（**Acer 與 guest 的 `/tmp` 每次重開都會清空**）
 
