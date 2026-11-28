@@ -35,27 +35,6 @@ void Ath10kInfraInterface::noteUserClientAttempt(UInt32 type)
           static_cast<unsigned long long>(seen + 1));
 }
 
-IOReturn Ath10kInfraInterface::newUserClient(task_t owningTask, void *securityID,
-                                             UInt32 type, OSDictionary *properties,
-                                             IOUserClient **handler)
-{
-    (void)owningTask; (void)securityID; (void)properties;
-    if (handler != nullptr)
-        *handler = nullptr;
-    noteUserClientAttempt(type);
-    return kIOReturnUnsupported;
-}
-
-IOReturn Ath10kInfraInterface::newUserClient(task_t owningTask, void *securityID,
-                                             UInt32 type, IOUserClient **handler)
-{
-    (void)owningTask; (void)securityID;
-    if (handler != nullptr)
-        *handler = nullptr;
-    noteUserClientAttempt(type | 0x80000000u);
-    return kIOReturnUnsupported;
-}
-
 Ath10kInfraInterface *Ath10kInfraInterface::createAndAttach(IO80211Controller *controller,
                                                            Ath10kPCIDevice *owner)
 {

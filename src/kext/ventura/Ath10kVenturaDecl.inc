@@ -202,6 +202,8 @@ private:
     // shows up afterwards. Keep the vif and retry the handoff from a delayed
     // thread call.
     IO80211VirtualInterface *_venturaVif = nullptr;
+    // Skywalk-side interface airportd's client binds to (Ath10kInfraInterface).
+    IOService *_venturaInfra = nullptr;
     thread_call_t _vifPublishCall = nullptr;
     thread_call_t _venturaAutoJoinCall = nullptr;
     UInt32 _venturaAutoJoinTries = 0;

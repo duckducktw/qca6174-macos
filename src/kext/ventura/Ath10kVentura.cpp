@@ -4,6 +4,7 @@
 // transmit path, power/state reporting and the apple80211 request dispatcher
 // that airportd uses for everything the Wi-Fi UI shows.
 #include "Ath10kVenturaABI.hpp"
+#include "Ath10kInfraInterface.hpp"
 #include <net/kpi_interface.h>
 #include <net/if_dl.h>
 
@@ -3976,6 +3977,17 @@ IOService *Ath10kPCIDevice::attachPlatformVif()
         if (probe)
             probe->setProperty("Ath10kCtrlPrimaryBefore",
                                primaryBefore != nullptr ? "non-null" : "null");
+        // The Skywalk-side interface airportd needs never existed: create it once,
+        // attach it to the controller, and let its newUserClient hand out the
+        // family's Apple80211 client (HANDOFF 6.62/6.63). Without this the family
+        // has no IO80211SkywalkInterface to bind, so Apple80211BindToInterfaceWith
+        // Service fails with -3900 and ref+0x50 keeps the assoc bit clear.
+        if (_venturaInfra == nullptr) {
+            _venturaInfra = Ath10kInfraInterface::createAndAttach(this, this);
+            if (probe)
+                probe->setProperty("Ath10kInfraCreated",
+                                   _venturaInfra != nullptr ? "yes" : "no");
+        }
         if (ctrlIvars != nullptr && primaryBefore == nullptr && *ivarsSlot != nullptr) {
             // Role 6 is what the station path in the family accepts (6 and 7 are the
             // only values IO80211VirtualInterface::newUserClient takes as well).

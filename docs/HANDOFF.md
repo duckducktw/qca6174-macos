@@ -3918,3 +3918,18 @@ t1:l32:6  t9:l32:0  t1:l32:6  t1:l32:6  t11:l32:5  t9:l32:0  t1:l32:6  t1:l32:6
 
 VM = v262（`Ath10kReqLog` 在），boot-args 8 token（已無 amfi），`connected-wpa2` / QCA-TEST / ping 2/2。
 回滾點 `/tmp/vk254`–`/tmp/vk262`。
+
+### 6.63 第廿三輪：v265 的教訓與交接文件改寫
+
+1. `Makefile` 的 `VENTURA_OBJECT` 漏了 `Ath10kInfraInterface.o` → 對該檔的編輯從未進 binary
+   （`make` 回 0、腳本仍印 `Built and symbol-checked`）。補上後 sha256 `0ef3f3dd…` → `d27bbdfd…`、
+   `nm | grep -c Ath10kInfra` 1 → 21。**判準永遠是 sha256，不是那行訊息。**
+2. v265（infra 介面真的被 link 進去）→ kext **完全載不起來**：`kmutil showloaded | grep -c Ath10k` = 0、
+   `ifconfig -l` 沒有 en1、serial 沒有 `Ath10kMac`。已回滾 v262，`connected-wpa2` 正常。
+   結論：自建 live `IO80211InfraInterface` 不能在 publish 階段一次全開，要分步（new → role/id →
+   `attach(controller)` → `attachInterface(OSObject*,IOService*)`），每步留 property。
+3. 入口交接文件 `docs/handoff-apple-join-conditions.md` 已整份改寫成現況（v265 之後），
+   內含：四層現況表、**已 superseded 的舊結論**（`ref+0x50=0xa073ee6f`、「沒有 Set(SSID)」、
+   supplicant 必須 false、caps byte 佈局）、已封閉的八條路、三條剩下的路（A 手動 attach airportd／
+   B 全關 SIP／C 以自帶 join 為成品）、精確 runbook、七條陷阱。
+   **新 session 先讀那一份，`HANDOFF.md` 只當逐輪歷史。**

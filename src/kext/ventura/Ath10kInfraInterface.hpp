@@ -37,12 +37,6 @@ public:
     static Ath10kInfraInterface *createAndAttach(IO80211Controller *controller,
                                                 Ath10kPCIDevice *owner);
 
-    IOReturn newUserClient(task_t owningTask, void *securityID,
-                           UInt32 type, OSDictionary *properties,
-                           IOUserClient **handler) override;
-    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
-                           IOUserClient **handler) override;
-
 private:
     Ath10kPCIDevice *_owner = nullptr;
     void noteUserClientAttempt(UInt32 type);
